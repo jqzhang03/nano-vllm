@@ -26,17 +26,21 @@ class Block:
 class BlockManager:
 
     def __init__(self, num_blocks: int, block_size: int):
-        self.block_size = block_size
-        self.blocks: list[Block] = [Block(i) for i in range(num_blocks)]
-        self.hash_to_block_id: dict[int, int] = dict()
-        self.free_block_ids: deque[int] = deque(range(num_blocks))
-        self.used_block_ids: set[int] = set()
+        self.block_size = block_size # 块大小
+        self.blocks: list[Block] = [Block(i) for i in range(num_blocks)] # 所有可用块的编号
+        self.hash_to_block_id: dict[int, int] = dict() # 哈希值到块id的映射，用于前缀缓存
+        self.free_block_ids: deque[int] = deque(range(num_blocks)) # 空闲块队列
+        self.used_block_ids: set[int] = set() # 已使用块集合
 
+    # 修饰为类方法，不需要实例化BlockManager即可调用，第一个参数必须是cls
     @classmethod
     def compute_hash(cls, token_ids: list[int], prefix: int = -1):
         h = xxhash.xxh64()
+        # 如果有前一块的哈希值，则把前面块的哈希值转换成字节串喂进h中
         if prefix != -1:
+            # 将整型转换为8字节的字节串，并以小端字节序存储
             h.update(prefix.to_bytes(8, "little"))
+        
         h.update(np.array(token_ids).tobytes())
         return h.intdigest()
 
@@ -57,15 +61,20 @@ class BlockManager:
 
     def can_allocate(self, seq: Sequence) -> int:
         h = -1
+        # 可复用块的个数
         num_cached_blocks = 0
+        # 需要新分配块的个数
         num_new_blocks = seq.num_blocks
         for i in range(seq.num_blocks - 1):
             token_ids = seq.block(i)
+            # 计算当前块的链式哈希
             h = self.compute_hash(token_ids, h)
             block_id = self.hash_to_block_id.get(h, -1)
+            # 找不到或者遇到了哈希碰撞，直接退出
             if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
                 break
             num_cached_blocks += 1
+            # 如果块在已使用队列中，只需要将对应块id的引用计数+1即可，不需要重新分配
             if block_id in self.used_block_ids:
                 num_new_blocks -= 1
         if len(self.free_block_ids) < num_new_blocks:
@@ -101,9 +110,12 @@ class BlockManager:
         seq.block_table.clear()
 
     def can_append(self, seq: Sequence) -> bool:
+        # 如果len(seq) % self.block_size == 1，说明追加的token需要申请一个新块来存储，以前的块都占满了，因此要求空闲块个数要大于等于1
+        # 否则永远为True，不需要新追加一个块，在最后一个块内直接追加即可
         return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)
 
     def may_append(self, seq: Sequence):
+        # 如果需要追加一个新块，则调用_allocate_block()分配一个新块，并将其加入seq.block_table中
         if len(seq) % self.block_size == 1:
             seq.block_table.append(self._allocate_block())
 

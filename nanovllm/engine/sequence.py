@@ -6,26 +6,30 @@ from nanovllm.sampling_params import SamplingParams
 
 
 class SequenceStatus(Enum):
+    # auto()自动为枚举对象赋值，从1开始
     WAITING = auto()
     RUNNING = auto()
     FINISHED = auto()
 
 
 class Sequence:
-    block_size = 256
-    counter = count()
+    block_size = 256 # KV Cache块大小
+    counter = count() # 确保每个Sequence都有唯一的ID
 
     def __init__(self, token_ids: list[int], sampling_params = SamplingParams()):
         self.seq_id = next(Sequence.counter)
         self.status = SequenceStatus.WAITING
+
         self.token_ids = copy(token_ids)
         self.last_token = token_ids[-1]
-        self.num_tokens = len(self.token_ids)
-        self.num_prompt_tokens = len(token_ids)
+        self.num_tokens = len(self.token_ids) # 当前token总数，prompt + completion
+        self.num_prompt_tokens = len(token_ids) # prompt token总数
+
         self.num_cached_tokens = 0
         self.num_scheduled_tokens = 0
         self.is_prefill = True
         self.block_table = []
+
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
@@ -75,9 +79,9 @@ class Sequence:
 
     def __setstate__(self, state):
         self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.block_table, last_state = state
-        if isinstance(last_state, list):
+        if isinstance(last_state, list): # 如果是prefill阶段传来的
             self.token_ids = last_state
             self.last_token = self.token_ids[-1]
-        else:
+        else: # 如果是decode阶段传来的
             self.token_ids = []
             self.last_token = last_state

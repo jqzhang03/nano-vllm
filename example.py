@@ -8,11 +8,13 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(path)
     llm = LLM(path, enforce_eager=True, tensor_parallel_size=1)
 
+    # 模型采样参数：温度、每次最多生成token数
     sampling_params = SamplingParams(temperature=0.6, max_tokens=256)
     prompts = [
         "introduce yourself",
         "list all prime numbers within 100",
     ]
+    # 将prompts转换为模型输入格式，添加生成提示
     prompts = [
         tokenizer.apply_chat_template(
             [{"role": "user", "content": prompt}],

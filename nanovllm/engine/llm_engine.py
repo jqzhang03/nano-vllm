@@ -41,6 +41,7 @@ class LLMEngine:
             p.join()
 
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
+        # isinstance(a, b)：检查a是不是b类型的对象
         if isinstance(prompt, str):
             prompt = self.tokenizer.encode(prompt)
         seq = Sequence(prompt, sampling_params)
@@ -48,9 +49,14 @@ class LLMEngine:
 
     def step(self):
         seqs, is_prefill = self.scheduler.schedule()
+        # 如果是prefill阶段就返回正数，意味着当前step要处理多少token
+        # 如果是decode阶段就返回负数，意味着当前step要处理多少个序列，或当前step新生成的token数
         num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
+        # 运行模型，返回采样出的token
         token_ids = self.model_runner.call("run", seqs, is_prefill)
+        # 调度器完成后处理，如追加token、更新缓存、判断是否结束等
         self.scheduler.postprocess(seqs, token_ids, is_prefill)
+        # 收集已经完成的请求
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
         return outputs, num_tokens
 
@@ -61,8 +67,10 @@ class LLMEngine:
         self,
         prompts: list[str] | list[list[int]],
         sampling_params: SamplingParams | list[SamplingParams],
-        use_tqdm: bool = True,
+        use_tqdm: bool = True, # use_tqdm:是否显示进度条
     ) -> list[str]:
+        # 创建一个进度条，总共有len(prompts)个任务，进度条前缀显示"Generating",
+        # dynamic_ncols=True：让进度条自适应终端宽度，disabel：是否禁用进度条
         pbar = tqdm(total=len(prompts), desc="Generating", dynamic_ncols=True, disable=not use_tqdm)
         if not isinstance(sampling_params, list):
             sampling_params = [sampling_params] * len(prompts)
@@ -73,6 +81,7 @@ class LLMEngine:
         while not self.is_finished():
             t = perf_counter()
             output, num_tokens = self.step()
+            # 计算吞吐
             if num_tokens > 0:
                 prefill_throughput = num_tokens / (perf_counter() - t)
             else:
