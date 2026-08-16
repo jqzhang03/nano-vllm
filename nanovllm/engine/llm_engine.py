@@ -32,6 +32,9 @@ class LLMEngine:
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)
+        # 基准计时数据：已结束请求的per-request时间戳快照 + 逐step聚合统计
+        self._req_metrics: list[dict] = []
+        self._step_stats: dict[str, float | int] = {}
         atexit.register(self.exit)
 
     def exit(self):
@@ -45,6 +48,7 @@ class LLMEngine:
         if isinstance(prompt, str):
             prompt = self.tokenizer.encode(prompt)
         seq = Sequence(prompt, sampling_params)
+        seq.t_submitted = perf_counter()  # 记录请求入队时间（基准计时）
         self.scheduler.add(seq)
 
     def step(self):
@@ -56,6 +60,17 @@ class LLMEngine:
         token_ids = self.model_runner.call("run", seqs, is_prefill)
         # 调度器完成后处理，如追加token、更新缓存、判断是否结束等
         self.scheduler.postprocess(seqs, token_ids, is_prefill)
+        # 快照已结束请求的计时信息（基准测试使用；driver侧数据完整）
+        for seq in seqs:
+            if seq.is_finished:
+                self._req_metrics.append({
+                    "seq_id": seq.seq_id,
+                    "prompt_tokens": seq.num_prompt_tokens,
+                    "completion_tokens": len(seq.completion_token_ids),
+                    "t_submitted": seq.t_submitted,
+                    "t_first_token": seq.t_first_token,
+                    "t_completed": seq.t_completed,
+                })
         # 收集已经完成的请求
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
         return outputs, num_tokens
@@ -78,14 +93,25 @@ class LLMEngine:
             self.add_request(prompt, sp)
         outputs = {}
         prefill_throughput = decode_throughput = 0.
+        # 重置基准计时统计
+        self._req_metrics = []
+        self._step_stats = dict(prefill_steps=0, decode_steps=0, prefill_tokens=0, decode_tokens=0,
+                                prefill_time=0.0, decode_time=0.0)
         while not self.is_finished():
             t = perf_counter()
             output, num_tokens = self.step()
-            # 计算吞吐
+            dt = perf_counter() - t
+            # 累计逐step统计（基准测试使用）
             if num_tokens > 0:
-                prefill_throughput = num_tokens / (perf_counter() - t)
+                self._step_stats["prefill_steps"] += 1
+                self._step_stats["prefill_tokens"] += num_tokens
+                self._step_stats["prefill_time"] += dt
+                prefill_throughput = num_tokens / dt
             else:
-                decode_throughput = -num_tokens / (perf_counter() - t)
+                self._step_stats["decode_steps"] += 1
+                self._step_stats["decode_tokens"] += -num_tokens
+                self._step_stats["decode_time"] += dt
+                decode_throughput = -num_tokens / dt
             pbar.set_postfix({
                 "Prefill": f"{int(prefill_throughput)}tok/s",
                 "Decode": f"{int(decode_throughput)}tok/s",
@@ -97,3 +123,16 @@ class LLMEngine:
         outputs = [outputs[seq_id] for seq_id in sorted(outputs.keys())]
         outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in outputs]
         return outputs
+
+    def collect_metrics(self) -> dict:
+        """返回最近一次generate()的基准计时原始数据（供benchmarks/使用）。
+
+        - per_request: 每个已结束请求的 {seq_id, prompt_tokens, completion_tokens,
+          t_submitted, t_first_token, t_completed}，时间为秒（perf_counter基准）；
+          t_first_token/t_completed 为None表示请求未生成token/未完成。
+        - step_stats: 逐step聚合 {prefill_steps, decode_steps, prefill_tokens,
+          decode_tokens, prefill_time, decode_time}。
+        - num_preemptions: 本次generate中的KV cache抢占次数。
+        """
+        return {"per_request": list(self._req_metrics), "step_stats": dict(self._step_stats),
+                "num_preemptions": self.scheduler.num_preemptions}

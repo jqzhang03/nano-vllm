@@ -30,6 +30,11 @@ class Sequence:
         self.is_prefill = True
         self.block_table = []
 
+        # ---- 基准计时（仅driver侧使用，不随__getstate__跨进程传输） ----
+        self.t_submitted: float | None = None      # 请求加入调度队列的时间（秒）
+        self.t_first_token: float | None = None    # 生成第一个completion token的时间（用于TTFT）
+        self.t_completed: float | None = None      # 请求完成（FINISHED）的时间
+
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos

@@ -1,4 +1,5 @@
 from collections import deque
+from time import perf_counter
 
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence, SequenceStatus
@@ -15,6 +16,7 @@ class Scheduler:
         self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
+        self.num_preemptions = 0  # 抢占次数统计（基准测试使用）
 
     def is_finished(self):
         return not self.waiting and not self.running
@@ -87,6 +89,7 @@ class Scheduler:
         return scheduled_seqs, False
 
     def preempt(self, seq: Sequence):
+        self.num_preemptions += 1
         seq.status = SequenceStatus.WAITING
         seq.is_prefill = True
         self.block_manager.deallocate(seq)
@@ -99,9 +102,13 @@ class Scheduler:
             seq.num_scheduled_tokens = 0
             if is_prefill and seq.num_cached_tokens < seq.num_tokens:
                 continue
+            # 记录首个生成token的时间（用于TTFT统计），仅第一次追加时触发
+            if seq.t_first_token is None and seq.num_completion_tokens == 0:
+                seq.t_first_token = perf_counter()
             seq.append_token(token_id)
             # 判断当前序列是否满足结束条件
             if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
                 seq.status = SequenceStatus.FINISHED
+                seq.t_completed = perf_counter()
                 self.block_manager.deallocate(seq)
                 self.running.remove(seq)

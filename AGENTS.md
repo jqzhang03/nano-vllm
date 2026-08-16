@@ -9,7 +9,7 @@ All source code lives under `nanovllm/`:
 - `models/` – model definitions (`Qwen3ForCausalLM`)
 - `utils/` – weight loading and the global inference context
 
-Root-level `example.py` and `bench.py` are runnable demos; `assets/` holds images; `pyproject.toml` defines packaging and dependencies. There is no separate tests directory yet.
+Root-level `example.py` and `bench.py` are runnable demos; `assets/` holds images; `pyproject.toml` defines packaging and dependencies. `benchmarks/` holds the performance tooling (see `BENCHMARKS.md`): `bench.py` (throughput/latency/SLO/vLLM comparison), `profiler.py` (torch.profiler prefill/decode breakdown), plus dev scripts to drive runs from Windows into WSL. There is no separate tests directory yet.
 
 ## Build, Test, and Development Commands
 
@@ -17,7 +17,12 @@ Root-level `example.py` and `bench.py` are runnable demos; `assets/` holds image
 pip install -e .        # install the package in editable mode
 python example.py       # end-to-end inference; expects a local Qwen3-0.6B checkpoint
 python bench.py         # throughput benchmark (256 sequences)
+python benchmarks/bench.py --num-seqs 256            # full metrics: TTFT/TPOT/E2E/p50/p99/SLO
+python benchmarks/bench.py --num-seqs 256 --shared-prefix-len 512   # prefix-cache workload
+python benchmarks/profiler.py --num-seqs 64 --max-input-len 512 --max-output-len 64  # prefill/decode breakdown
 ```
+
+`benchmarks/bench.py` consumes the timing instrumentation on `Sequence` (`t_submitted`/`t_first_token`/`t_completed`, driver-side only) exported through `LLMEngine.collect_metrics()`; keep those fields when touching the engine. Never name a script `profile.py` under `benchmarks/` — it shadows the stdlib `profile` module that torch's `cProfile` import chain needs.
 
 Requires Python 3.10–3.12 and an NVIDIA GPU; `flash-attn`, `triton`, and NCCL are hard dependencies. There is no build step beyond `pip install`.
 

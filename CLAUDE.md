@@ -14,7 +14,13 @@ Hard runtime requirements (GPU): CUDA, `flash-attn`, `triton`, and NCCL. There i
 pip install -e .          # editable install (the only build step)
 python example.py         # end-to-end inference demo (2 prompts)
 python bench.py           # throughput benchmark (256 seqs)
+python benchmarks/bench.py --num-seqs 256                  # full metrics: TTFT/TPOT/E2E/p50/p99/SLO (+ JSON in results/)
+python benchmarks/bench.py --num-seqs 256 --shared-prefix-len 512   # prefix-cache workload
+python benchmarks/bench.py --num-seqs 256 --compare-vllm   # side-by-side vs real vLLM (needs pip install vllm)
+python benchmarks/profiler.py --num-seqs 64 --max-input-len 512 --max-output-len 64  # prefill/decode torch.profiler breakdown
 ```
+
+See `BENCHMARKS.md` for metric definitions and interpretation. Timing instrumentation lives on `Sequence` (`t_submitted`/`t_first_token`/`t_completed`, driver-side only) and is exported via `LLMEngine.collect_metrics()`; `benchmarks/bench.py` consumes it. `benchmarks/run_in_wsl.sh` drives any python command from Windows into the WSL env (it sets `PYTHONPATH` so the workspace copy of `nanovllm` wins over the conda env's editable install, which may point at another clone such as `~/AI/nano-vllm`).
 
 `example.py` / `bench.py` hardcode the model path `~/huggingface/Qwen3-0.6B/`; download it with:
 
