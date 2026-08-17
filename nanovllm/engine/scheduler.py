@@ -60,8 +60,9 @@ class Scheduler:
                 seq.status = SequenceStatus.RUNNING
                 self.waiting.popleft()
                 self.running.append(seq)
-            # 无论当前序列prefill是否完成，都加入调度序列中
-            scheduled_seqs.append(seq)
+            # 当前序列prefill如果未完成，再加入调度序列中
+            if num_tokens != 0:
+                scheduled_seqs.append(seq)
 
         if scheduled_seqs:
             return scheduled_seqs, True

@@ -65,7 +65,7 @@ class BlockManager:
         num_cached_blocks = 0
         # 需要新分配块的个数
         num_new_blocks = seq.num_blocks
-        for i in range(seq.num_blocks - 1):
+        for i in range(seq.num_blocks):
             token_ids = seq.block(i)
             # 计算当前块的链式哈希
             h = self.compute_hash(token_ids, h)
@@ -98,7 +98,10 @@ class BlockManager:
             seq.block_table.append(block_id)
         for i in range(num_cached_blocks, seq.num_blocks):
             seq.block_table.append(self._allocate_block())
-        seq.num_cached_tokens = num_cached_blocks * self.block_size
+        if num_cached_blocks == 0:
+            seq.num_cached_tokens = 0
+        else:
+            seq.num_cached_tokens = (num_cached_blocks - 1) * self.block_size + len(seq.block(num_cached_blocks - 1))
 
     def deallocate(self, seq: Sequence):
         for block_id in reversed(seq.block_table):
@@ -121,12 +124,14 @@ class BlockManager:
 
     def hash_blocks(self, seq: Sequence):
         start = seq.num_cached_tokens // self.block_size
-        end = (seq.num_cached_tokens + seq.num_scheduled_tokens) // self.block_size
+        end = (seq.num_cached_tokens + seq.num_scheduled_tokens + self.block_size - 1) // self.block_size
         if start == end: return
         h = self.blocks[seq.block_table[start - 1]].hash if start > 0 else -1
         for i in range(start, end):
             block = self.blocks[seq.block_table[i]]
             token_ids = seq.block(i)
             h = self.compute_hash(token_ids, h)
+            if block.hash != -1 and block.hash != h:
+                del self.hash_to_block_id[block.hash]
             block.update(h, token_ids)
             self.hash_to_block_id[h] = block.block_id
