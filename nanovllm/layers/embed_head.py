@@ -55,7 +55,19 @@ class ParallelLMHead(VocabParallelEmbedding):
 
     def forward(self, x: torch.Tensor):
         context = get_context()
-        if context.is_prefill:
+        if context.is_mixed:
+            if context.is_spec:
+                # 投机混合步：prefill组（每seq取最后一行，索引相对组内）+ verify组
+                # （每seq保留全部γ+1行，从prefill组token边界起）
+                pre_last = context.cu_seqlens_q[1:context.n_prefill_rows + 1] - 1
+                x = torch.cat([x[pre_last], x[context.cu_seqlens_q[context.n_prefill_rows]:]], dim=0).contiguous()
+            else:
+                # 混合批次：prefill组（每seq取最后一行，索引相对组内） + decode组（每seq一行，原样）
+                pre_last = context.cu_seqlens_q[1:] - 1
+                x = torch.cat([x[pre_last], x[context.n_prefill_tokens:]], dim=0).contiguous()
+        elif context.is_spec:
+            pass  # verify步：保留全部行（每seq γ+1行，供逐行采样+验收）
+        elif context.is_prefill:
             last_indices = context.cu_seqlens_q[1:] - 1
             x = x[last_indices].contiguous()
         logits = F.linear(x, self.weight)

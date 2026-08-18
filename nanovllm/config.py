@@ -17,10 +17,17 @@ class Config:
     eos: int = -1 # EOS的token id
     kvcache_block_size: int = 256 # 在PagedAttention中，一个KV缓存块(页)的大小，在vllm生产环境下一般是16，必须保持为16的倍数
     num_kvcache_blocks: int = -1 # KV Cache块的数量，-1表示GPU根据显存大小、模型大小、block size等自动计算
+    kv_cache_dtype: str = "auto" # KV缓存数据类型："auto"（模型dtype，默认）或 "fp8_e4m3"（FP8 E4M3量化，容量翻倍，decode用自研Triton内核）
+    quantization: str = "none" # 权重量化："none" 或 "w8a8"（per-channel int8权重 + per-token int8激活，Triton int8 GEMM）
+    speculative: str = "none" # 投机解码："none" 或 "ngram"（n-gram/prompt-lookup草稿，无模型零显存，见BENCHMARKS.md §9）
+    ngram_window: int = 4 # n-gram窗口上限（vLLM --ngram-prompt-lookup-max 默认同款）
+    ngram_min_window: int = 1 # n-gram窗口下限（先长后短回退，vLLM --ngram-prompt-lookup-min 默认同款）
+    max_draft_len: int = 4 # 每步最大草稿数γ（vLLM --num-speculative-tokens 常用值）
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
         assert self.kvcache_block_size % 256 == 0
         assert 1 <= self.tensor_parallel_size <= 8
+        assert self.speculative in ("none", "ngram"), f"unknown speculative: {self.speculative}"
         self.hf_config = AutoConfig.from_pretrained(self.model)
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)

@@ -29,6 +29,7 @@ class Sequence:
         self.num_scheduled_tokens = 0
         self.is_prefill = True
         self.block_table = []
+        self.draft_tokens: list[int] | None = None  # 投机解码：本步n-gram草稿（None=非verify行；[]=verify行无草稿）
 
         # ---- 基准计时（仅driver侧使用，不随__getstate__跨进程传输） ----
         self.t_submitted: float | None = None      # 请求加入调度队列的时间（秒）
@@ -78,12 +79,20 @@ class Sequence:
         self.last_token = token_id
         self.num_tokens += 1
 
+    def append_tokens(self, token_ids: list[int]):
+        """一次追加多个 token（投机验收：n_acc 个已接受 token）。"""
+        assert token_ids
+        self.token_ids.extend(token_ids)
+        self.last_token = token_ids[-1]
+        self.num_tokens += len(token_ids)
+
     def __getstate__(self):
         last_state = self.last_token if not self.is_prefill else self.token_ids
-        return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.block_table, last_state)
+        return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.block_table, last_state, self.draft_tokens)
 
     def __setstate__(self, state):
-        self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.block_table, last_state = state
+        (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens,
+         self.block_table, last_state, self.draft_tokens) = state
         if isinstance(last_state, list): # 如果是prefill阶段传来的
             self.token_ids = last_state
             self.last_token = self.token_ids[-1]

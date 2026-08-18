@@ -105,7 +105,10 @@ def _fmt_seconds(v):
 
 def run_nanovllm(args, prompts, sampling_params):
     llm = LLM(args.model, enforce_eager=args.enforce_eager, tensor_parallel_size=args.tp,
-              max_model_len=args.max_model_len, gpu_memory_utilization=args.gpu_memory_utilization)
+              max_model_len=args.max_model_len, gpu_memory_utilization=args.gpu_memory_utilization,
+              kv_cache_dtype=getattr(args, "kv_cache_dtype", "auto"),
+              quantization=getattr(args, "quantization", "none"),
+              speculative=getattr(args, "speculative", "none"))
     # 预热：触发torch.compile/triton的JIT编译、分配KV Cache、捕获CUDA Graph
     llm.generate(["warm up"] * args.warmup_seqs,
                  SamplingParams(temperature=0.6, max_tokens=8), use_tqdm=False)
@@ -255,6 +258,12 @@ def parse_args():
     p.add_argument("--model", default=os.path.expanduser("~/huggingface/Qwen3-0.6B/"))
     add_workload_args(p)
     p.add_argument("--enforce-eager", action="store_true")
+    p.add_argument("--kv-cache-dtype", default="auto",
+                   help="KV缓存dtype: auto(模型dtype) 或 fp8_e4m3(FP8量化，容量翻倍)")
+    p.add_argument("--quantization", default="none",
+                   help="权重量化: none 或 w8a8(per-channel int8 + per-token int8, Triton GEMM)")
+    p.add_argument("--speculative", default="none",
+                   help="投机解码: none 或 ngram(n-gram/prompt-lookup草稿, 无模型)")
     p.add_argument("--tp", type=int, default=1)
     p.add_argument("--max-model-len", type=int, default=4096)
     p.add_argument("--gpu-memory-utilization", type=float, default=0.9)
