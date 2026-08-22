@@ -55,7 +55,9 @@ def run_case(style: str, speculative: str, prompts, tokenize, tokenizer, args):
         prompts_tok = tokenize()
     else:
         prompts_tok = [tokenizer.encode(t) for t in prompts]
-    llm = LLM(MODEL, speculative=speculative, kv_cache_dtype="fp8_e4m3" if args.fp8 else "auto",
+    llm = LLM(MODEL, speculative=speculative,
+              medusa_path=args.medusa_path if speculative == "medusa" else "",
+              kv_cache_dtype="fp8_e4m3" if args.fp8 else "auto",
               max_model_len=args.max_model_len, gpu_memory_utilization=args.gpu_memory_utilization)
     llm.generate(["warm up"] * 4, SamplingParams(temperature=0.6, max_tokens=8), use_tqdm=False)
     sps = [SamplingParams(temperature=0.6, max_tokens=args.max_output_len, ignore_eos=True)] * len(prompts_tok)
@@ -75,7 +77,7 @@ def run_case(style: str, speculative: str, prompts, tokenize, tokenizer, args):
         "preemptions": m.get("num_preemptions", 0),
         "prefill_steps": stats["prefill_steps"], "decode_steps": stats["decode_steps"],
     }
-    if speculative == "ngram":
+    if speculative != "none":
         d, acc = stats["spec_draft_tokens"], stats["spec_accepted_drafts"]
         rows_spec = stats["spec_rows"]
         row.update({
@@ -99,6 +101,9 @@ def _summarize(vals):
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--styles", default="free,json,repeat")
+    p.add_argument("--speculative", default="none,ngram",
+                   help="逗号分隔的spec模式（none/ngram/medusa）；medusa需--medusa-path")
+    p.add_argument("--medusa-path", default="results/medusa_heads.pt")
     p.add_argument("--num-seqs", type=int, default=64)
     p.add_argument("--max-input-len", type=int, default=256)
     p.add_argument("--max-output-len", type=int, default=96)
@@ -116,15 +121,18 @@ def main():
         prompts, tokenize = build_prompts(style, tokenizer, args.num_seqs,
                                           args.max_input_len, args.max_input_len, args.seed)
         print(f"\n=== style={style} (fp8={args.fp8}) ===")
-        base = run_case(style, "none", prompts, tokenize, tokenizer, args)
-        spec = run_case(style, "ngram", prompts, tokenize, tokenizer, args)
-        rows += [base, spec]
-        print(f"  baseline: {base['throughput_tok_per_s']:7.1f} tok/s | "
-              f"TTFT {base['ttft_p50_ms']}ms | TPOT {base['tpot_p50_ms']}ms")
-        speedup = spec["throughput_tok_per_s"] / base["throughput_tok_per_s"]
-        print(f"  spec    : {spec['throughput_tok_per_s']:7.1f} tok/s ({speedup:+.2f}x) | "
-              f"TTFT {spec['ttft_p50_ms']}ms | TPOT {spec['tpot_p50_ms']}ms | "
-              f"α={spec.get('alpha')} | avg γ={spec.get('avg_draft_len')}")
+        for spec_mode in [s.strip() for s in args.speculative.split(",")]:
+            row = run_case(style, spec_mode, prompts, tokenize, tokenizer, args)
+            rows.append(row)
+            if spec_mode == "none":
+                base = row
+                print(f"  baseline: {base['throughput_tok_per_s']:7.1f} tok/s | "
+                      f"TTFT {base['ttft_p50_ms']}ms | TPOT {base['tpot_p50_ms']}ms")
+            else:
+                speedup = row["throughput_tok_per_s"] / base["throughput_tok_per_s"]
+                print(f"  {spec_mode:<6}: {row['throughput_tok_per_s']:7.1f} tok/s ({speedup:+.2f}x) | "
+                      f"TTFT {row['ttft_p50_ms']}ms | TPOT {row['tpot_p50_ms']}ms | "
+                      f"α={row.get('alpha')} | avg γ={row.get('avg_draft_len')}")
 
     with open(args.output, "w", newline="") as f:
         fieldnames = list(dict.fromkeys(k for r in rows for k in r.keys()))

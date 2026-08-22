@@ -124,6 +124,92 @@ def paged_decode_attention_fp8(q: torch.Tensor, k_cache: torch.Tensor, v_cache: 
     return o
 
 
+@triton.jit
+def paged_varlen_attention_fp8_kernel(
+    q_ptr, k_cache_ptr, v_cache_ptr, block_table_ptr, cu_q_ptr, key_lens_ptr, o_ptr,
+    k_scale, v_scale, softmax_scale,
+    max_blocks, num_heads, kv_heads,
+    head_dim: tl.constexpr, num_groups: tl.constexpr, QPAD: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr, BLOCK_T: tl.constexpr,
+):
+    """Paged varlen attention over an FP8 (E4M3) KV cache（v7，verify步用）。
+
+    - 每program处理 (seq, kv_head)：该seq的全部 Q 个query（Q=γ+1≤5，GQA组融合）；
+    - 列 c = r*G+g（r=query行号0..Q-1，g=组内q head）→ N=Q*G≤10 ≤ QPAD=16；
+    - query r 在逻辑位置 seqlen-Q+r，attend keys 0..seqlen-Q+r（逐列因果掩码）；
+    - 直接 fp8 load + 硬件cvt反量化（无全缓存反量化→消除 verify 步 ~18GB/步 的
+      内存搬运，见BENCHMARKS.md §9）；BLOCK_T=32/warps=1 与v6同款；
+    - key_lens = cu_seqlens_k 差分（本seq的key总数，含draft写入）。
+    """
+    pid = tl.program_id(0)
+    seq_id = pid // kv_heads
+    kv_head = pid % kv_heads
+    q_start = tl.load(cu_q_ptr + seq_id)
+    qlen = tl.load(cu_q_ptr + seq_id + 1) - q_start
+    seqlen = tl.load(key_lens_ptr + seq_id)
+    offs_d = tl.arange(0, head_dim)
+    offs_c = tl.arange(0, QPAD)
+    c_valid = offs_c < qlen * num_groups
+    r_of_c = offs_c // num_groups      # query行号（0..Q-1）
+    g_of_c = offs_c % num_groups
+    q_ptrs = q_ptr + (q_start + r_of_c[None, :]) * (num_heads * head_dim) \
+             + (kv_head * num_groups + g_of_c[None, :]) * head_dim + offs_d[:, None]
+    q = tl.load(q_ptrs, mask=c_valid[None, :], other=0.0).to(tl.float32)   # [D, QPAD]
+    q16 = q.to(tl.float16)
+
+    acc = tl.zeros([head_dim, QPAD], dtype=tl.float32)
+    m = tl.full([1, QPAD], float("-inf"), dtype=tl.float32)
+    l = tl.zeros([1, QPAD], dtype=tl.float32)
+    num_blocks = (seqlen + BLOCK_SIZE - 1) // BLOCK_SIZE
+    block_stride = BLOCK_SIZE * kv_heads * head_dim
+    key_upper = seqlen - qlen + r_of_c   # query r 的key上限（本seq逻辑位置）
+    for b in range(num_blocks):
+        block_id = tl.load(block_table_ptr + seq_id * max_blocks + b)
+        base = block_id * block_stride + kv_head * head_dim
+        for t in range(0, BLOCK_SIZE, BLOCK_T):
+            offs_t = t + tl.arange(0, BLOCK_T)
+            key_pos = b * BLOCK_SIZE + offs_t
+            tok_mask = key_pos[:, None] <= key_upper[None, :]   # <=：含query自己的key
+            k_ptrs = k_cache_ptr + base + offs_t[:, None] * (kv_heads * head_dim) + offs_d[None, :]
+            k16 = (tl.load(k_ptrs).to(tl.float32) * k_scale).to(tl.float16)  # [T, D]
+            s = tl.dot(k16, q16, out_dtype=tl.float32) * softmax_scale       # [T, QPAD]
+            s = tl.where(tok_mask & c_valid[None, :], s, float("-inf"))
+            m_new = tl.maximum(m, tl.max(s, axis=0)[None, :])
+            alpha = tl.exp(m - m_new)
+            p = tl.exp(s - m_new)
+            l = l * alpha + tl.sum(p, axis=0)[None, :]
+            v_ptrs = v_cache_ptr + base + offs_t[:, None] * (kv_heads * head_dim) + offs_d[None, :]
+            v_t = (tl.load(v_ptrs).to(tl.float32) * v_scale).to(tl.float16)  # [T, D]
+            acc = acc * alpha + tl.dot(tl.trans(v_t), p.to(tl.float16), out_dtype=tl.float32)
+            m = m_new
+    o = acc / l                                                            # [D, QPAD]
+    o_ptrs = o_ptr + (q_start + r_of_c[None, :]) * (num_heads * head_dim) \
+             + (kv_head * num_groups + g_of_c[None, :]) * head_dim + offs_d[:, None]
+    tl.store(o_ptrs, o.to(q_ptr.dtype.element_ty), mask=c_valid[None, :])
+
+
+def paged_varlen_attention_fp8(q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor,
+                               cu_seqlens_q: torch.Tensor, key_lens: torch.Tensor,
+                               block_table: torch.Tensor,
+                               k_scale: float, v_scale: float, softmax_scale: float) -> torch.Tensor:
+    """verify步（Q=γ+1≤5的varlen多查询）fp8 paged attention。"""
+    total, num_heads, head_dim = q.shape
+    n_seqs = cu_seqlens_q.size(0) - 1
+    kv_heads = k_cache.shape[2]
+    num_groups = num_heads // kv_heads
+    o = torch.empty_like(q)
+    grid = (n_seqs * kv_heads,)
+    paged_varlen_attention_fp8_kernel[grid](
+        q, k_cache, v_cache, block_table, cu_seqlens_q, key_lens, o,
+        k_scale, v_scale, softmax_scale,
+        block_table.shape[1], num_heads, kv_heads,
+        head_dim=head_dim, num_groups=num_groups, QPAD=16,
+        BLOCK_SIZE=k_cache.shape[1], BLOCK_T=32,
+        num_warps=1,
+    )
+    return o
+
+
 class Attention(nn.Module):
 
     def __init__(
@@ -218,7 +304,17 @@ class Attention(nn.Module):
         if context.is_prefill:
             if context.block_tables is not None:    # prefix cache：KV来自缓存
                 if self.use_fp8:
-                    # 反量化成模型dtype再交给flash-attn（正确性优先；性能限制见BENCHMARKS.md）
+                    if context.is_spec:
+                        # verify步（Q=γ+1≤5）：自研fp8 varlen内核直接读缓存，
+                        # 消除"逐层全缓存反量化"（~18GB/步，见BENCHMARKS.md §9）
+                        key_lens = context.cu_seqlens_k[1:] - context.cu_seqlens_k[:-1]
+                        o = paged_varlen_attention_fp8(q, k_cache, v_cache,
+                                                       context.cu_seqlens_q, key_lens,
+                                                       context.block_tables,
+                                                       self.k_scale, self.v_scale, self.scale)
+                        return o
+                    # 普通prefill（前缀复用）：反量化成模型dtype再交给flash-attn
+                    # （prefill步少，全缓存反量化的代价可接受）
                     k = k_cache.to(k.dtype) * self.k_scale
                     v = v_cache.to(v.dtype) * self.v_scale
                 else:

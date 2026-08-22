@@ -108,6 +108,8 @@ def run_nanovllm(args, prompts, sampling_params):
               max_model_len=args.max_model_len, gpu_memory_utilization=args.gpu_memory_utilization,
               kv_cache_dtype=getattr(args, "kv_cache_dtype", "auto"),
               quantization=getattr(args, "quantization", "none"),
+              awq_scales_path=getattr(args, "awq_scales_path", ""),
+              quantize_lm_head=getattr(args, "quantize_lm_head", False),
               speculative=getattr(args, "speculative", "none"))
     # 预热：触发torch.compile/triton的JIT编译、分配KV Cache、捕获CUDA Graph
     llm.generate(["warm up"] * args.warmup_seqs,
@@ -261,7 +263,12 @@ def parse_args():
     p.add_argument("--kv-cache-dtype", default="auto",
                    help="KV缓存dtype: auto(模型dtype) 或 fp8_e4m3(FP8量化，容量翻倍)")
     p.add_argument("--quantization", default="none",
-                   help="权重量化: none 或 w8a8(per-channel int8 + per-token int8, Triton GEMM)")
+                   help="权重量化: none | w8a8(int8, Triton GEMM) | int4(per-group int4, Triton GEMM) | "
+                        "awq(int4+激活感知缩放) | sparse24(2:4结构化剪枝, Triton稀疏GEMM)")
+    p.add_argument("--awq-scales-path", default="",
+                   help="AWQ缩放文件（benchmarks/awq_calibrate.py产出）；空=随机token内联校准")
+    p.add_argument("--quantize-lm-head", action="store_true",
+                   help="同时量化LM head（默认不量化，见BENCHMARKS.md §10）")
     p.add_argument("--speculative", default="none",
                    help="投机解码: none 或 ngram(n-gram/prompt-lookup草稿, 无模型)")
     p.add_argument("--tp", type=int, default=1)

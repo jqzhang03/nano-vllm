@@ -3,6 +3,7 @@ from dataclasses import fields
 from time import perf_counter
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
+import torch
 import torch.multiprocessing as mp
 
 from nanovllm.config import Config
@@ -18,6 +19,7 @@ class LLMEngine:
         config_fields = {field.name for field in fields(Config)}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         config = Config(model, **config_kwargs)
+        self.config = config
         Sequence.block_size = config.kvcache_block_size
         self.ps = []
         self.events = []
@@ -62,20 +64,23 @@ class LLMEngine:
         γ+1行（第i行预测位置len-1+i → 样本samples[i]验证草稿drafts[i]；
         最后一行是全接受时的bonus）。接受语义见 nanovllm/engine/ngram.verify_drafts。
 
-        返回 (token_lists, n_decode, n_draft, n_draft_acc, n_verify)：
+        返回 (token_lists, n_decode, n_draft, n_draft_acc, n_verify, n_acc_list)：
         n_decode = 本步产出token总数（= Σ接受数）；n_draft = 草稿总数；
         n_draft_acc = 被接受草稿数（α = n_draft_acc / n_draft）；
-        n_verify = verify forward处理的token数（Σ γ_i+1，含末token重算）。
+        n_verify = verify forward处理的token数（Σ γ_i+1，含末token重算）；
+        n_acc_list = 每seq的接受数（与seqs对齐，Medusa draft选行用）。
         """
         from nanovllm.engine.ngram import verify_drafts
         token_lists = []
         idx = 0
         n_decode = n_draft = n_draft_acc = n_verify = 0
+        n_acc_list = []
         for seq in seqs:
             if seq.draft_tokens is None:
                 token_lists.append([token_ids[idx]])
                 idx += 1
                 n_decode += 1
+                n_acc_list.append(0)  # 非verify行（prefill行）；_medusa_drafts用它识别
                 continue
             drafts = seq.draft_tokens
             n = len(drafts) + 1
@@ -87,27 +92,86 @@ class LLMEngine:
             n_draft += len(drafts)
             n_draft_acc += n_acc - 1
             n_verify += n
-        return token_lists, n_decode, n_draft, n_draft_acc, n_verify
+            n_acc_list.append(n_acc)
+        return token_lists, n_decode, n_draft, n_draft_acc, n_verify, n_acc_list
+
+    def _medusa_drafts(self, seqs: list[Sequence], hidden: torch.Tensor,
+                       n_acc_list: list[int], n_rows_list: list[int]):
+        """从verify步的hidden批量计算下一轮Medusa draft（语义见 layers/medusa.py）。
+
+        draft输入行 = 验收后新t_last的hidden（当前verify输入的第min(n_acc,γ_i)行：
+        非全接受时t_last是第n_acc个输入token；全接受时bonus无hidden，用第γ_i行）+
+        head偏移（全接受 shift=1）。EOS/剩余预算截断与n-gram一致。
+        n_rows_list 必须在postprocess前捕获（postprocess会清零num_scheduled_tokens）。
+        """
+        heads = self.model_runner.medusa_heads
+        gamma = self.config.max_draft_len
+        eos = self.config.eos
+        # mixed步里prefill行在hidden前面，spec组从n_prefill_tokens起
+        h_offset = sum(seq.num_scheduled_tokens for seq in seqs if seq.is_prefill)
+        groups = {0: [], 1: []}  # shift → [(seq, hidden行号)]
+        row = h_offset
+        for seq, n_acc, n_rows in zip(seqs, n_acc_list, n_rows_list):
+            if n_acc == 0:
+                continue  # 非verify行（prefill行）
+            gamma_i = n_rows - 1  # 本行实际γ（可能<全局γ）
+            if n_acc <= gamma_i:
+                # 非全接受：t_last（位置len+n_acc-1）是当前verify输入的第n_acc行
+                idx = row + n_acc
+                shift = 0
+            else:
+                # 全接受：t_last是bonus采样产物、无hidden → 用第γ_i行 + head偏移1
+                idx = row + gamma_i
+                shift = 1
+            groups[shift].append((seq, idx))
+            row += n_rows
+        for shift, items in groups.items():
+            if not items:
+                continue
+            h = torch.stack([hidden[i] for _, i in items])  # [n, hidden]（fp16）
+            toks = [hd(h).argmax(dim=-1).tolist() for hd in heads.heads[shift:shift + gamma]]
+            for i, (seq, _) in enumerate(items):
+                cap = min(gamma, seq.max_tokens - seq.num_completion_tokens - 1)
+                drafts = []
+                for k in range(cap):
+                    t = toks[k][i]
+                    if t == eos:
+                        break
+                    drafts.append(t)
+                seq.draft_tokens = drafts
 
     def step(self):
         seqs, kind = self.scheduler.schedule()  # kind ∈ {"prefill", "decode", "mixed", "spec"}
         # 本步是否含verify行（投机）：任一行带draft_tokens（[]也算，表示γ=0的verify行）
         has_spec = any(seq.draft_tokens is not None for seq in seqs)
+        # Medusa模式：spec步需要最后一层hidden（下轮草稿输入）
+        return_hidden = self.config.speculative == "medusa" and kind == "spec"
         # 在运行模型之前执行COW复制：任何序列写共享部分块之前，先把旧块复制给写者。
         # 必须发生在 run() 之前，prepare_decode/prepare_prefill 才能基于换表后的新块计算slot
         for old_id, new_id in self.scheduler.cow_pairs:
             self.model_runner.call("cow_block", old_id, new_id)
         # 运行模型，返回采样出的token（精度检查模式下同时返回本步logits）
-        result = self.model_runner.call("run", seqs, kind, self._collect_logits)
+        result = self.model_runner.call("run", seqs, kind, self._collect_logits, return_hidden)
+        hidden = None
         if self._collect_logits:
-            token_ids, logits = result
+            if return_hidden:
+                token_ids, logits, hidden = result
+            else:
+                token_ids, logits = result
             self.collected_logits.append((kind, logits))
         else:
-            token_ids = result
+            if return_hidden:
+                token_ids, hidden = result
+            else:
+                token_ids = result
         if has_spec:
-            # 统计必须在postprocess_spec之前（之后draft_tokens被清空）
+            # 统计必须在postprocess_spec之前（之后draft_tokens/num_scheduled_tokens被清空）
             n_spec_rows = sum(1 for seq in seqs if seq.draft_tokens is not None)
-            token_lists, n_decode, n_draft, n_draft_acc, n_verify = self._verify(seqs, token_ids)
+            # Medusa：postprocess前捕获每行行数（_medusa_drafts选hidden行用）
+            n_rows_list = [seq.num_scheduled_tokens if seq.draft_tokens is not None else 0
+                           for seq in seqs]
+            (token_lists, n_decode, n_draft, n_draft_acc, n_verify,
+             n_acc_list) = self._verify(seqs, token_ids)
             self.scheduler.postprocess_spec(seqs, token_lists)
             # 投机统计（与kind无关，混合步同样累计）
             self._step_stats["spec_steps"] += 1
@@ -117,6 +181,9 @@ class LLMEngine:
             self._step_stats["spec_accepted_drafts"] += n_draft_acc
         else:
             self.scheduler.postprocess(seqs, token_ids)
+        # Medusa：用本步verify的hidden生成下一轮草稿（写回seq.draft_tokens）
+        if return_hidden:
+            self._medusa_drafts(seqs, hidden, n_acc_list, n_rows_list)
         # 统计用token数：prefill步为正（prefill token数），decode步为负（序列数），
         # mixed步拆分返回prefill/decode各自的数量
         if kind == "prefill":

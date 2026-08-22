@@ -3,6 +3,7 @@ from torch import nn
 import torch.nn.functional as F
 import torch.distributed as dist
 
+from nanovllm.layers.linear import WeightQuantMixin
 from nanovllm.utils.context import get_context
 
 
@@ -42,7 +43,7 @@ class VocabParallelEmbedding(nn.Module):
         return y
 
 
-class ParallelLMHead(VocabParallelEmbedding):
+class ParallelLMHead(WeightQuantMixin, VocabParallelEmbedding):
 
     def __init__(
         self,
@@ -52,6 +53,8 @@ class ParallelLMHead(VocabParallelEmbedding):
     ):
         assert not bias
         super().__init__(num_embeddings, embedding_dim)
+        self.int4 = False  # w_int4/w_int4_scale/awq_scale缓冲由quantize_int4创建
+        self.sparse24 = False  # w_sparse由quantize_sparse24创建
 
     def forward(self, x: torch.Tensor):
         context = get_context()
@@ -70,7 +73,12 @@ class ParallelLMHead(VocabParallelEmbedding):
         elif context.is_prefill:
             last_indices = context.cu_seqlens_q[1:] - 1
             x = x[last_indices].contiguous()
-        logits = F.linear(x, self.weight)
+        if self.sparse24:
+            logits = self._sparse24_forward(x)
+        elif self.int4:
+            logits = self._int4_forward(x)
+        else:
+            logits = F.linear(x, self.weight)
         if self.tp_size > 1:
             all_logits = [torch.empty_like(logits) for _ in range(self.tp_size)] if self.tp_rank == 0 else None
             dist.gather(logits, all_logits, 0)

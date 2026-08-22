@@ -19,8 +19,9 @@ class Scheduler:
         self.running: deque[Sequence] = deque()
         self.num_preemptions = 0  # 抢占次数统计（基准测试使用）
         self.cow_pairs: list[tuple[int, int]] = []  # 本轮调度产生的COW复制对 (old_block_id, new_block_id)
-        # ---- 投机解码（n-gram / prompt-lookup） ----
-        self.spec_decode = config.speculative == "ngram"
+        # ---- 投机解码（n-gram / Medusa） ----
+        self.spec_decode = config.speculative in ("ngram", "medusa")
+        self.spec_mode = config.speculative   # "ngram" | "medusa"
         self.ngram_window = config.ngram_window
         self.ngram_min_window = config.ngram_min_window
         self.max_draft_len = config.max_draft_len
@@ -64,11 +65,18 @@ class Scheduler:
         return self._schedule_decode()
 
     def _compute_draft(self, seq: Sequence):
-        """给一个running序列计算本步n-gram草稿（CPU，无GPU成本）。
+        """给一个running序列准备本步草稿。
+
+        - ngram模式：每步CPU重新搜索（历史窗口）。
+        - medusa模式：草稿由engine在上一轮verify后用GPU头前向算出并写回
+          seq.draft_tokens——已设置的保留；未设置的（刚完成prefill、或上一轮
+          是回落步）用n-gram兜底，保证第一步也能投机。
 
         上限 = min(最大草稿数, 剩余输出预算-1)：每步至少产出1个token（bonus/
         拒绝样本），所以草稿数最多 = remaining-1，保证追加后不超max_tokens。
         """
+        if self.spec_mode == "medusa" and seq.draft_tokens is not None:
+            return  # engine已设置（GPU头前向），保持
         remaining = seq.max_tokens - seq.num_completion_tokens - 1
         max_len = min(self.max_draft_len, remaining)
         if max_len <= 0:

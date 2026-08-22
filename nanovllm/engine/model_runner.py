@@ -34,10 +34,26 @@ class ModelRunner:
         # 加载预训练权重到模型上
         load_model(self.model, config.model)
         self.sampler = Sampler()
+        # Medusa多头（投机草稿源）：挂在backbone最后一层hidden之后、LM head之前；
+        # 权重由 benchmarks/medusa_train.py 自蒸馏训练产出
+        if config.speculative == "medusa":
+            from nanovllm.layers.medusa import MedusaHeads
+            heads = MedusaHeads(config.max_draft_len + 1, hf_config.hidden_size,
+                                config.medusa_hidden, hf_config.vocab_size)
+            state = torch.load(config.medusa_path, map_location="cpu")
+            heads.load_state_dict(state)
+            heads.to(device="cuda", dtype=hf_config.dtype)
+            self.medusa_heads = heads
         # W8A8权重量化（SmoothQuant式：校准激活通道分布→折叠进权重→per-channel int8 + Triton int8 GEMM）
         # 放在sampler之后：校准用的run()会调用sampler
         if config.quantization == "w8a8":
             self.calibrate_and_quantize_w8a8()
+        elif config.quantization == "int4":
+            self.quantize_int4_weights()
+        elif config.quantization == "awq":
+            self.quantize_awq_weights()
+        elif config.quantization == "sparse24":
+            self.prune_sparse24()
         # 调用预热方法，执行一次模拟prefill来分配显存、初始化CUDA内核，并测量峰值显存
         self.warmup_model()
         # 分配KV Cache的显存空间，并根据模型层数将KV Cache引用绑定到各注意力层
@@ -46,7 +62,7 @@ class ModelRunner:
         if not self.enforce_eager:
             self.capture_cudagraph()
             # 投机解码：再捕获verify前向（varlen）的graph族（固定容量+空行填充）
-            if config.speculative == "ngram":
+            if config.speculative in ("ngram", "medusa"):
                 self.capture_spec_graph()
 
         torch.set_default_device("cpu")
@@ -180,6 +196,88 @@ class ModelRunner:
         for m in linears:
             m.quantize_w8a8(m.x_max)
             del m.x_max
+
+    def _quant_mods(self):
+        """参与权重量化的模块：全部 LinearBase；LM head 默认不量化（quantize_lm_head=True
+        才纳入——logits 由 lm_head 点积直接决定，量化它精度损失最大，见 BENCHMARKS.md §10）。
+
+        词嵌入是查表，不量化；权重绑定时（tie_word_embeddings）LM head 与词嵌入共享存储，
+        强制跳过。
+        """
+        from nanovllm.layers.linear import LinearBase
+        from nanovllm.layers.embed_head import ParallelLMHead
+        mods = [m for m in self.model.modules() if isinstance(m, (LinearBase, ParallelLMHead))]
+        if not self.config.quantize_lm_head or self.config.hf_config.tie_word_embeddings:
+            mods = [m for m in mods if not isinstance(m, ParallelLMHead)]
+        return mods
+
+    def quantize_int4_weights(self):
+        """int4 per-group（128）权重量化，无激活缩放（Triton 反量化 GEMM）。"""
+        for m in self._quant_mods():
+            m.quantize_int4(dense_path=self.config.int4_dense_path)
+
+    def prune_sparse24(self):
+        """2:4 结构化剪枝 + cuSPARSELt 半结构化权重（torch.sparse.semi_structured）。"""
+        for m in self._quant_mods():
+            m.quantize_sparse24()
+
+    def quantize_awq_weights(self):
+        """AWQ：激活感知缩放 + int4 per-group 量化。
+
+        校准数据来源：awq_scales_path（真实文本，benchmarks/awq_calibrate.py 产出，
+        推荐）或内联随机 token 校准（与 w8a8/fp8 KV 校准同源数据，零额外文件）。
+        """
+        mods = self._quant_mods()
+        dp = self.config.int4_dense_path
+        if self.config.awq_scales_path:
+            state = torch.load(self.config.awq_scales_path, map_location="cpu")
+            found = 0
+            for name, m in self.model.named_modules():
+                if name in state:
+                    m.quantize_int4(state[name], dense_path=dp)
+                    found += 1
+            assert found == len(mods), f"awq scales cover {found}/{len(mods)} quantized modules"
+        else:
+            scales = self._calibrate_awq_scales(mods)
+            for m, s in zip(mods, scales):
+                m.quantize_int4(s, dense_path=dp)
+
+    def _calibrate_awq_scales(self, mods) -> list[torch.Tensor]:
+        """内联校准：随机token prefill 收集每层输入逐通道 mean|X|，AWQ式 s = mean^0.5 归一化。"""
+        hooks = []
+        for m in mods:
+            m.x_sum = None
+            m.x_count = 0
+
+            def make_hook(mod):
+                def hook(_mod, args):
+                    x = args[0].float()
+                    s = x.abs().sum(dim=0)
+                    if mod.x_sum is None:
+                        mod.x_sum = s.cpu()
+                    else:
+                        mod.x_sum += s.cpu()
+                    mod.x_count += x.shape[0]
+                return hook
+            hooks.append(m.register_forward_pre_hook(make_hook(m)))
+        seq_len = min(self.config.max_num_batched_tokens, self.config.max_model_len)
+        num_seqs = min(self.config.max_num_batched_tokens // seq_len, self.config.max_num_seqs)
+        vocab = min(self.config.hf_config.vocab_size, 50000)
+        rng = torch.Generator(device="cuda").manual_seed(42)
+        seqs = [Sequence(torch.randint(0, vocab, (seq_len,), generator=rng).tolist()) for _ in range(num_seqs)]
+        for seq in seqs:
+            seq.num_scheduled_tokens = seq_len
+        self.run(seqs, "prefill")
+        for h in hooks:
+            h.remove()
+        scales = []
+        for m in mods:
+            mean = m.x_sum / max(m.x_count, 1)
+            s = mean.clamp(min=1e-8) ** 0.5
+            s = s / s.mean()  # 归一化保持输出量级（几何均值≈1）
+            scales.append(s.to(self.config.hf_config.dtype))
+            del m.x_sum, m.x_count
+        return scales
 
     def calibrate_fp8_kv(self):
         layers = [m for m in self.model.modules() if hasattr(m, "calibrating")]
@@ -495,13 +593,13 @@ class ModelRunner:
 
     # 装饰器，该方法在推理模式下使用，禁用梯度计算和额外的梯度计算性能优化
     @torch.inference_mode()
-    def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, kind: str):
+    def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, kind: str,
+                  return_hidden: bool = False):
         # 纯spec批次（verify）走spec CUDA graph：固定容量+零长度行填充，消除eager的
         # 逐kernel启动税（实测~10ms/步，见BENCHMARKS.md §9）。按本步最大query长度
-        # 选stride家族（低γ步用stride-3图，容量=3×行数，减少填充浪费）；fp8的verify
-        # 路径（每层全缓存反量化）不吃graph收益，保持eager。
+        # 选stride家族（低γ步用stride-3图，容量=3×行数，减少填充浪费）。
+        # fp8也入图：fp8 verify走自研varlen内核（直接读fp8缓存，无反量化）。
         if (kind == "spec" and not self.enforce_eager
-                and self.config.kv_cache_dtype != "fp8_e4m3"
                 and getattr(self, "spec_graphs", None)):
             context = get_context()
             rows = context.cu_seqlens_q.size(0) - 1
@@ -509,11 +607,15 @@ class ModelRunner:
             s = next((x for x in self.spec_strides if x >= stride), None)
             cap = next((r for r in self.spec_graph_rows if r >= rows), None)
             if s is not None and cap is not None and (s, cap) in self.spec_graphs:
-                return self._run_spec_graph(input_ids, positions, s, cap, rows)
+                hidden = self._spec_graph_hidden(input_ids, positions, s, cap, rows)
+                logits = self.model.compute_logits(hidden)
+                return (logits, hidden) if return_hidden else logits
         # 只有纯decode批次且非强制eager且batch<=512时走CUDA graph；
         # prefill与mixed批次一律eager（mixed含prefill行，无法用纯decode图）
         if kind != "decode" or self.enforce_eager or input_ids.size(0) > 512:
-            return self.model.compute_logits(self.model(input_ids, positions))
+            hidden = self.model(input_ids, positions)
+            logits = self.model.compute_logits(hidden)
+            return (logits, hidden) if return_hidden else logits
         else: # 否则执行decode
             # 获取batch_size
             bs = input_ids.size(0)
@@ -540,15 +642,17 @@ class ModelRunner:
             # 重放CUDA Graph，执行模型前向
             graph.replay()
             # 从图输出张量中取出前batch_size个隐藏状态，计算完logits后返回
-            return self.model.compute_logits(graph_vars["outputs"][:bs])
+            hidden = graph_vars["outputs"][:bs]
+            logits = self.model.compute_logits(hidden)
+            return (logits, hidden) if return_hidden else logits
 
-    def _run_spec_graph(self, input_ids: torch.Tensor, positions: torch.Tensor,
-                        stride: int, cap_rows: int, rows: int) -> torch.Tensor:
-        """重放verify CUDA graph：真实行拷入静态张量，尾部用零长度行填充。
+    def _spec_graph_hidden(self, input_ids: torch.Tensor, positions: torch.Tensor,
+                           stride: int, cap_rows: int, rows: int) -> torch.Tensor:
+        """重放verify CUDA graph，返回真实行的最后一层hidden。
 
         - cu_seqlens 尾部重复末值 → flash varlen 按空行跳过（bit-exact，probe验证）；
         - slot_mapping 填充 -1（store_kvcache跳过）；input_ids/positions 填 0；
-        - LM head 在图外对真实行切片计算（省掉填充行的词表GEMM）。
+        - 返回 hidden[:real_tok]（LM head/Medusa 头在图外对真实行计算）。
         """
         config = self.config
         context = get_context()
@@ -568,7 +672,7 @@ class ModelRunner:
         v["block_tables"][:rows, :context.block_tables.size(1)] = context.block_tables
         v["block_tables"][rows:cap_rows] = 0
         self.spec_graphs[(stride, cap_rows)].replay()
-        return self.model.compute_logits(v["outputs"][:real_tok])
+        return v["outputs"][:real_tok]
 
     @torch.inference_mode()
     def capture_spec_graph(self):
@@ -629,7 +733,8 @@ class ModelRunner:
                                     outputs=outputs)
 
     # run流程：准备输入、运行模型、采样、返回生成的token id列表
-    def run(self, seqs: list[Sequence], kind: str, return_logits: bool = False):
+    def run(self, seqs: list[Sequence], kind: str, return_logits: bool = False,
+            return_hidden: bool = False):
         if kind == "mixed":
             input_ids, positions = self.prepare_mixed(seqs)
         elif kind == "prefill":
@@ -639,13 +744,20 @@ class ModelRunner:
         else:
             input_ids, positions = self.prepare_decode(seqs)
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
-        logits = self.run_model(input_ids, positions, kind)
+        logits = self.run_model(input_ids, positions, kind, return_hidden)
+        hidden = None
+        if return_hidden:
+            logits, hidden = logits
         # 主进程通过采样器从logits中采样得到token id列表
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
         reset_context()
         if return_logits:
             # 精度检查用：返回本步logits（fp32，driver侧）
+            if return_hidden:
+                return token_ids, logits.float() if self.rank == 0 else None, hidden
             return token_ids, logits.float() if self.rank == 0 else None
+        if return_hidden:
+            return token_ids, hidden
         return token_ids
 
     # 捕获CUDA Graph以加速decode阶段

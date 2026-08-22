@@ -1,7 +1,7 @@
 """Step-level timing breakdown of the nano-vllm engine.
 
 Pins down where per-step decode time goes (schedule / COW / run / postprocess).
-Usage: python benchmarks/_step_timing.py [fp8_e4m3|auto] [long|small] [eager]
+Usage: python benchmarks/_step_timing.py [auto|fp8_e4m3] [long|small] [eager|quant] [awq_path]
 """
 import json
 import os
@@ -14,6 +14,8 @@ from nanovllm import LLM, SamplingParams
 kv_dtype = sys.argv[1] if len(sys.argv) > 1 else "fp8_e4m3"
 tag = sys.argv[2] if len(sys.argv) > 2 else "long"
 eager = len(sys.argv) > 3 and sys.argv[3] == "eager"
+quant = sys.argv[3] if len(sys.argv) > 3 and sys.argv[3] != "eager" else "none"
+awq_path = sys.argv[4] if len(sys.argv) > 4 else ""
 with open(os.path.join("results", f"compare_workload_{tag}.json"), encoding="utf-8") as f:
     spec = json.load(f)
 prompts = spec["prompts"]
@@ -21,7 +23,7 @@ max_tokens = spec["max_tokens"]
 
 llm = LLM(os.path.expanduser("~/huggingface/Qwen3-0.6B/"), enforce_eager=eager,
           max_model_len=4096, gpu_memory_utilization=0.9,
-          kv_cache_dtype=kv_dtype, quantization="none")
+          kv_cache_dtype=kv_dtype, quantization=quant, awq_scales_path=awq_path)
 llm.generate(["warm up"] * 8, SamplingParams(temperature=0.6, max_tokens=8), use_tqdm=False)
 
 for p, mt in zip(prompts, max_tokens):
@@ -55,7 +57,7 @@ for name, arr, kind in (("schedule", t_sched, None), ("cow", t_cow, None),
 
 dec = [r for r, k in zip(t_run, step_kinds) if k == "decode"]
 pre = [r for r, k in zip(t_run, step_kinds) if k == "prefill"]
-print(f"== kv={kv_dtype} tag={tag} ==")
+print(f"== kv={kv_dtype} tag={tag} quant={quant} awq={awq_path} ==")
 print(f"run(decode)  n={len(dec):4d} avg={statistics.fmean(dec) * 1000:7.1f}ms p50={statistics.median(dec) * 1000:7.1f}ms p99={sorted(dec)[int(len(dec) * 0.99)] * 1000:7.1f}ms")
 if pre:
     print(f"run(prefill) n={len(pre):4d} avg={statistics.fmean(pre) * 1000:7.1f}ms p50={statistics.median(pre) * 1000:7.1f}ms")

@@ -48,7 +48,7 @@ def run_timed(llm, prompts, sps, spec_mode: bool):
         if any(s.draft_tokens is not None for s in seqs):
             rows_per_step.append(sum(1 for s in seqs if s.draft_tokens is not None))
         if any(s.draft_tokens is not None for s in seqs):
-            token_lists, n_dec, _, _, _ = llm._verify(seqs, token_ids)
+            token_lists, n_dec, _, _, _, _ = llm._verify(seqs, token_ids)
             llm.scheduler.postprocess_spec(seqs, token_lists)
         else:
             llm.scheduler.postprocess(seqs, token_ids)

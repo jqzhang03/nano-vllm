@@ -261,9 +261,100 @@ python benchmarks/compare_merge.py results/compare_*.json   # → results/compar
 **诚实结论**：
 1. **verify 路径本身效率没问题**（47µs/tok vs decode 110µs/tok，2.3× 更优）；初版打平的真相是 **eager 启动税**。CUDA graph 化后 **α≈1 时全面赢**（bs=256 +43%、bs=8 +3.87×），延迟（TPOT）大改善（-44% ~ -77%）。
 2. **剩余亏损场景 = 草稿质量低**（α < 0.4 时 γ 个草稿大半浪费）：0.6B 模型在自由文本/非 echo 结构上的续写重复度低。这是草稿源的问题（Medusa 头的用武之地），verify 路径已就绪。
-3. **fp8 KV + spec 仍不可用（0.15×）**：fp8 的前缀复用 prefill 路径每层每次**全缓存反量化**（`k_cache.to(k.dtype)*k_scale`，802 块 × 28 层 ≈ 18GB/步 内存搬运）——这是 GPU 侧成本，graph 也救不了。修复需自研 fp8 varlen 内核（或缓存镜像，但会抵消 fp8 的容量收益）。正确性不受影响（fp8 对齐全过）。
-4. **对路线图的含义（更新）**：Medusa 的 verify 形状与 n-gram 相同，**verify 路径已 graph 化、直接受益**；下一步瓶颈转移到草稿质量（Medusa 头）+ fp8 verify 内核。
+3. **fp8 KV + spec 已解锁（自研 fp8 varlen 内核，`_fp8_varlen_check.py` bit-exact 验证）**：此前 0.15× 的根因是 fp8 前缀复用路径每层每次**全缓存反量化**（`k_cache.to(k.dtype)*k_scale`，802 块 × 28 层 ≈ 18GB/步 内存搬运）。新内核 `paged_varlen_attention_fp8`（v7）是 v6 decode 内核的多查询扩展：per (seq, kv_head) program、Q≤5 列（QPAD=16，GQA 融合）、直接 fp8 load + 硬件 cvt 反量化、逐列因果掩码（query r attend keys ≤ seqlen-Q+r，**注意必须 `<=` 含 query 自己的 key——`<` 差 1 会让真实数据的 logits 差 9-25**）。fp8 verify 同步纳入 CUDA graph。**效果（bs=8）：repeat 0.15×→+3.92×、free 0.23×→+1.31×；bs=256：repeat +1.53×、free 0.66×——与 fp16 spec 同量级**，且 fp8 容量优势（802 vs 421 块）不变。剩余差距：普通 prefill（前缀复用）仍走反量化（prefill 步少，代价可接受）。
+4. **对路线图的含义（更新）**：verify 路径已 graph 化 + fp8 内核就绪，投机解码的工程侧闭环；剩余瓶颈 = 草稿质量（0.6B 模型 top-1 可预测性 ~35% 的天花板）。
 5. 条件：WSL2 单卡、flash-attn 2.8.3、bs=8/256、Qwen3-0.6B（0.6B 模型的续写重复度低，α 天然偏低；大模型 + 结构化内容 α 更高，结论会右移）。vLLM 同款 n-gram 的对照测试（vllm-compare 环境）留作后续。
+
+### 9b. Medusa 多头（`--speculative medusa --medusa-path ...`）
+
+**结构**（`nanovllm/layers/medusa.py`）：γ+1 个小型 MLP 头（1024→256→151936，SiLU），共享最后一层 hidden（norm 后、LM head 前）。**语义约定**：head_k(h_t) 预测位置 t+k+1 的 token（训练标签 = 自蒸馏的 token_{t+k+1}）；推理时 draft 输入行 = 验收后新 t_last 的 hidden（当前 verify 输入的第 min(n_acc, γ_i) 行：非全接受时 t_last 是第 n_acc 个输入 token；**全接受时 bonus 是采样产物、无 hidden → 用第 γ_i 行 + head 偏移 1**）。draft 成本 = 每步一次批量头前向 + argmax（~0.5ms）。
+
+**训练**（`benchmarks/medusa_train.py`，自蒸馏）：模型自己生成 192 条序列 × 256 token（真实 prompt + 随机 token 混合，temp=0.8）→ 整批 prefill 提取最后一层 hidden [49K, 1024] + 标签 → AdamW 3000 步（~7 分钟，**必须先 exit 引擎再训练**——实测引擎占显存时每步 7.3s vs 释放后 123ms，caching allocator 在 15.8/16GB 压力下的分配开销）。
+
+**踩坑记录**（三个集成 bug，均已被集成检查 `_medusa_integration.py` 定位）：
+1. 训练标签错位 1（head_0 训成了"预测当前位置"→ draft_1≈t_last 永不接受，α≈0）；
+2. `postprocess_spec` 清零 `num_scheduled_tokens` 后 `_medusa_drafts` 读它 → 行索引全错（须在 postprocess 前捕获每行行数）；
+3. `capture_spec_graph` 只对 ngram 模式调用（medusa 的 verify 走了 eager）。另：`hf_config.dtype` 是 **bf16**（不是 fp16），头权重加载须对齐。
+
+**验证**（`_medusa_debug.py` 单元级 + `_medusa_integration.py` 引擎级）：
+- head_0 top-1 vs 模型 LM head argmax = **47%**（学到模型分布）；vs 真实 next = 30.9%（模型上限 35.3% 的 87%）——**头是好的**；
+- head_1..4 vs 模型 argmax = 15%/14%/5%/11%（远位置预测天然更难）；
+- 引擎实际 draft_1 vs 模型 argmax = 49% 重合（集成正确）。
+
+**性能（`spec_bench.py`，Qwen3-0.6B）**：
+
+| 场景 | medusa α | 吞吐 |
+|---|---|---|
+| repeat bs=8 | 0.25 | **+1.57×（赢）**，TPOT 5.4→4.4ms |
+| repeat bs=256 | 0.27 | 0.61× |
+| free bs=8 / bs=256 | 0.04 / 0.06 | 0.70× / 0.59× |
+| json bs=8 / bs=256 | 0.02 / 0.02 | 0.67× / 0.49× |
+
+**诚实结论**：
+1. **实现正确、头有效**（head_0 达模型 top-1 的 87%），但 **0.6B 模型的可预测性是 α 的天花板**：自由文本 top-1 仅 35%，且 temp=0.6 采样只有 ~20-30% 概率等于 argmax → 即使 draft 完美（=模型 argmax），接受率也只有 ~20-30%；head_1..4 更弱（远位置预测难）。**α≈0.05-0.25 的现实意味着 1+αγ 的产出（1.2-2.0 token/行）难以覆盖 verify 的 γ+1 行成本（GPU 时间主导的大 batch）**。
+2. **只在小 batch（launch 摊销）且高可预测内容上赢**（repeat bs=8 +1.57×）；大 batch 亏。
+3. **vs n-gram**：重复内容上 ngram 更优（draft 免费 + 历史抄写 α≈1，bs=8 +3.87×）；medusa 的定位是"不重复但可预测"的内容（如代码/结构化续写）——0.6B 模型上这个窗口很小（json bs=8 也只有 0.67×，因为该模型的 JSON 续写也不够可预测）。
+4. **可改进点**（按收益排序）：训练数据扩大（原文用百万级 token，这里仅 49K）与更久训练 → 提升 head_1..4；medusa_hidden 256→512；tree attention（Medusa-2，把"验证多候选"的 γ+1 成本摊给更多候选）——但**模型可预测性天花板不随这些改变**；换更大的目标模型（7B+，top-1 更高）收益会显著右移。
+5. 训练/推理均单卡 WSL2；head 权重 `results/medusa_heads.pt`（~480MB fp32）。
+
+### 10. INT4/AWQ 与 2:4 稀疏（`--quantization int4|awq|sparse24`）
+
+**背景**：路线图的最后两项——INT4 权重量化（目标 4× 权重压缩）与 NVIDIA 2:4 结构化稀疏。两者都落地为自研 Triton 内核 + 引擎集成（`nanovllm/layers/linear.py` 的 `WeightQuantMixin`，LinearBase 与 ParallelLMHead 共用；`quantize_lm_head` 默认关闭——Qwen3-0.6B `tie_word_embeddings=True`，lm_head 与词嵌入共享存储，本就走守卫跳过）。
+
+#### 10.1 INT4（per-group 128，对称）+ 自研反量化 GEMM
+
+**方案**：per-group（K 维 128 分组，AWQ 标准）对称 int4（组 scale = 组amax/7，码偏移 +8）；打包沿输入维——字节 `(n, j)` 低/高半字节 = 输出通道 n 在 k=2j/2j+1 的码，存储 `[N, K//2]` int8（0.25× + scale）。**内核 2-dot 拆分**：a_e/a_o 按 K 奇偶步长 2 加载，与拆出的 lo/hi 分别 dot——避免 v1 的 `tl.interleave` 寄存器布局转换（v1 实测 0.25-0.67×，v2 小 M 最高 4.4×，`_int4_tune.py`）。**双路径模式（默认开，`int4_dense_path=False` 关闭）**：quantize 时额外保存稠密反量化副本 `w_deq`（bf16，AWQ 时 /s 还原到原始尺度），forward 按形态路由——**M≤128 且 N≥2048**（int4 唯一赢的形态：小 M 大 N 的权重带宽主导）走 int4 内核，其余（大 M prefill/decode、小 N 的 o/down 层）走 `F.linear(x, w_deq)` 稠密 cuBLAS——两条路径对同一份 q/scale **数学恒等**（`_int4_check.py` 验证 max|Δ| 0.008-0.016 = bf16 舍入级）。
+
+**独立验证**（`_int4_check.py`，vs 反量化 fp16 参考）：max abs err 0.004-0.008（纯 bf16 舍入级）✓；`_int4_layers.py` 三层分离（fp16 / 内核 / 反量化参考）：内核 vs 参考 logits mean diff 0.038（正确），误差来自量化本身且随层深累积（层 0 的 0.04 → 层 27 的 2.1，离群位置 max 达 3864——激活离群通道正是 AWQ 的目标）。
+
+**踩坑记录**（两个集成 bug）：
+1. **打包列块偏移缺失**：`offs_j` 未加 `pid_n·(BLOCK_N//2)` → 所有 N 块≥1 的程序都读通道 0-63（独立检查小形状全过，大 N 才炸）。定位手法：按 N 块打印误差分布（块 0 全对、其余全错）一眼锁定。教训：**小形状检查通过 ≠ 内核正确，必须覆盖多块路径**。
+2. **AWQ 方向三连错**（见 10.2）：`W·s 且 X·s`（KL 8.6）→ `W/s 且 X·s`（组塌缩 KL 12.4）→ 论文方向 `W·s 且 X/s`（KL 2.0 但 ppl 3.76 胜出）。
+
+**精度**（`_quant_ppl.py` 真实文本困惑度，12 序列 3060 token，决定性指标）：
+
+| 模式 | PPL | vs fp16 | 8-prompt KL | top-1 |
+|---|---|---|---|---|
+| fp16 | 3.32 | — | — | — |
+| int4 (RTN) | **4.38** | +32% | 1.08 | 50% |
+| awq（α 搜索） | **3.76** | **+13%** | 2.03* | 37.5% |
+
+\* 8-prompt KL 被个别极端位置主导（seq3 的 p=0.93 单点贡献 ~1.4），与 ppl 结论相反——**小样本 logits 指标会骗人，困惑度才是端到端真相**。`_awq_diagnose.py`：AWQ 缩放逐层输出误差在引擎真实激活上 **112/112 层全赢**（-10~30%）。
+
+**吞吐**（clean workload：in 64-256 / out 32-128；int4/awq 为双路径默认配置）：
+
+| 模式 | bs=256 吞吐 | bs=8 吞吐 | bs=256 TPOT p50 | bs=8 TPOT/TTFT |
+|---|---|---|---|---|
+| fp16 | 4792 tok/s | 1099 tok/s | 33.1ms | 5.7ms / 33.9ms |
+| w8a8（参照） | 4183（0.87×） | — | 35.5ms | — |
+| int4（双路径） | 5057（**1.06×**） | 1488（**1.35×**） | 32.6ms | 4.2ms / 29.2ms |
+| awq（双路径） | 4932（1.03×） | 1305（1.19×） | 32.6ms | 4.8ms / 30.7ms |
+| int4（纯，`int4_dense_path=False`） | 3073（0.64×） | 1033（0.94×） | 46.9ms | 5.7ms / 55.1ms |
+| sparse24 | 2357（0.49×） | 385（0.35×） | 63.3ms | 9.4ms / 426.8ms |
+
+**双路径模式的权衡**：吞吐从"bs=8 持平 / bs=256 0.64×"变成"**bs=8 +35%、bs=256 +3~6%、TTFT 恢复**"（decode M≤128 的 qkv/gate_up/lm_head 走 int4 赢、o/down 走稠密不亏、大 M 全稠密），代价是**权重显存 1.730GB——比 fp16 的 1.503GB 还大 15%**（int4 220MB + w_deq 881MB + scale 7MB，w_deq 是 bf16 全尺寸副本）。`int4_dense_path=False` 回到纯 int4 显存模式（0.850GB）。精度不变（KL 1.08 / awq ppl 3.76；int4+fp8 KV 组合 KL 1.13 正常）。
+
+**诚实解读**：软件 int4 的赢面只在**权重带宽主导的小 M GEMM**——微基准 gate_up M=8 **4.36×**、lm_head M=8 3.42×、qkv 1.6-2.0×；但 down_proj（K=4096）只有 0.40×，M≥128 全输（0.2-0.6×，MMA 计数与稠密相同 + 反量化开销，cuBLAS 不可战胜）。**双路径把"每层走自己赢的形态"落地**：端到端吞吐反超 fp16（小 batch 明显、大 batch 微赢），代价是显存。这是"带宽优化型内核在计算主导区间的天花板"的正面解法——不是跟 cuBLAS 硬碰，而是按形态路由。纯 int4 仍是显存优先选项（0.85GB，0.57×）。
+
+#### 10.2 AWQ（激活感知缩放 + 按层 α 搜索）
+
+**方案**（`benchmarks/awq_calibrate.py`）：真实文本校准（20 提示 + 12 条模型自生成续写）→ 每层收集输入逐通道 mean|X| 与激活样本 → **按层网格搜索 α ∈ {0..1.0}**，缩放 `s = (mean|X| / w_col)^α`（含权重项的均衡化形式，α=0 即 RTN 基线），目标 = 校准批上的量化输出误差 `||(Q(W·s)/s − W)·X^T||_F`（llm-awq 同款逐层搜索）→ 保存 `results/awq_scales.pt`。推理折叠：`W'=W·s, X'=X/s`（**论文方向，权重乘、激活除**——反了会塌缩，见 10.1 踩坑 2）。
+
+**搜索结果**：112 层全部选到 α=0.2~0.6（典型 0.3-0.4），s 范围 ~0.1-5（gate_up 输入离群结构最明显）；引擎真实激活上逐层误差 112/112 全赢。**端到端 ppl 4.38 → 3.76**（把 int4 相对 fp16 的差距砍半）。引擎侧用法：`quantization="awq"` + `awq_scales_path`（真实文本校准，推荐）；不带路径时内联随机 token 校准兜底（质量略差）。
+
+#### 10.3 2:4 结构化稀疏（自研 Triton 内核）
+
+**方案**：幅值剪枝（每组 4 个连续输入通道保留最大 2 个）+ 打包 `v [N, K//2] bf16`（非零值）+ `idx [N, K//4] uint8`（每槽 2bit 偏移 ×2 槽/字节）→ **4 路拆分内核**：a_p 按 K 步长 4 加载、`idx==p` 掩码重建权重块、4 个 (BM, BK/4)×(BK/4, BN) dot。权重字节 0.625×稠密。
+
+**独立验证**（`_sparse24_check.py`，vs 剪枝稠密参考）：**近 bit-exact**（max err 0.004，mean 0）✓；`_sparse24_layers.py` 三层分离确认内核 == 剪枝参考。
+
+**为什么不用 torch 官方路径**（`_sparse24_probe.py`，sm_120 实测）：CUTLASS 后端**仅支持 compute capability 8.x**（Ampere）；cuSPARSELt 可用但**每调用开销 0.3-0.5ms** → MLP 层只有稠密 0.02-0.17×（仅 lm_head 大权重小 M 有 1.7×），且 CUDA graph 重放非确定性。自研内核在这些形状上 5-30× 优于官方路径。
+
+**精度（关键发现）**：**一次性幅值 2:4 剪枝对 0.6B 是精度灾难**——权重 Frobenius 相对误差 0.346-0.364（丢弃 ~35% 权重质量），逐层漂移 0.10 → 6.03 累积，**KL 8.5、top-1 0%**（非内核问题，剪枝算法本身的代价；SparseGPT 式误差补偿剪枝或剪枝感知训练是修复路线）。
+
+**性能**：只有大 N 小 M 的权重带宽主导 GEMM 赢（gate_up M=8 **1.84×**、lm_head M=8 1.24×），其余 0.2-0.5×；引擎级 **bs=8 0.35×、bs=256 0.49×**（decode 步 28.7ms vs 13.3ms）。软件 2:4 的硬限制：**MMA 数与稠密相同**（Triton 无稀疏 MMA 指令），4 路掩码重建是纯开销——它只是带宽优化，真正的 2:4 计算加速需要硬件稀疏 MMA（Ampere 专用指令/cuSPARSELt 高效封装），在 sm_120 上本仓库的结论是**做显存/带宽优化可、做吞吐加速不可**。
+
+**结论与路线**：INT4/AWQ 是"完成且可用"的（双路径：ppl +13%、吞吐超 fp16、显存 1.73GB；纯 int4：显存 0.57×、大 batch 慢；按需二选一）。进一步路线 = Marlin 式持久内核 / w_deq 降精度存储（fp8 会引入 dequant 流量，不划算）收显存。2:4 的落地瓶颈在剪枝算法与硬件支持，而非内核。全部结论条件：RTX 5060 Ti（sm_120）、Qwen3-0.6B、bf16、WSL2 单卡。
 
 ## Profiling
 
