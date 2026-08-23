@@ -56,10 +56,13 @@ def run_timed(llm, prompts, sps, spec_mode: bool):
 
 
 def main():
+    global MODEL
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--model", default=MODEL, help="模型目录（默认 Qwen3-0.6B）")
     p.add_argument("--bs", type=int, default=256)
     p.add_argument("--out-len", type=int, default=96)
     args = p.parse_args()
+    MODEL = os.path.expanduser(args.model)  # bash argv 不展开 ~ → 手动展开
 
     text = "Repeat exactly, continuing the same digit forever: " + " ".join(["5"] * 40)
     prompts = [text] * args.bs

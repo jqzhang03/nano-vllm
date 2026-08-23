@@ -1,7 +1,7 @@
 """各量化模式的模型权重显存占用（按参数/缓冲区实际字节数统计）。
 
-用法：python benchmarks/_quant_mem.py [none|w8a8|int4|awq|sparse24] [awq_scales_path] [nodense]
-第三参 nodense：int4/awq 关闭稠密反量化路径（纯 int4 显存模式）。
+用法：python benchmarks/_quant_mem.py [model] [none|w8a8|int4|awq|sparse24] [awq_scales_path] [nodense]
+model 缺省 = Qwen3-0.6B；第三参 nodense：int4/awq 关闭稠密反量化路径（纯 int4 显存模式）。
 """
 import os
 import sys
@@ -10,10 +10,11 @@ import torch
 
 from nanovllm import LLM
 
-mode = sys.argv[1] if len(sys.argv) > 1 else "none"
-awq_path = sys.argv[2] if len(sys.argv) > 2 else ""
-dense_path = not (len(sys.argv) > 3 and sys.argv[3] == "nodense")
-llm = LLM(os.path.expanduser("~/huggingface/Qwen3-0.6B/"), quantization=mode,
+MODEL = os.path.expanduser(sys.argv[1]) if len(sys.argv) > 1 else os.path.expanduser("~/huggingface/Qwen3-0.6B/")
+mode = sys.argv[2] if len(sys.argv) > 2 else "none"
+awq_path = sys.argv[3] if len(sys.argv) > 3 else ""
+dense_path = not (len(sys.argv) > 4 and sys.argv[4] == "nodense")
+llm = LLM(MODEL, quantization=mode,
           awq_scales_path=awq_path, int4_dense_path=dense_path, max_model_len=4096)
 
 total = 0

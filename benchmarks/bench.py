@@ -110,9 +110,15 @@ def run_nanovllm(args, prompts, sampling_params):
               quantization=getattr(args, "quantization", "none"),
               awq_scales_path=getattr(args, "awq_scales_path", ""),
               quantize_lm_head=getattr(args, "quantize_lm_head", False),
-              speculative=getattr(args, "speculative", "none"))
-    # 预热：触发torch.compile/triton的JIT编译、分配KV Cache、捕获CUDA Graph
-    llm.generate(["warm up"] * args.warmup_seqs,
+              speculative=getattr(args, "speculative", "none"),
+              streaming_load=getattr(args, "streaming_load", False),
+              int4_dense_path=not getattr(args, "no_int4_dense_path", False),
+              kv_swap=not getattr(args, "no_swap_kv", False),
+              kv_swap_space_gb=getattr(args, "kv_swap_space_gb", 2.0))
+    # 预热：触发torch.compile/triton的JIT编译、分配KV Cache、捕获CUDA Graph。
+    # 用真实 workload prompts（而非 3-token 的 "warm up"）——fp8 的融合量化/硬件MMA
+    # 内核按 K 形状一次性 JIT 编译（~100-400ms），必须落在预热里而不是计时区间
+    llm.generate(prompts[: min(args.warmup_seqs, len(prompts))],
                  SamplingParams(temperature=0.6, max_tokens=8), use_tqdm=False)
     batches = []
     for i in range(args.repeat_batches):
@@ -188,6 +194,7 @@ def make_summary(metrics):
         "prefill_tokens": stats["prefill_tokens"],
         "decode_tokens": stats["decode_tokens"],
         "num_preemptions": metrics.get("num_preemptions", 0),
+        "num_swaps": metrics.get("num_swaps", 0),
     }
 
 
@@ -217,6 +224,7 @@ def print_report(args, wall, metrics, kv_info, vllm_res=None, out_path=None):
     line("decode", (f"{s['decode_tokens']} tok in {s['decode_steps']} steps"
                     + (f" ({s['decode_throughput_tok_per_s']:.0f} tok/s)" if s["decode_throughput_tok_per_s"] else "")))
     line("preemptions", f"{s['num_preemptions']} (KV cache 不足导致的抢占；0 表示容量充足)")
+    line("kv swaps", f"{s['num_swaps']} (KV 换出到 CPU 的次数；swap 免重新prefill)")
     line("TTFT", f"avg {_fmt_seconds(s['ttft']['avg'])} | p50 {_fmt_seconds(s['ttft']['p50'])} | "
                  f"p99 {_fmt_seconds(s['ttft']['p99'])} (n={s['ttft']['count']})")
     line("TPOT", f"avg {_fmt_seconds(s['tpot']['avg'])} | p50 {_fmt_seconds(s['tpot']['p50'])} | "
@@ -264,11 +272,23 @@ def parse_args():
                    help="KV缓存dtype: auto(模型dtype) 或 fp8_e4m3(FP8量化，容量翻倍)")
     p.add_argument("--quantization", default="none",
                    help="权重量化: none | w8a8(int8, Triton GEMM) | int4(per-group int4, Triton GEMM) | "
-                        "awq(int4+激活感知缩放) | sparse24(2:4结构化剪枝, Triton稀疏GEMM)")
+                        "awq(int4+激活感知缩放) | sparse24(2:4结构化剪枝, Triton稀疏GEMM) | "
+                        "fp8(e4m3全量化: per-column权重+per-token激活, Triton内核+硬件FP8 MMA)")
     p.add_argument("--awq-scales-path", default="",
                    help="AWQ缩放文件（benchmarks/awq_calibrate.py产出）；空=随机token内联校准")
     p.add_argument("--quantize-lm-head", action="store_true",
                    help="同时量化LM head（默认不量化，见BENCHMARKS.md §10）")
+    p.add_argument("--no-int4-dense-path", action="store_true",
+                   help="int4 关闭双路径模式（纯 int4 显存模式，0.85GB；吞吐回退见 BENCHMARKS.md §10；"
+                        "流式加载(7B+)自动强制关闭）")
+    p.add_argument("--no-swap-kv", action="store_true",
+                   help="关闭KV swap抢占（KV块不足时回退重算 recompute 而非换出到CPU；"
+                        "swap 仅 TP=1 且非 fp8 KV 时生效）")
+    p.add_argument("--kv-swap-space-gb", type=float, default=2.0,
+                   help="KV swap 的 CPU 缓冲空间上限（GB；换出累计超限回落 recompute）")
+    p.add_argument("--streaming-load", action="store_true",
+                   help="按层流式加载+即时量化（meta构造→逐layer物化→量化→释放fp16）；"
+                        "7B+ 在16GB卡上的前提。7B 大模型且启用量化时会自动开启，此参数强制开启")
     p.add_argument("--speculative", default="none",
                    help="投机解码: none 或 ngram(n-gram/prompt-lookup草稿, 无模型)")
     p.add_argument("--tp", type=int, default=1)
@@ -288,6 +308,7 @@ def parse_args():
 
 def main():
     args = parse_args()
+    args.model = os.path.expanduser(args.model)  # bash argv 不展开 ~ → 手动展开
     from transformers import AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=True) if args.prompts_file else None
     prompts, sampling_params = build_workload(args, tokenizer)

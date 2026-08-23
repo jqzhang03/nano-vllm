@@ -69,12 +69,14 @@ def make_scale(mean: torch.Tensor, w_col: torch.Tensor, alpha: float) -> torch.T
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--model", default=MODEL, help="模型目录（默认 Qwen3-0.6B）")
     ap.add_argument("--out", default="results/awq_scales.pt")
     ap.add_argument("--n-gen", type=int, default=12, help="模型自生成的真实文本序列数")
     ap.add_argument("--gen-len", type=int, default=256)
     args = ap.parse_args()
+    args.model = os.path.expanduser(args.model)  # bash argv 不展开 ~ → 手动展开
 
-    llm = LLM(MODEL, quantization="none", max_model_len=4096)
+    llm = LLM(args.model, quantization="none", max_model_len=4096)
     print("tie_word_embeddings:", llm.model_runner.config.hf_config.tie_word_embeddings)
     llm.generate(["warm up"] * 8, SamplingParams(temperature=0.6, max_tokens=8), use_tqdm=False)
 

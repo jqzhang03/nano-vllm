@@ -196,9 +196,12 @@ def check_distribution(fp8: bool) -> bool:
 
 
 def main():
+    global MODEL
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--model", default=MODEL, help="模型目录（默认 Qwen3-0.6B）")
     p.add_argument("--fp8", action="store_true", help="同时用fp8 KV cache跑对齐与分布检查")
     args = p.parse_args()
+    MODEL = os.path.expanduser(args.model)  # bash argv 不展开 ~ → 手动展开
 
     ok = check_logits_alignment(False)
     ok = check_verify_rows(False) and ok

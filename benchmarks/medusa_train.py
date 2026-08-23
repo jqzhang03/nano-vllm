@@ -89,6 +89,7 @@ def extract_features(llm: LLM, seqs: list[list[int]]) -> tuple[torch.Tensor, lis
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--model", default=MODEL, help="模型目录（默认 Qwen3-0.6B）")
     p.add_argument("--out", default="results/medusa_heads.pt")
     p.add_argument("--steps", type=int, default=3000)
     p.add_argument("--batch", type=int, default=512)
@@ -97,10 +98,11 @@ def main():
     p.add_argument("--seq-len", type=int, default=256)
     p.add_argument("--seed", type=int, default=0)
     args = p.parse_args()
+    args.model = os.path.expanduser(args.model)  # bash argv 不展开 ~ → 手动展开
     os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
 
     print(f"== 1/4 生成自蒸馏数据（{args.num_seqs} seqs × {args.seq_len} tok） ==")
-    llm = LLM(MODEL, gpu_memory_utilization=0.9)
+    llm = LLM(args.model, gpu_memory_utilization=0.9)
     llm.generate(["warm up"] * 4, SamplingParams(temperature=0.8, max_tokens=8), use_tqdm=False)
     seqs = generate_data(llm, args.num_seqs, args.seq_len, args.seed)
     print(f"   生成 {len(seqs)} 条序列")
@@ -149,7 +151,7 @@ def main():
     eval_prompts = [tokenizer.encode(pp) for pp in REAL_PROMPTS[:12]]
     sps = [SamplingParams(temperature=0.6, max_tokens=96, ignore_eos=True)] * len(eval_prompts)
     for mode, mpath in (("none", ""), ("ngram", ""), ("medusa", args.out)):
-        evallm = LLM(MODEL, speculative=mode, medusa_path=mpath, gpu_memory_utilization=0.9)
+        evallm = LLM(args.model, speculative=mode, medusa_path=mpath, gpu_memory_utilization=0.9)
         evallm.generate(["warm up"] * 4, SamplingParams(temperature=0.6, max_tokens=8), use_tqdm=False)
         t0 = time.perf_counter()
         evallm.generate(eval_prompts, sps, use_tqdm=False)

@@ -55,8 +55,10 @@ def run_case(style: str, speculative: str, prompts, tokenize, tokenizer, args):
         prompts_tok = tokenize()
     else:
         prompts_tok = [tokenizer.encode(t) for t in prompts]
-    llm = LLM(MODEL, speculative=speculative,
+    llm = LLM(args.model, speculative=speculative,
               medusa_path=args.medusa_path if speculative == "medusa" else "",
+              eagle_path=args.eagle_path if speculative == "eagle" else "",
+              max_draft_len=args.max_draft_len,
               kv_cache_dtype="fp8_e4m3" if args.fp8 else "auto",
               max_model_len=args.max_model_len, gpu_memory_utilization=args.gpu_memory_utilization)
     llm.generate(["warm up"] * 4, SamplingParams(temperature=0.6, max_tokens=8), use_tqdm=False)
@@ -100,10 +102,15 @@ def _summarize(vals):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--model", default=MODEL, help="模型目录（默认 Qwen3-0.6B）")
     p.add_argument("--styles", default="free,json,repeat")
     p.add_argument("--speculative", default="none,ngram",
                    help="逗号分隔的spec模式（none/ngram/medusa）；medusa需--medusa-path")
     p.add_argument("--medusa-path", default="results/medusa_heads.pt")
+    p.add_argument("--eagle-path", default="results/eagle_layer.pt",
+                   help="EAGLE草稿层权重（speculative含eagle时用）")
+    p.add_argument("--max-draft-len", type=int, default=4,
+                   help="最大草稿数γ（草稿成本/特征误差累积的权衡）")
     p.add_argument("--num-seqs", type=int, default=64)
     p.add_argument("--max-input-len", type=int, default=256)
     p.add_argument("--max-output-len", type=int, default=96)
@@ -113,9 +120,10 @@ def main():
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--output", default="results/spec_bench.csv")
     args = p.parse_args()
+    args.model = os.path.expanduser(args.model)  # bash argv 不展开 ~ → 手动展开
 
     os.makedirs("results", exist_ok=True)
-    tokenizer = AutoTokenizer.from_pretrained(MODEL, use_fast=True)
+    tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=True)
     rows = []
     for style in [s.strip() for s in args.styles.split(",")]:
         prompts, tokenize = build_prompts(style, tokenizer, args.num_seqs,
@@ -140,7 +148,7 @@ def main():
         w.writeheader()
         w.writerows(rows)
     with open(args.output.replace(".csv", ".json"), "w", encoding="utf-8") as f:
-        json.dump({"meta": {"model": MODEL, "num_seqs": args.num_seqs, "fp8": args.fp8},
+        json.dump({"meta": {"model": args.model, "num_seqs": args.num_seqs, "fp8": args.fp8},
                    "rows": rows}, f, indent=2)
     print(f"\nCSV -> {args.output}, JSON -> {args.output.replace('.csv', '.json')}")
 

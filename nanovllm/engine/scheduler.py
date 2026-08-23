@@ -1,6 +1,8 @@
 from collections import deque
 from time import perf_counter
 
+import torch
+
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence, SequenceStatus
 from nanovllm.engine.block_manager import BlockManager
@@ -17,17 +19,34 @@ class Scheduler:
         self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
+        self.swapped: deque[Sequence] = deque()  # KV swap 抢占：KV 已换出到 CPU 的序列
         self.num_preemptions = 0  # 抢占次数统计（基准测试使用）
+        self.num_swaps = 0  # KV swap 换出次数统计（基准测试使用）
         self.cow_pairs: list[tuple[int, int]] = []  # 本轮调度产生的COW复制对 (old_block_id, new_block_id)
+        self.swap_pairs: list[tuple[Sequence, list[int], object, str]] = []  # 本轮KV swap对 (seq, gpu块id, cpu缓冲, "out"/"in")——GPU拷贝由engine在run前执行
+        self._swap_buffers: dict[int, object] = {}  # seq_id → CPU pinned 缓冲（换出时分配，换入后释放）
+        # KV swap 仅 TP=1 且非 fp8 KV 时启用：fp8(float8_e4m3) 是 CUDA-only dtype，无法分配
+        # CPU pinned 缓冲；TP>1 的 spawn 进程不共享 CPU 内存（vLLM 用 shared memory，未实现）
+        self.kv_swap = config.kv_swap and config.tensor_parallel_size == 1 \
+            and config.kv_cache_dtype == "auto"
+        self._swap_max_bytes = int(config.kv_swap_space_gb * 1e9)
+        self._swap_bytes = 0  # 当前换出缓冲累计字节（超预算回落 recompute）
+        if self.kv_swap:
+            hf = config.hf_config
+            self._swap_layers = hf.num_hidden_layers
+            self._swap_kv_heads = hf.num_key_value_heads // config.tensor_parallel_size
+            self._swap_head_dim = (getattr(hf, "head_dim", None)
+                                   or hf.hidden_size // hf.num_attention_heads)
+            self._swap_dtype = hf.dtype
         # ---- 投机解码（n-gram / Medusa） ----
-        self.spec_decode = config.speculative in ("ngram", "medusa")
-        self.spec_mode = config.speculative   # "ngram" | "medusa"
+        self.spec_decode = config.speculative in ("ngram", "medusa", "eagle")
+        self.spec_mode = config.speculative   # "ngram" | "medusa" | "eagle"
         self.ngram_window = config.ngram_window
         self.ngram_min_window = config.ngram_min_window
         self.max_draft_len = config.max_draft_len
 
     def is_finished(self):
-        return not self.waiting and not self.running
+        return not self.waiting and not self.running and not self.swapped
 
     def add(self, seq: Sequence):
         self.waiting.append(seq)
@@ -46,6 +65,10 @@ class Scheduler:
         草稿时回落纯decode（CUDA graph路径，不损失）。
         """
         self.cow_pairs = []
+        self.swap_pairs = []
+        # KV swap 换入优先：把 KV 已换出到 CPU 的序列换回 GPU（free块足够时），
+        # 换入后直接参与本步 decode（KV 完整，无需重新 prefill）
+        self._try_swap_in()
         if self.spec_decode:
             for seq in self.running:
                 self._compute_draft(seq)
@@ -75,8 +98,8 @@ class Scheduler:
         上限 = min(最大草稿数, 剩余输出预算-1)：每步至少产出1个token（bonus/
         拒绝样本），所以草稿数最多 = remaining-1，保证追加后不超max_tokens。
         """
-        if self.spec_mode == "medusa" and seq.draft_tokens is not None:
-            return  # engine已设置（GPU头前向），保持
+        if self.spec_mode in ("medusa", "eagle") and seq.draft_tokens is not None:
+            return  # engine已设置（GPU头前向/草稿层自回归），保持
         remaining = seq.max_tokens - seq.num_completion_tokens - 1
         max_len = min(self.max_draft_len, remaining)
         if max_len <= 0:
@@ -312,16 +335,95 @@ class Scheduler:
         return scheduled_seqs, "decode"
 
     def preempt(self, seq: Sequence):
+        """抢占：KV 块不足时中断序列。
+
+        - kv_swap 开启且序列 KV 完整（decode/spec 序列）→ **swap_out**：KV 拷到
+          pinned CPU、释放 GPU 块；恢复时直接换回（bit-exact，免重新 prefill）。
+        - 否则（prefill 中途 / swap 关闭）→ **recompute**：释放块、回 waiting，
+          恢复时按前缀缓存重新 prefill（块哈希命中部分免算）。
+        """
         self.num_preemptions += 1
+        # can_swap：decode/spec 序列（KV 覆盖到 len-1，最后生成的 token 的 KV 本步才写——
+        # 换出拷贝已写入部分，恢复后最后 token 的 KV 由本步 decode 正常写入）。
+        # 不能用 cached == num_tokens（decode 序列恒差 1）；prefill 中途序列走 recompute
+        can_swap = (self.kv_swap and not seq.is_prefill and seq.block_table
+                    and self._swap_bytes < self._swap_max_bytes)
+        if can_swap:
+            self.swap_out(seq)
+        else:
+            seq.status = SequenceStatus.WAITING
+            seq.is_prefill = True
+            seq.draft_tokens = None  # 回waiting的序列下次以prefill行重新调度，草稿作废
+            seq.swapped = False
+            self.block_manager.deallocate(seq)
+            self.waiting.appendleft(seq)
+
+    def swap_out(self, seq: Sequence):
+        """KV swap 换出（记账）：记录待拷贝的块与 CPU 缓冲，**不立即释放块**。
+
+        块保持占用直到 engine 完成 GPU→CPU 拷贝（swap_pairs 机制，同 COW）——
+        否则本步后续调度可能从 free 池重分配该块、覆盖内容，拷贝读到脏数据。
+        engine 拷贝后调用 finish_swap_out 释放块。
+        """
+        self.num_swaps += 1
         seq.status = SequenceStatus.WAITING
-        seq.is_prefill = True
-        seq.draft_tokens = None  # 回waiting的序列下次以prefill行重新调度，草稿作废
-        self.block_manager.deallocate(seq)
-        self.waiting.appendleft(seq)
+        seq.is_prefill = False       # 恢复时直接 decode，不是 prefill
+        seq.draft_tokens = None
+        seq.swapped = True
+        n_blocks = len(seq.block_table)
+        assert n_blocks >= 1
+        # 注意：decode 序列最后 token 的块可能未分配（can_append 失败正是缺这块）
+        # → 缓冲只拷已分配的块（KV 已写入部分）；恢复后本步 decode 正常写最后 token
+        # CPU 缓冲（不用 pin_memory：WSL2 下 GPU→pinned CPU 的大块 D2H 拷贝实测会
+        # 崩 VM（cudaHostAlloc 支持有限）；普通 CPU 内存的 D2H/H2D 拷贝正确且稳定，
+        # 只是 H2D 略慢——swap 频率低，可接受）
+        buf = torch.empty(2, self._swap_layers, n_blocks, self.block_size,
+                          self._swap_kv_heads, self._swap_head_dim,
+                          dtype=self._swap_dtype)
+        gpu_block_ids = list(seq.block_table)
+        self._swap_bytes += buf.numel() * buf.element_size()
+        self._swap_buffers[seq.seq_id] = buf
+        self.swap_pairs.append((seq, gpu_block_ids, buf, "out"))
+        self.swapped.appendleft(seq)
+
+    def finish_swap_out(self, seq: Sequence, block_ids: list[int]):
+        """engine 完成 GPU→CPU 拷贝后：释放块、清块表（num_cached_tokens 保留=num_tokens）。"""
+        self.block_manager.release_blocks(block_ids)
+        seq.block_table.clear()
+
+    def swap_in(self, seq: Sequence):
+        """KV swap 换入：重新分配私有 GPU 块，KV 从 CPU 拷回（bit-exact），直接 decode。"""
+        seq.status = SequenceStatus.RUNNING
+        seq.swapped = False
+        buf = self._swap_buffers.pop(seq.seq_id)
+        self._swap_bytes -= buf.numel() * buf.element_size()
+        self.block_manager.allocate_private(seq)  # 全新私有块（num_cached_tokens 保留）
+        self.swap_pairs.append((seq, list(seq.block_table), buf, "in"))
+        self.running.appendleft(seq)
+
+    def _try_swap_in(self):
+        """把 swapped 队列里 KV 足够的序列换回 GPU（free 块够一个换一个）。
+
+        预留 1 块给换入后的首个 decode 追加（can_append 在块边界需新块），
+        否则 swap_in→can_append 失败→又 swap_out 的死循环。
+        """
+        if not self.swapped:
+            return
+        remaining = deque()
+        while self.swapped:
+            seq = self.swapped.popleft()
+            if len(self.block_manager.free_block_ids) >= seq.num_blocks + 1:
+                self.swap_in(seq)
+            else:
+                remaining.append(seq)
+        self.swapped = remaining
 
     def _maybe_finish(self, seq: Sequence, token_id: int):
         # 判断当前序列是否满足结束条件
-        if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
+        # 注意 >= 而非 ==：投机步一次可接受多个token，completion数可能跳过max_tokens
+        # （如 62→65 跳过 64）——精确相等会让序列永不结束、一路长到max_model_len
+        # （实测 EAGLE 草稿无上限时序列长到 4093 → 块表17列溢出 spec graph 的16列）
+        if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens >= seq.max_tokens:
             seq.status = SequenceStatus.FINISHED
             seq.t_completed = perf_counter()
             self.block_manager.deallocate(seq)

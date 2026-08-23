@@ -46,6 +46,7 @@ def parse_args():
 
 def main():
     args = parse_args()
+    args.model = os.path.expanduser(args.model)  # bash argv 不展开 ~ → 手动展开
     num_seqs_list = [int(x) for x in args.num_seqs_list.split(",")]
     os.makedirs("results", exist_ok=True)
 

@@ -6,12 +6,15 @@ Questions answered:
   3. What does RequestOutput expose?
 """
 import os
+import sys
 import time
 
 import torch
 from vllm import LLM, SamplingParams
 
-llm = LLM(model=os.path.expanduser("~/huggingface/Qwen3-0.6B/"), dtype="auto",
+MODEL = os.path.expanduser(sys.argv[1]) if len(sys.argv) > 1 else os.path.expanduser("~/huggingface/Qwen3-0.6B/")
+
+llm = LLM(model=MODEL, dtype="auto",
           gpu_memory_utilization=0.9, max_model_len=4096, max_num_batched_tokens=16384,
           max_num_seqs=512, kv_cache_dtype="auto", enforce_eager=False,
           enable_prefix_caching=True, swap_space=0, disable_log_stats=False)

@@ -4,14 +4,17 @@
 判定：内核 vs 剪枝参考 应≈0（存储重排）；fp16 vs 剪枝 = 一次性幅值剪枝的真实代价。
 另报每层权重 Frobenius 相对误差 ||w_pruned-w||/||w||（50%权重被丢弃的质量占比）。
 """
+import os
+import sys
+
 import torch
 import torch.distributed as dist
 from transformers import AutoConfig
 
-from nanovllm.models.qwen3 import Qwen3ForCausalLM
+from nanovllm.models.registry import get_model_class
 from nanovllm.utils.loader import load_model
 
-PATH = "/home/zjq/huggingface/Qwen3-0.6B/"
+PATH = os.path.expanduser(sys.argv[1]) if len(sys.argv) > 1 else os.path.expanduser("~/huggingface/Qwen3-0.6B/")
 DEV = "cuda"
 
 dist.init_process_group("nccl", "tcp://localhost:2333", world_size=1, rank=0)
@@ -19,8 +22,11 @@ torch.cuda.set_device(0)
 
 torch.manual_seed(0)
 hf = AutoConfig.from_pretrained(PATH)
-model = Qwen3ForCausalLM(hf).to(DEV, dtype=hf.dtype)
+model = get_model_class(hf.model_type)(hf).to(DEV, dtype=hf.dtype)
 load_model(model, PATH)
+# CPU 构造→.to(cuda) 打破 tie 共享；tie 模型 checkpoint 常不含 lm_head.weight → 重绑
+if getattr(hf, "tie_word_embeddings", False):
+    model.lm_head.weight.data = model.model.embed_tokens.weight.data
 model.eval()
 
 ids = torch.randint(0, 50000, (8, 256), device=DEV).flatten()

@@ -4,11 +4,12 @@
     python benchmarks/_medusa_train_probe.py
 """
 import os
+import sys
 import time
 
 import torch
 
-MODEL = os.path.expanduser("~/huggingface/Qwen3-0.6B/")
+MODEL = os.path.expanduser(sys.argv[1]) if len(sys.argv) > 1 else os.path.expanduser("~/huggingface/Qwen3-0.6B/")
 from nanovllm.layers.medusa import MedusaHeads
 
 torch.backends.cuda.matmul.allow_tf32 = True

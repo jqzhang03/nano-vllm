@@ -3,7 +3,7 @@ from torch import nn
 import torch.nn.functional as F
 import torch.distributed as dist
 
-from nanovllm.layers.linear import WeightQuantMixin
+from nanovllm.layers.linear import WeightQuantMixin, tp_size, tp_rank
 from nanovllm.utils.context import get_context
 
 
@@ -15,8 +15,8 @@ class VocabParallelEmbedding(nn.Module):
         embedding_dim: int,
     ):
         super().__init__()
-        self.tp_rank = dist.get_rank()
-        self.tp_size = dist.get_world_size()
+        self.tp_rank = tp_rank()
+        self.tp_size = tp_size()
         assert num_embeddings % self.tp_size == 0
         self.num_embeddings = num_embeddings
         self.num_embeddings_per_partition = self.num_embeddings // self.tp_size
@@ -55,6 +55,7 @@ class ParallelLMHead(WeightQuantMixin, VocabParallelEmbedding):
         super().__init__(num_embeddings, embedding_dim)
         self.int4 = False  # w_int4/w_int4_scale/awq_scale缓冲由quantize_int4创建
         self.sparse24 = False  # w_sparse由quantize_sparse24创建
+        self.fp8 = False  # w_fp8/w_fp8_scale缓冲由quantize_fp8创建
 
     def forward(self, x: torch.Tensor):
         context = get_context()
@@ -73,7 +74,9 @@ class ParallelLMHead(WeightQuantMixin, VocabParallelEmbedding):
         elif context.is_prefill:
             last_indices = context.cu_seqlens_q[1:] - 1
             x = x[last_indices].contiguous()
-        if self.sparse24:
+        if self.fp8:
+            logits = self._fp8_forward(x)
+        elif self.sparse24:
             logits = self._sparse24_forward(x)
         elif self.int4:
             logits = self._int4_forward(x)

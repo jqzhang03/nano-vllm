@@ -8,11 +8,12 @@ used as the bar — temperature sampling amplifies tiny logit perturbations.
 Metrics: max/mean |logit diff|, KL divergence, top-1 token agreement.
 """
 import os
+import sys
 import torch
 
 from nanovllm import LLM, SamplingParams
 
-PATH = os.path.expanduser("~/huggingface/Qwen3-0.6B/")
+PATH = os.path.expanduser(sys.argv[1]) if len(sys.argv) > 1 else os.path.expanduser("~/huggingface/Qwen3-0.6B/")
 PROMPTS = [
     "The capital of France is",
     "To bake a chocolate cake, you need",
@@ -50,13 +51,12 @@ def first_decode_logits(steps):
 
 
 def main():
-    import sys
-    # 用法: accuracy_check.py [w8a8|int4|awq|sparse24] [auto|fp8_e4m3] [awq_scales_path] [lmhead]
+    # 用法: accuracy_check.py [model] [w8a8|int4|awq|sparse24] [auto|fp8_e4m3] [awq_scales_path] [lmhead]
     #   —— 对比fp16基线 vs 指定组合（默认 fp8 KV + 无权重量化，隔离各自影响）
-    quant = sys.argv[1] if len(sys.argv) > 1 else "none"
-    kv2 = sys.argv[2] if len(sys.argv) > 2 else "fp8_e4m3"
-    awq_path = sys.argv[3] if len(sys.argv) > 3 else ""
-    lm_head = len(sys.argv) > 4 and sys.argv[4] == "lmhead"
+    quant = sys.argv[2] if len(sys.argv) > 2 else "none"
+    kv2 = sys.argv[3] if len(sys.argv) > 3 else "fp8_e4m3"
+    awq_path = sys.argv[4] if len(sys.argv) > 4 else ""
+    lm_head = len(sys.argv) > 5 and sys.argv[5] == "lmhead"
     print("running fp16 engine ...")
     tokens16, steps16 = run_once("auto", "none")
     print(f"running engine with quantization=[{quant}] + kv_cache_dtype=[{kv2}] "

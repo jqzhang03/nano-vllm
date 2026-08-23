@@ -4,6 +4,7 @@ from time import perf_counter
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
 import torch
+import torch.nn.functional as F
 import torch.multiprocessing as mp
 
 from nanovllm.config import Config
@@ -140,16 +141,84 @@ class LLMEngine:
                     drafts.append(t)
                 seq.draft_tokens = drafts
 
+    def _eagle_drafts(self, seqs: list[Sequence], hidden: torch.Tensor,
+                      n_acc_list: list[int], n_rows_list: list[int]):
+        """EAGLE-1 草稿：从验收后新 t_last 的 hidden 自回归生成 γ 个草稿 token。
+
+        F(h_t, e(w_{t+1})) → h̃_{t+1} → LM_head → argmax 采样 w_{t+2}；下一步
+        F(h̃_{t+1}, e(w_{t+2}))…（hidden 与 token 双自回归，草稿分布条件化于已草拟
+        内容——比 Medusa 的并行头更接近目标分布，α 更高）。
+
+        hidden 行选择与 _medusa_drafts 同语义：非全接受用第 n_acc 行（t_last 的
+        feature），全接受（bonus 无 hidden）用第 γ_i 行；起始 token = seq.last_token
+        （postprocess_spec 已追加）。EOS 截断与 n-gram 一致。
+        按步跨 seq 批量（每步一个 [m, H] 前向 + LM head），γ 步串行。
+        """
+        layer = self.model_runner.eagle_layer
+        gamma = self.config.max_draft_len
+        eos = self.config.eos
+        # mixed步里prefill行在hidden前面，spec组从n_prefill_tokens起
+        h_offset = sum(seq.num_scheduled_tokens for seq in seqs if seq.is_prefill)
+        row = h_offset
+        items = []  # (seq, hidden行)
+        for seq, n_acc, n_rows in zip(seqs, n_acc_list, n_rows_list):
+            if n_acc == 0:
+                continue  # 非verify行（prefill行）
+            gamma_i = n_rows - 1
+            idx = row + (n_acc if n_acc <= gamma_i else gamma_i)
+            items.append((seq, idx))
+            row += n_rows
+        if not items:
+            return
+        embed = self.model_runner.model.model.embed_tokens
+        lm_head = self.model_runner.model.lm_head
+        h = torch.stack([hidden[i] for _, i in items])            # [m, H]
+        w = torch.tensor([s.last_token for s, _ in items], device=h.device)
+        active_seqs = [s for s, _ in items]
+        drafts = {id(s): [] for s, _ in items}
+        for _ in range(gamma):
+            emb = embed(w)                                        # [m, H]
+            h = layer(h, emb)                                     # [m, H]
+            logits = F.linear(h, lm_head.weight)                  # [m, V]
+            # 草稿用 argmax：草稿分布已接近目标（teacher-forced top-1 ~62%），
+            # 温度采样反而稀释接受率（temp=0.6 时实测 α 从 0.13 → 0.06）
+            w_new = logits.argmax(dim=-1)
+            keep_idx = []
+            for j, seq in enumerate(active_seqs):
+                t = w_new[j].item()
+                # per-seq 输出预算（同 ngram 的 remaining-1）：保证追加后不超 max_tokens，
+                # 否则投机接受可能跳过 max_tokens 让序列永不结束（_maybe_finish 已改 >= 兜底）
+                if t == eos or len(drafts[id(seq)]) >= seq.max_tokens - seq.num_completion_tokens - 1:
+                    continue
+                drafts[id(seq)].append(t)
+                keep_idx.append(j)
+            if not keep_idx:
+                break
+            h = h[keep_idx]
+            w = w_new[keep_idx]
+            active_seqs = [active_seqs[j] for j in keep_idx]
+        for s, _ in items:
+            s.draft_tokens = drafts[id(s)]
+
     def step(self):
         seqs, kind = self.scheduler.schedule()  # kind ∈ {"prefill", "decode", "mixed", "spec"}
         # 本步是否含verify行（投机）：任一行带draft_tokens（[]也算，表示γ=0的verify行）
         has_spec = any(seq.draft_tokens is not None for seq in seqs)
-        # Medusa模式：spec步需要最后一层hidden（下轮草稿输入）
-        return_hidden = self.config.speculative == "medusa" and kind == "spec"
+        # Medusa/EAGLE模式：spec步需要最后一层hidden（下轮草稿输入）
+        return_hidden = self.config.speculative in ("medusa", "eagle") and kind == "spec"
         # 在运行模型之前执行COW复制：任何序列写共享部分块之前，先把旧块复制给写者。
         # 必须发生在 run() 之前，prepare_decode/prepare_prefill 才能基于换表后的新块计算slot
         for old_id, new_id in self.scheduler.cow_pairs:
             self.model_runner.call("cow_block", old_id, new_id)
+        # KV swap 拷贝（同 COW 时机）：换出 GPU→CPU、换入 CPU→GPU（新私有块，run 前填好）。
+        # 换出对在拷贝完成后释放块（finish_swap_out）——块在拷贝前保持占用，
+        # 避免本步内被重分配覆盖内容。TP=1 且非 fp8 KV 时启用（见 Scheduler.kv_swap）
+        for seq, block_ids, buf, direction in self.scheduler.swap_pairs:
+            if direction == "out":
+                self.model_runner.call("swap_out", block_ids, buf)
+                self.scheduler.finish_swap_out(seq, block_ids)
+            else:
+                self.model_runner.call("swap_in", block_ids, buf)
         # 运行模型，返回采样出的token（精度检查模式下同时返回本步logits）
         result = self.model_runner.call("run", seqs, kind, self._collect_logits, return_hidden)
         hidden = None
@@ -181,9 +250,12 @@ class LLMEngine:
             self._step_stats["spec_accepted_drafts"] += n_draft_acc
         else:
             self.scheduler.postprocess(seqs, token_ids)
-        # Medusa：用本步verify的hidden生成下一轮草稿（写回seq.draft_tokens）
+        # Medusa/EAGLE：用本步verify的hidden生成下一轮草稿（写回seq.draft_tokens）
         if return_hidden:
-            self._medusa_drafts(seqs, hidden, n_acc_list, n_rows_list)
+            if self.config.speculative == "eagle":
+                self._eagle_drafts(seqs, hidden, n_acc_list, n_rows_list)
+            else:
+                self._medusa_drafts(seqs, hidden, n_acc_list, n_rows_list)
         # 统计用token数：prefill步为正（prefill token数），decode步为负（序列数），
         # mixed步拆分返回prefill/decode各自的数量
         if kind == "prefill":
@@ -291,4 +363,5 @@ class LLMEngine:
         - num_preemptions: 本次generate中的KV cache抢占次数。
         """
         return {"per_request": list(self._req_metrics), "step_stats": dict(self._step_stats),
-                "num_preemptions": self.scheduler.num_preemptions}
+                "num_preemptions": self.scheduler.num_preemptions,
+                "num_swaps": self.scheduler.num_swaps}

@@ -5,10 +5,10 @@ from nanovllm.config import Config
 import os
 
 
-def _make_scheduler(max_num_batched_tokens=2048):
+def _make_scheduler(max_num_batched_tokens=2048, kv_swap=True):
     path = os.path.expanduser("~/huggingface/Qwen3-0.6B/")
     config = Config(model=path, num_kvcache_blocks=64, kvcache_block_size=256,
-                    max_num_batched_tokens=max_num_batched_tokens)
+                    max_num_batched_tokens=max_num_batched_tokens, kv_swap=kv_swap)
     return Scheduler(config)
 
 
@@ -87,3 +87,53 @@ def test_pure_phases():
         kinds.append(kind)
     # 2048预算下一个prefill步装下两个seq；第二步waiting空 → 纯decode
     assert kinds == ["prefill", "decode"], kinds
+
+
+def test_kv_swap_state():
+    """KV swap 抢占状态机：KV完整的decode序列抢占时换出（保留num_cached_tokens、
+    进swapped队列），free块恢复后换入（直接decode，免重新prefill）。"""
+    scheduler = _make_scheduler(kv_swap=True)
+    bm = scheduler.block_manager
+    s = Sequence([7] * 1024)
+    _simulate_prefill(bm, s, 1024)
+    s.status = SequenceStatus.RUNNING
+    s.is_prefill = False       # decode序列（KV覆盖到len-1，最后token的KV本步写）
+    s.num_cached_tokens = s.num_tokens - 1
+    scheduler.running.append(s)
+
+    scheduler.preempt(s)
+    assert s.swapped and s in scheduler.swapped
+    assert s.num_cached_tokens == s.num_tokens - 1  # KV 保留（免重新prefill）
+    assert not s.is_prefill                          # 恢复走 decode 而非 prefill
+    assert len(scheduler.swap_pairs) == 1 and scheduler.swap_pairs[0][3] == "out"
+    assert not scheduler.is_finished()          # swapped 队列非空不算完成
+
+    # engine 完成 GPU→CPU 拷贝后释放块
+    block_ids = scheduler.swap_pairs[0][1]
+    scheduler.finish_swap_out(s, block_ids)
+    assert not s.block_table
+    assert len(bm.free_block_ids) == 64         # 块全部回收
+
+    # free 恢复 → 换入（直接 decode）
+    scheduler._try_swap_in()
+    assert s in scheduler.running and not s.swapped
+    assert s.num_cached_tokens == s.num_tokens - 1
+    assert len(scheduler.swap_pairs) == 2 and scheduler.swap_pairs[1][3] == "in"
+    assert scheduler.swap_pairs[1][0] is s
+
+
+def test_kv_swap_disabled_recompute():
+    """kv_swap=False 时抢占走 recompute（原行为：释放块、回 waiting、下次 prefill）。"""
+    scheduler = _make_scheduler(kv_swap=False)
+    bm = scheduler.block_manager
+    s = Sequence([7] * 1024)
+    _simulate_prefill(bm, s, 1024)
+    s.status = SequenceStatus.RUNNING
+    s.num_cached_tokens = s.num_tokens
+    scheduler.running.append(s)
+
+    scheduler.preempt(s)
+    assert not s.swapped and s in scheduler.waiting
+    assert s.is_prefill                        # 恢复走 prefill（重算）
+    assert s.num_cached_tokens == 0            # 缓存被清
+    assert scheduler.num_swaps == 0

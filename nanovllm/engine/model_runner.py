@@ -1,12 +1,13 @@
 import pickle
 import torch
+from torch import nn
 import torch.distributed as dist
 from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
 
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
-from nanovllm.models.qwen3 import Qwen3ForCausalLM
+from nanovllm.models.registry import get_model_class
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
@@ -29,10 +30,24 @@ class ModelRunner:
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.dtype)
         torch.set_default_device("cuda")
-        # 根据配置初始化模型结构
-        self.model = Qwen3ForCausalLM(hf_config)
-        # 加载预训练权重到模型上
-        load_model(self.model, config.model)
+        # 按 HF model_type 从注册表选模型类（多模型适配入口，见 models/registry.py）；
+        # 引擎侧不再硬编码 Qwen3。
+        model_class = get_model_class(hf_config.model_type)
+        # 按层流式加载 + 即时量化：模型先在 meta 设备构造（0 显存），loader 逐
+        # decoder layer 物化→加载→立即量化→释放 fp16（16GB 卡跑 7B+ 的前提）。
+        # 自动触发阈值：fp16 权重估算超空闲显存 45%（7B≈14GB 必触发，0.6B 不触发）。
+        self.streaming = self._decide_streaming()
+        if self.streaming:
+            with torch.device("meta"):
+                self.model = model_class(hf_config)
+            load_model(self.model, config.model, streaming=True,
+                       chunk_hook=self._streaming_quant_hook())
+            self._finalize_streaming()
+        else:
+            # 根据配置初始化模型结构
+            self.model = model_class(hf_config)
+            # 加载预训练权重到模型上
+            load_model(self.model, config.model)
         self.sampler = Sampler()
         # Medusa多头（投机草稿源）：挂在backbone最后一层hidden之后、LM head之前；
         # 权重由 benchmarks/medusa_train.py 自蒸馏训练产出
@@ -44,16 +59,31 @@ class ModelRunner:
             heads.load_state_dict(state)
             heads.to(device="cuda", dtype=hf_config.dtype)
             self.medusa_heads = heads
+        # EAGLE草稿层（无RoPE transformer层 + 目标模型共享LM head，自回归草稿）
+        if config.speculative == "eagle":
+            from nanovllm.layers.eagle import EagleLayer
+            head_dim = (getattr(hf_config, "head_dim", None)
+                        or hf_config.hidden_size // hf_config.num_attention_heads)
+            self.eagle_layer = EagleLayer(hf_config.hidden_size, hf_config.num_attention_heads,
+                                          head_dim, hf_config.intermediate_size,
+                                          hf_config.rms_norm_eps)
+            state = torch.load(config.eagle_path, map_location="cpu")
+            self.eagle_layer.load_state_dict(state)
+            self.eagle_layer.to(device="cuda", dtype=hf_config.dtype)
         # W8A8权重量化（SmoothQuant式：校准激活通道分布→折叠进权重→per-channel int8 + Triton int8 GEMM）
-        # 放在sampler之后：校准用的run()会调用sampler
-        if config.quantization == "w8a8":
-            self.calibrate_and_quantize_w8a8()
-        elif config.quantization == "int4":
-            self.quantize_int4_weights()
-        elif config.quantization == "awq":
-            self.quantize_awq_weights()
-        elif config.quantization == "sparse24":
-            self.prune_sparse24()
+        # 放在sampler之后：校准用的run()会调用sampler。streaming 模式的量化已由
+        # chunk_hook 在加载期完成，这里跳过。
+        if not self.streaming:
+            if config.quantization == "w8a8":
+                self.calibrate_and_quantize_w8a8()
+            elif config.quantization == "int4":
+                self.quantize_int4_weights()
+            elif config.quantization == "awq":
+                self.quantize_awq_weights()
+            elif config.quantization == "sparse24":
+                self.prune_sparse24()
+            elif config.quantization == "fp8":
+                self.quantize_fp8_weights()
         # 调用预热方法，执行一次模拟prefill来分配显存、初始化CUDA内核，并测量峰值显存
         self.warmup_model()
         # 分配KV Cache的显存空间，并根据模型层数将KV Cache引用绑定到各注意力层
@@ -62,7 +92,7 @@ class ModelRunner:
         if not self.enforce_eager:
             self.capture_cudagraph()
             # 投机解码：再捕获verify前向（varlen）的graph族（固定容量+空行填充）
-            if config.speculative in ("ngram", "medusa"):
+            if config.speculative in ("ngram", "medusa", "eagle"):
                 self.capture_spec_graph()
 
         torch.set_default_device("cpu")
@@ -147,6 +177,28 @@ class ModelRunner:
         """
         self.kv_cache[:, :, new_block_id] = self.kv_cache[:, :, old_block_id]
 
+    def swap_out(self, block_ids: list[int], cpu_buffer: torch.Tensor):
+        """KV swap 换出：seq 的 GPU KV 块内容拷到 CPU pinned 缓冲（bit-exact）。
+
+        cpu_buffer 形状 [2, layers, n_blocks, block_size, kv_heads, head_dim]；
+        TP=1（swap 仅 TP=1 启用），kv_cache 分片即全局。
+        """
+        gpu = self.kv_cache[:, :, block_ids]
+        cpu_buffer.copy_(gpu)
+        torch.cuda.synchronize()  # 确保换出完成（缓冲在 CPU 侧后续由调度器管理）
+
+    def swap_in(self, block_ids: list[int], cpu_buffer: torch.Tensor):
+        """KV swap 换入：CPU 缓冲拷回 seq 的（新分配的私有）GPU KV 块。
+
+        缓冲只含换出时已分配的块（decode 序列最后 token 的块换出时未分配，
+        本步 decode 正常写入）；拷贝前 n_buf 块。
+        **必须用 index_copy_ 原位写**：kv_cache[:, :, block_ids] 是高级索引
+        （list）→ 返回临时副本，copy_ 只写副本不写回缓存（静默产生垃圾 KV）。
+        """
+        n = cpu_buffer.shape[2]
+        ids = torch.tensor(block_ids[:n], device=self.kv_cache.device)
+        self.kv_cache.index_copy_(2, ids, cpu_buffer.to(self.kv_cache.device))
+
     def warmup_model(self):
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
@@ -216,6 +268,15 @@ class ModelRunner:
         for m in self._quant_mods():
             m.quantize_int4(dense_path=self.config.int4_dense_path)
 
+    def quantize_fp8_weights(self):
+        """FP8(e4m3) 全量化（per-column 权重 + per-token 激活，vLLM 同款方案）。
+
+        decode 小 M 走 Triton fp8 内核（0.5× 权重带宽），prefill 大 M 走硬件 FP8 MMA
+        （torch._scaled_mm，sm_120 可用）——无需 int4 的 w_deq 双路径。
+        """
+        for m in self._quant_mods():
+            m.quantize_fp8()
+
     def prune_sparse24(self):
         """2:4 结构化剪枝 + cuSPARSELt 半结构化权重（torch.sparse.semi_structured）。"""
         for m in self._quant_mods():
@@ -278,6 +339,118 @@ class ModelRunner:
             scales.append(s.to(self.config.hf_config.dtype))
             del m.x_sum, m.x_count
         return scales
+
+    def _decide_streaming(self) -> bool:
+        """是否走按层流式加载+即时量化。
+
+        显式 --streaming-load 恒开启；否则仅在"启用了量化 且 fp16 权重估算超
+        空闲显存 45%"时自动开启（Qwen2.5-7B≈14GB 必触发，0.6B 不触发）。
+        限制：awq 内联校准需要全 fp16 模型前向（7B 装不下）→ 自动触发对
+        无 awq_scales_path 的 awq 关闭；fp16（quantization=none）不自动流式
+        （7B 直接 OOM，用户需显式量化 + streaming）。
+        """
+        cfg = self.config
+        if cfg.streaming_load:
+            return True
+        if cfg.quantization == "awq" and not cfg.awq_scales_path:
+            return False
+        if cfg.quantization == "none":
+            return False
+        est = self._estimate_weight_bytes()
+        free, _ = torch.cuda.mem_get_info()
+        return est > free * 0.45
+
+    def _estimate_weight_bytes(self) -> int:
+        """按 config 结构估算 bf16 权重字节（embed+lm_head、层内 qkv/o/gate_up/down）。"""
+        hf = self.config.hf_config
+        hidden = hf.hidden_size
+        head_dim = getattr(hf, "head_dim", None) or hidden // hf.num_attention_heads
+        qkv = (hf.num_attention_heads + 2 * hf.num_key_value_heads) * head_dim
+        o = hf.num_attention_heads * head_dim
+        inter = hf.intermediate_size
+        per_layer = (qkv + o + 3 * inter) * hidden  # qkv + o + gate_up(2×) + down(1×)
+        embed = hidden * hf.vocab_size
+        n_head = embed if getattr(hf, "tie_word_embeddings", False) else 2 * embed
+        params = n_head + hf.num_hidden_layers * per_layer
+        return int(params * hf.dtype.itemsize)
+
+    def _streaming_quant_hook(self):
+        """streaming 模式的加载即量化回调：每个 chunk（decoder layer 等）权重加载完
+        立即量化其线性层并释放 fp16（`del self.weight`）。
+
+        与 eager 路径的差异（诚实标注）：
+        - int4：双路径(dense_path)需要 w_deq 全尺寸 bf16 副本 → 强制纯 int4（权重 0.27×）；
+        - w8a8：SmoothQuant 平滑需要全模型前向校准激活 → 纯 per-group int8（无平滑）；
+        - awq：内联校准需全 fp16 模型 → 仅支持预生成 awq_scales_path。
+        """
+        from nanovllm.layers.linear import LinearBase
+        from nanovllm.layers.embed_head import ParallelLMHead
+        q = self.config.quantization
+        awq_scales = None
+        if q == "awq":
+            assert self.config.awq_scales_path, (
+                "streaming 模式不支持内联 AWQ 校准（需要全 fp16 模型前向）；"
+                "请用 --awq-scales-path 提供预生成缩放（benchmarks/awq_calibrate.py 在更大机器上产出）")
+            awq_scales = torch.load(self.config.awq_scales_path, map_location="cpu")
+        dp = self.config.int4_dense_path
+        if q == "int4" and dp:
+            print("[streaming] int4 双路径需要 w_deq 全尺寸 bf16 副本，与按层加载目的冲突 "
+                  "→ 强制 dense_path=False（纯 int4，权重 0.27×）", flush=True)
+            dp = False
+
+        def hook(chunk: nn.Module, chunk_path: str):
+            for name, m in chunk.named_modules():
+                full = f"{chunk_path}.{name}" if name else chunk_path
+                if isinstance(m, ParallelLMHead):
+                    # 与 eager 的 _quant_mods 同规则：默认不量化；tie 绑定时跳过
+                    if self.config.quantize_lm_head and not self.config.hf_config.tie_word_embeddings:
+                        if q in ("int4", "awq", "sparse24", "fp8"):
+                            if q == "sparse24":
+                                m.quantize_sparse24()
+                            elif q == "fp8":
+                                m.quantize_fp8()
+                            else:
+                                s = awq_scales.get(full) if awq_scales is not None else None
+                                m.quantize_int4(s, dense_path=dp)
+                    continue
+                if not isinstance(m, LinearBase):
+                    continue
+                if q == "w8a8":
+                    m.quantize_w8a8(None)  # streaming 无 SmoothQuant（需全模型前向校准）
+                elif q == "int4":
+                    m.quantize_int4(awq_scales.get(full) if awq_scales is not None else None,
+                                    dense_path=dp)
+                elif q == "awq":
+                    assert awq_scales is not None and full in awq_scales, \
+                        f"awq scale missing for {full}"
+                    m.quantize_int4(awq_scales[full], dense_path=dp)
+                elif q == "sparse24":
+                    m.quantize_sparse24()
+                elif q == "fp8":
+                    m.quantize_fp8()  # 无需校准（per-column/动态 per-token）→ 流式直接可用
+        return hook
+
+    def _finalize_streaming(self):
+        """streaming 加载后的收尾：重建 RoPE 缓存 + 重绑词表 + 校验无 meta 残留。"""
+        hf = self.config.hf_config
+        # to_empty 物化只给未初始化内存 → meta 设备上算出的 cos/sin 缓存值丢失
+        # （全零 → q/k 被零旋转 → 逐层发散；见 _qwen2_smoke 的定位过程）。
+        # get_rope 的 lru_cache 让各层共享同一实例，重建一次即全部生效。
+        from nanovllm.layers.rotary_embedding import RotaryEmbedding
+        for m in self.model.modules():
+            if isinstance(m, RotaryEmbedding):
+                m.build_cache()
+        # 物化会打破 __init__ 里的 lm_head↔embed 存储共享 → 重新绑定。
+        # tie 模型的文件通常不存 lm_head.weight → lm_head 还是 meta，
+        # 先物化（set_data 不允许 meta→cuda 换存储），再与 embed 共享存储
+        if getattr(hf, "tie_word_embeddings", False):
+            head = self.model.lm_head
+            if head.weight.is_meta:
+                head.to_empty(device="cuda")
+            head.weight.data = self.model.model.embed_tokens.weight.data
+        # 未加载到的权重会以 meta 形式残留 → 必须报错而非带病运行
+        metas = [n for n, p in self.model.named_parameters() if p.is_meta]
+        assert not metas, f"streaming load left meta params: {metas}"
 
     def calibrate_fp8_kv(self):
         layers = [m for m in self.model.modules() if hasattr(m, "calibrating")]
@@ -380,7 +553,11 @@ class ModelRunner:
                     slot_end = seq.block_table[i] * self.block_size + end - i * self.block_size
                 slot_mapping.extend(range(slot_start, slot_end))
         # key的总序列大于query的总序列长度，有prefix cache，query跳过了前缀，则需要准备块表供注意力内核使用
+        # 在cu_seqlens_q中，加入的是当前步需要计算的token数量，不包括前缀缓存的token数量
+        # 在cu_seqlens_k中，加入的是当前步计算所需的所有key数量，=缓存前缀长度+新计算的token数量
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:
+            # 如果用到了前缀缓存，那么cu_seqlens_k的长度一定会大于cu_seqlens_q的长度，前缀缓存的key的前一部分已经有缓存了
+            # 需要将缓存的那一部分key值的物理位置索引和新计算的后缀块的物理地址按逻辑顺序拼成一张地址索引表
             block_tables = self.prepare_block_tables(seqs)
         # 将数据转成int64张量，锁页传输并异步拷贝到GPU
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
@@ -399,8 +576,11 @@ class ModelRunner:
         （flash varlen 只跑 prefill 行）；slot_mapping 覆盖全批次（写入）；
         context_lens/block_tables 为 decode 组（供 decode 注意力内核）。
         """
+        # 判断是否存在草稿token
         if any(seq.draft_tokens is not None for seq in seqs):
             # 投机混合步：verify行不是flash-kvcache行，走全批次varlen
+            # 如果存在草稿token，进入投机采样的验证阶段，模型一次性处理所有草稿token，判断哪些是可以接受的
+            # 在投机采样的验证阶段，将一个批次内所有序列的验证请求合并，所有候选的token共享同一份历史KV Cache，内核可以处理批次中每个序列长度不同的情况
             return self._prepare_mixed_spec(seqs)
         # --- prefill 部分（前 n_prefill 个seq） ---
         n_prefill = sum(1 for seq in seqs if seq.is_prefill)

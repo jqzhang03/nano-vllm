@@ -140,10 +140,13 @@ def case_drain(runner, repeats, fp8: bool):
 
 
 def main():
+    global MODEL
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--model", default=MODEL, help="模型目录（默认 Qwen3-0.6B）")
     p.add_argument("--fp8", action="store_true")
     p.add_argument("--repeats", type=int, default=6)
     args = p.parse_args()
+    MODEL = os.path.expanduser(args.model)  # bash argv 不展开 ~ → 手动展开
 
     print(f"model: {os.path.basename(MODEL)} | kv_cache: {'fp8' if args.fp8 else 'fp16'} | "
           f"repeats={args.repeats}（排除首轮编译）")

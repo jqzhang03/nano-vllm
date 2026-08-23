@@ -4,12 +4,13 @@
 若 AWQ 更好 → α 搜索过拟合了校准样本（结论：需要更大/更贴合的校准集）。
 """
 import os
+import sys
 
 import torch
 
 from nanovllm import LLM, SamplingParams
 
-PATH = os.path.expanduser("~/huggingface/Qwen3-0.6B/")
+PATH = os.path.expanduser(sys.argv[1]) if len(sys.argv) > 1 else os.path.expanduser("~/huggingface/Qwen3-0.6B/")
 SCALES = os.path.join("results", "awq_scales.pt")
 PROMPTS = [
     "The capital of France is",

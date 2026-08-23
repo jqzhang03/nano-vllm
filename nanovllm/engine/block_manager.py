@@ -111,6 +111,29 @@ class BlockManager:
         else:
             seq.num_cached_tokens = (num_cached_blocks - 1) * self.block_size + len(seq.block(num_cached_blocks - 1))
 
+    def allocate_private(self, seq: Sequence):
+        """KV swap 换入专用：分配全新私有块（不查前缀缓存、不参与共享、不发布哈希）。
+
+        KV 内容由 ModelRunner 从 CPU 缓冲拷回（bit-exact），逻辑上已缓存到
+        num_cached_tokens（= len-1，decode 序列最后生成的 token 的 KV 本步才写）。
+        **只分配 cached tokens 的块（ceil(num_cached_tokens/256)）**——待写 token
+        的块由 may_append 在 decode 时正常分配，避免双重分配（num_blocks 含待写块，
+        与正常 decode 路径的块表语义不一致 → swap_in 后 may_append 又加一块）。
+        恢复后的 decode 步由 postprocess 的 hash_blocks 重新发布哈希。
+        """
+        assert not seq.block_table
+        n = (seq.num_cached_tokens + self.block_size - 1) // self.block_size
+        for _ in range(n):
+            seq.block_table.append(self._allocate_block())
+
+    def release_blocks(self, block_ids: list[int]):
+        """按显式块 id 列表释放（KV swap 换出完成后）：refcount--，为 0 回 free 池。"""
+        for block_id in block_ids:
+            block = self.blocks[block_id]
+            block.ref_count -= 1
+            if block.ref_count == 0:
+                self._deallocate_block(block_id)
+
     def deallocate(self, seq: Sequence):
         for block_id in reversed(seq.block_table):
             block = self.blocks[block_id]

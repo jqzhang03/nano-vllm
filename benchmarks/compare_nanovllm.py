@@ -57,6 +57,7 @@ def main() -> None:
     p.add_argument("--max-num-seqs", type=int, default=512)
     p.add_argument("--warmup-seqs", type=int, default=8)
     args = p.parse_args()
+    args.model = os.path.expanduser(args.model)  # bash argv 不展开 ~ → 手动展开
 
     with open(args.workload, encoding="utf-8") as f:
         spec = json.load(f)

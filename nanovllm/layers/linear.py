@@ -11,6 +11,15 @@ def divide(numerator, denominator):
     return numerator // denominator
 
 
+def tp_size() -> int:
+    """张量并行世界大小；进程组未初始化（如引擎 exit 后的裸模型训练）时按 1。"""
+    return dist.get_world_size() if dist.is_initialized() else 1
+
+
+def tp_rank() -> int:
+    return dist.get_rank() if dist.is_initialized() else 0
+
+
 @triton.jit
 def gemm_int8_kernel(
     a_ptr, b_ptr, c_ptr, a_scale_ptr, b_scale_ptr,
@@ -262,6 +271,103 @@ def sparse24_gemm(a: torch.Tensor, v: torch.Tensor, idx: torch.Tensor) -> torch.
     return out
 
 
+@triton.jit
+def quantize_fp8_act_kernel(
+    x_ptr, q_ptr, s_ptr, M, K,
+    stride_xm, stride_xk, stride_qm, stride_qk,
+    BLOCK_K: tl.constexpr,
+):
+    """融合的 per-token 激活 fp8 量化（一个 kernel 完成 amax→scale→clamp→cast）。
+
+    替代 torch 的 5-9 个逐层 kernel（convert/abs/amax/clamp/div/cast）——小形状下
+    激活量化开销曾超过 GEMM 本身（fp8 引擎比 fp16 慢的根因）。每行一个 program。
+    """
+    pid = tl.program_id(0)  # 行号
+    offs_k = tl.arange(0, BLOCK_K)
+    mask = offs_k < K
+    x = tl.load(x_ptr + pid * stride_xm + offs_k * stride_xk, mask=mask, other=0.0).to(tl.float32)
+    amax = tl.maximum(tl.max(tl.abs(x), axis=0), 1e-8)
+    s = amax / 448.0
+    q = tl.clamp(x / s, -448.0, 448.0).to(tl.float8e4nv)
+    tl.store(s_ptr + pid, s)
+    tl.store(q_ptr + pid * stride_qm + offs_k * stride_qk, q, mask=mask)
+
+
+@triton.jit
+def gemm_fp8_kernel(
+    a_ptr, b_ptr, c_ptr, b_scale_ptr,
+    M, N, K,
+    stride_am, stride_ak, stride_bn, stride_bk, stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr,
+):
+    """FP8 GEMM（decode 小 M 形态，权重-only）: C = A_bf16 @ W_fp8^T。
+
+    A: [M, K] bf16（不量化激活——decode 单 token 的激活精度比 prefill 更敏感，
+    且省掉逐层量化开销）；B: [N, K] fp8(e4m3)，per-column scale b_scale[N]
+    （scale 与 K 无关 → 末尾统一乘，可提出累加循环）。
+    内核内硬件 cvt（fp8→bf16）后 bf16 MMA；权重字节 = bf16 的一半 → 大 K 模型
+    （7B+，K=4096+）decode 权重带宽主导形态赢；0.6B 的 K=1024 非带宽主导，小 M
+    仅 lm_head（N 巨大）赢。
+    """
+    pid = tl.program_id(0)
+    num_pid_m = tl.cdiv(M, BLOCK_M)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+    num_pid_in_group = GROUP_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_M)
+    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    a_ptrs = a_ptr + offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak
+    b_ptrs = b_ptr + offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn
+    a_mask = offs_m[:, None] < M
+    b_mask = offs_n[None, :] < N
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for k in range(0, K, BLOCK_K):
+        a = tl.load(a_ptrs, mask=a_mask, other=0.0)          # (BM, BK) bf16
+        b8 = tl.load(b_ptrs, mask=b_mask, other=0.0)         # (BK, BN) fp8
+        acc += tl.dot(a, b8.to(tl.bfloat16), out_dtype=tl.float32)
+        a_ptrs += BLOCK_K * stride_ak
+        b_ptrs += BLOCK_K * stride_bk
+
+    b_s = tl.load(b_scale_ptr + offs_n, mask=offs_n < N, other=1.0)
+    out = acc * b_s[None, :]
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    tl.store(c_ptrs, out, mask=a_mask & b_mask)
+
+
+def fp8_gemm(a: torch.Tensor, w_fp8: torch.Tensor, w_scale: torch.Tensor) -> torch.Tensor:
+    """FP8 线性（decode 小 M，权重-only）: a [M, K] bf16 × W [N, K] fp8 → [M, N] bf16。
+
+    w_scale [N, 1] per-column。tile 按 M 自适应（与 int4 同形态结论）。
+    """
+    M, K = a.shape
+    N = w_fp8.shape[0]
+    assert w_fp8.shape == (N, K)
+    out = torch.empty(M, N, device=a.device, dtype=torch.bfloat16)
+    if M <= 128:
+        bm, bn, warps, stages = 16, 128, 4, 2
+    else:
+        bm, bn, warps, stages = 64, 256, 8, 2
+    grid = (triton.cdiv(M, bm) * triton.cdiv(N, bn),)
+    gemm_fp8_kernel[grid](
+        a, w_fp8, out, w_scale,
+        M, N, K,
+        a.stride(0), a.stride(1),
+        w_fp8.stride(0), w_fp8.stride(1),
+        out.stride(0), out.stride(1),
+        BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=128, GROUP_M=8,
+        num_warps=warps, num_stages=stages,
+    )
+    return out
+
+
 class WeightQuantMixin:
     """int4 / sparse24 量化共享实现（LinearBase 与 ParallelLMHead 复用）。"""
 
@@ -271,6 +377,10 @@ class WeightQuantMixin:
     # 与 TTFT 回归（见 BENCHMARKS.md §10）。
     int4_max_m = 128
     int4_min_n = 2048
+    # fp8 路由阈值：M≤128（decode）走 Triton 内核（带宽赢），M>128（prefill）走
+    # torch._scaled_mm 硬件 FP8 MMA（sm_120 可用，b 列主序）——fp8 是唯一大 M 不输
+    # cuBLAS 的量化模式（int4/int8 的软件内核大 M 都输）
+    fp8_max_m = 128
 
     def quantize_int4(self, awq_scale: torch.Tensor | None = None, group_size: int = 128,
                       dense_path: bool = True):
@@ -334,6 +444,47 @@ class WeightQuantMixin:
             y = y + bias
         return y
 
+    def quantize_fp8(self):
+        """FP8(e4m3) 全量化：权重 per-column scale + 激活 per-token scale（vLLM 同款方案）。
+
+        权重 [N, K] → w_fp8 e4m3 + w_scale [N,1]（per-column = amax/448，scale 与 K 无关
+        可提出累加循环）；推理时激活也量化成 e4m3（per-token scale）→ 全 FP8。
+        GEMM 双路径：decode 小 M 走 Triton 内核（fp8 权重字节 = bf16 一半 → 带宽赢）；
+        prefill 大 M 走 torch._scaled_mm（**硬件 FP8 MMA**，sm_120 实测可用，b 需列主序
+        w.t()）——与 int4 不同，fp8 大 M 不再输给 cuBLAS，无需 w_deq 双路径。
+        字节 = 0.5×bf16（比 int8 还省一半，精度靠 e4m3 的 3 位尾数 + 每列 scale）。
+        """
+        w = self.weight.detach().float()
+        N, K = w.shape
+        w_scale = w.abs().amax(dim=1, keepdim=True).clamp(min=1e-8) / 448.0     # [N,1] fp32
+        w_fp8 = torch.clamp(w / w_scale, -448.0, 448.0).to(torch.float8_e4m3fn)  # 饱和化
+        self.register_buffer("w_fp8", w_fp8.contiguous())
+        # scale 存 fp32：torch._scaled_mm 要求 fp32 scale（bf16 会报错）
+        self.register_buffer("w_fp8_scale", w_scale.contiguous())
+        self.fp8 = True
+        del self.weight  # 释放fp16权重（weight_loader只在加载期使用）
+
+    def _fp8_forward(self, x: torch.Tensor) -> torch.Tensor:
+        bias = getattr(self, "bias", None)
+        if x.shape[0] > self.fp8_max_m:
+            # 大 M（prefill）：硬件 FP8 MMA（cuBLASLt _scaled_mm，b 列主序 w.t()）。
+            # 激活用融合 Triton kernel 量化（一个 kernel 完成 amax→scale→clamp→cast，
+            # 避免 5-9 个逐层 torch kernel 的开销吃掉 GEMM 收益）
+            a_fp8 = torch.empty(x.shape, device=x.device, dtype=torch.float8_e4m3fn)
+            a_scale = torch.empty(x.shape[0], 1, device=x.device, dtype=torch.float32)
+            quantize_fp8_act_kernel[(x.shape[0],)](
+                x, a_fp8, a_scale, x.shape[0], x.shape[1],
+                x.stride(0), x.stride(1), a_fp8.stride(0), a_fp8.stride(1),
+                BLOCK_K=triton.next_power_of_2(x.shape[1]))
+            y = torch._scaled_mm(a_fp8, self.w_fp8.t(), scale_a=a_scale,
+                                 scale_b=self.w_fp8_scale.t(), out_dtype=torch.bfloat16)
+        else:
+            # 小 M（decode）：权重-only Triton 内核（激活 bf16 不量化——decode 单 token
+            # 激活精度更敏感，且省掉逐层量化开销；权重字节 0.5× → 大 K 模型带宽赢）
+            y = fp8_gemm(x, self.w_fp8, self.w_fp8_scale)
+        if bias is not None:
+            y = y + bias
+        return y
     def quantize_sparse24(self):
         """2:4 结构化剪枝 + 自研 Triton 稀疏 GEMM（打包 v + idx，见 gemm_sparse24_kernel）。
 
@@ -377,8 +528,8 @@ class LinearBase(WeightQuantMixin, nn.Module):
     ):
         super().__init__()
         self.tp_dim = tp_dim
-        self.tp_rank = dist.get_rank()
-        self.tp_size = dist.get_world_size()
+        self.tp_rank = tp_rank()
+        self.tp_size = tp_size()
         self.weight = nn.Parameter(torch.empty(output_size, input_size))
         self.weight.weight_loader = self.weight_loader
         if bias:
@@ -390,6 +541,7 @@ class LinearBase(WeightQuantMixin, nn.Module):
         self.w8a8 = False  # w_int8/w_scale/smooth缓冲由quantize_w8a8创建（不能先占普通属性名）
         self.int4 = False  # w_int4/w_int4_scale/awq_scale缓冲由quantize_int4创建
         self.sparse24 = False  # w_s24_v/w_s24_idx缓冲由quantize_sparse24创建
+        self.fp8 = False  # w_fp8/w_fp8_scale缓冲由quantize_fp8创建
 
     def quantize_w8a8(self, x_max: torch.Tensor | None = None):
         """per-group（K维按128分组，AWQ标准）int8权重量化 + scale；TP分片按各自输出维量化。
@@ -452,6 +604,8 @@ class ReplicatedLinear(LinearBase):
         param.data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.fp8:
+            return self._fp8_forward(x)
         if self.sparse24:
             return self._sparse24_forward(x)
         if self.int4:
@@ -469,8 +623,8 @@ class ColumnParallelLinear(LinearBase):
         output_size: int,
         bias: bool = False,
     ):
-        tp_size = dist.get_world_size()
-        super().__init__(input_size, divide(output_size, tp_size), bias, 0)
+        ts = tp_size()
+        super().__init__(input_size, divide(output_size, ts), bias, 0)
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         param_data = param.data
@@ -480,6 +634,8 @@ class ColumnParallelLinear(LinearBase):
         param_data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.fp8:
+            return self._fp8_forward(x)
         if self.sparse24:
             return self._sparse24_forward(x)
         if self.int4:
@@ -519,11 +675,11 @@ class QKVParallelLinear(ColumnParallelLinear):
         total_num_kv_heads: int | None = None,
         bias: bool = False,
     ):
-        tp_size = dist.get_world_size()
+        ts = tp_size()
         total_num_kv_heads = total_num_kv_heads or total_num_heads
         self.head_size = head_size
-        self.num_heads = divide(total_num_heads, tp_size)
-        self.num_kv_heads = divide(total_num_kv_heads, tp_size)
+        self.num_heads = divide(total_num_heads, ts)
+        self.num_kv_heads = divide(total_num_kv_heads, ts)
         output_size = (total_num_heads + 2 * total_num_kv_heads) * self.head_size
         super().__init__(hidden_size, output_size, bias)
 
@@ -552,8 +708,8 @@ class RowParallelLinear(LinearBase):
         output_size: int,
         bias: bool = False,
     ):
-        tp_size = dist.get_world_size()
-        super().__init__(divide(input_size, tp_size), output_size, bias, 1)
+        ts = tp_size()
+        super().__init__(divide(input_size, ts), output_size, bias, 1)
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         param_data = param.data
@@ -566,7 +722,9 @@ class RowParallelLinear(LinearBase):
         param_data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.sparse24:
+        if self.fp8:
+            y = self._fp8_forward(x)
+        elif self.sparse24:
             y = self._sparse24_forward(x)
         elif self.int4:
             y = self._int4_forward(x)

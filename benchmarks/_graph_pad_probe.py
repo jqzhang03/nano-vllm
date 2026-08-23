@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import os
+import sys
 import time
 
 import torch
@@ -17,7 +18,7 @@ from nanovllm.engine.sequence import Sequence
 from nanovllm.engine.model_runner import ModelRunner
 from nanovllm.utils.context import set_context, reset_context
 
-MODEL = os.path.expanduser("~/huggingface/Qwen3-0.6B/")
+MODEL = os.path.expanduser(sys.argv[1]) if len(sys.argv) > 1 else os.path.expanduser("~/huggingface/Qwen3-0.6B/")
 from flash_attn import flash_attn_varlen_func
 
 

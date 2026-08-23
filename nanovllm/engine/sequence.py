@@ -30,6 +30,7 @@ class Sequence:
         self.is_prefill = True
         self.block_table = []
         self.draft_tokens: list[int] | None = None  # 投机解码：本步n-gram草稿（None=非verify行；[]=verify行无草稿）
+        self.swapped = False  # KV swap 抢占：KV 已换出到 CPU（在 swapped 队列，恢复时换入直接decode）
 
         # ---- 基准计时（仅driver侧使用，不随__getstate__跨进程传输） ----
         self.t_submitted: float | None = None      # 请求加入调度队列的时间（秒）

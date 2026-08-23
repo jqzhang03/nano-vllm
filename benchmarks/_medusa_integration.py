@@ -22,10 +22,12 @@ TEXT = ("Repeat exactly, continuing the same digit forever: " + " ".join(["5"] *
 
 def main():
     p = argparse.ArgumentParser()
+    p.add_argument("--model", default=MODEL, help="模型目录（默认 Qwen3-0.6B）")
     p.add_argument("--medusa-path", default="results/medusa_heads.pt")
     args = p.parse_args()
+    args.model = os.path.expanduser(args.model)  # bash argv 不展开 ~ → 手动展开
 
-    llm = LLM(MODEL, speculative="medusa", medusa_path=args.medusa_path, gpu_memory_utilization=0.9)
+    llm = LLM(args.model, speculative="medusa", medusa_path=args.medusa_path, gpu_memory_utilization=0.9)
     llm.generate(["warm up"] * 4, SamplingParams(temperature=0.6, max_tokens=8), use_tqdm=False)
     tokenizer = llm.tokenizer
     prompts = [tokenizer.encode(TEXT), tokenizer.encode("The capital of France is")]

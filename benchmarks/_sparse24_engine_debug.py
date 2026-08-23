@@ -1,11 +1,15 @@
-"""sparse24 引擎级调试：eager vs CUDA-graph 路径定位（首个 decode 步 logits）。"""
+"""sparse24 引擎级调试：eager vs CUDA-graph 路径定位（首个 decode 步 logits）。
+
+用法：python benchmarks/_sparse24_engine_debug.py [model]
+"""
 import os
+import sys
 
 import torch
 
 from nanovllm import LLM, SamplingParams
 
-PATH = os.path.expanduser("~/huggingface/Qwen3-0.6B/")
+PATH = os.path.expanduser(sys.argv[1]) if len(sys.argv) > 1 else os.path.expanduser("~/huggingface/Qwen3-0.6B/")
 PROMPTS = [
     "The capital of France is",
     "To bake a chocolate cake, you need",

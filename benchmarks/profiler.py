@@ -45,6 +45,7 @@ def parse_args():
 
 def main():
     args = parse_args()
+    args.model = os.path.expanduser(args.model)  # bash argv 不展开 ~ → 手动展开
     llm = LLM(args.model, enforce_eager=not args.cudagraph, tensor_parallel_size=args.tp,
               max_model_len=args.max_model_len, gpu_memory_utilization=args.gpu_memory_utilization)
     # 预热：在profiler之外完成torch.compile/triton的JIT编译与CUDA Graph捕获
