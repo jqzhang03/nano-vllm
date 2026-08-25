@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project overview
 
-nano-vllm is a from-scratch reimplementation of vLLM's offline inference stack (~1,200 lines of Python) built on raw PyTorch + Triton + flash-attn. It supports **Qwen3 / Qwen2.5 / Llama-3.x 因果 LM**（`nanovllm/models/qwen3.py` / `qwen2.py` / `llama3.py`，按 `hf_config.model_type` 经 `nanovllm/models/registry.py` 分发；Qwen2 删 QK-Norm、Llama 的 `attention_bias` 默认 False）。The public API mirrors vLLM: `LLM(path, ...)` + `SamplingParams`, and `LLM.generate(prompts, sampling_params)` returns a list of `{"text": ..., "token_ids": [...]}` dicts in input order. Root `example.py` and `bench.py` are the runnable demos.
+nano-vllm is a from-scratch reimplementation of vLLM's offline inference stack (~1,200 lines of Python) built on raw PyTorch + Triton + flash-attn. It supports **Qwen3 / Qwen2.5 / Llama-3.x / Mistral-7B（滑动窗口 SWA）/ Gemma-2（交替 local/global + logit soft-cap）因果 LM**（`nanovllm/models/qwen3.py` / `qwen2.py` / `llama3.py` / `mistral.py` / `gemma2.py`，按 `hf_config.model_type` 经 `nanovllm/models/registry.py` 分发；Qwen2 删 QK-Norm、Llama 的 `attention_bias` 默认 False、Mistral 的 `sliding_window` 传 Attention、Gemma-2 的 embed ×√d 缩放 + RMSNorm (1+weight) 偏移 + 层内双残差四 norm）。The public API mirrors vLLM: `LLM(path, ...)` + `SamplingParams`, and `LLM.generate(prompts, sampling_params)` returns a list of `{"text": ..., "token_ids": [...]}` dicts in input order. Root `example.py` and `bench.py` are the runnable demos.
 
 Hard runtime requirements (GPU): CUDA, `flash-attn`, `triton`, and NCCL. There is **no test suite and no linter**.
 
@@ -53,6 +53,18 @@ This repo is developed on Windows + WSL2 (Ubuntu), conda env `nanovllm`, Python 
 - `ModelRunner.allocate_kv_cache()` allocates one big `[2, num_layers, num_blocks, block_size, num_kv_heads, head_dim]` tensor and binds each layer's `k_cache`/`v_cache` by matching modules that have those attributes. `num_kvcache_blocks` is derived from a free-VRAM heuristic (`total*util - used - warmup_peak + current // block_bytes`) and asserts `> 0`.
 - Block size = `kvcache_block_size` (default 256, must be a multiple of 256). `Config` asserts this.
 - `Attention.forward` writes K/V into the cache with a custom triton kernel (`store_kvcache`, using `context.slot_mapping`), then calls flash-attn: `flash_attn_varlen_func` for prefill (paged via `block_table`), `flash_attn_with_kvcache` for decode (paged via `block_table` + `cache_seqlens`).
+- **SWA 滑动窗口（Mistral / Gemma-2 local 层）**：`Attention(window_size=W)` 把窗口传进所有 flash
+  调用（`window_size=(W-1, 0)`——flash 的 `[i-left, i+right]` **含两端**，causal 窗口 W 个 key
+  必须减 1，见 `benchmarks/_swa_probe.py` 的 off-by-one 演示）与自研 fp8 内核（`WINDOW` constexpr
+  掩码：decode `key_pos ≥ seqlen-W`、varlen `key_pos ≥ key_upper-W+1`）。**不做滚动块复用**
+  （flash 从块表索引推导 key 位置，滚动表会错位；vLLM 同样只掩码）。fp8 内核 WINDOW>0 时
+  m 从 0 起步（否则全掩块 `exp(-inf-(-inf))=NaN`；softmax 平移不变，数学等价）。
+- **attn logit soft-cap（Gemma-2）**：`Attention(logit_softcapping=cap)` 走 flash 原生
+  `softcap=cap` 参数（内核内 cap·tanh(logits/cap)，probe 验证与 torch 参考精确一致）；
+  softcap 层禁用 fp8 KV（自研内核无 softcap，forward 断言）。final logit soft-cap 在模型
+  `compute_logits` 里（logits = cap·tanh(logits/cap)）。
+- **RMSNorm weight_offset（Gemma-2）**：`RMSNorm(..., weight_offset=True)` 输出 = norm(x)×(1+w)
+  （HF Gemma2RMSNorm 同款；权重 init 0、checkpoint 存偏移量）——用标准 ×weight 会差 (1+w)/w 倍。
 - **KV cache quantization**: `kv_cache_dtype="fp8_e4m3"` stores K/V as FP8(E4M3) (1 byte/elem, ~2× capacity) with per-layer static scales calibrated on random-token prefill; decode/verify read the cache with the custom fp8 Triton attention kernels (`paged_decode_attention_fp8` / `paged_varlen_attention_fp8`) that load fp8 directly and dequantize in-register via hardware cvt.
 
 ### Weight quantization & sparsity (`--quantization none|w8a8|int4|awq|sparse24`)

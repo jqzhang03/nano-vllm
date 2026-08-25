@@ -47,6 +47,7 @@ def paged_decode_attention_fp8_kernel(
     max_blocks, num_heads, kv_heads,
     head_dim: tl.constexpr, num_groups: tl.constexpr, QPAD: tl.constexpr,
     BLOCK_SIZE: tl.constexpr, BLOCK_T: tl.constexpr,
+    WINDOW: tl.constexpr,
 ):
     """Paged decode attention over an FP8 (E4M3) KV cache（v6，MMA版）。
 
@@ -74,7 +75,10 @@ def paged_decode_attention_fp8_kernel(
     q16 = q.to(tl.float16)
 
     acc = tl.zeros([head_dim, QPAD], dtype=tl.float32)                    # [D, QPAD]
-    m = tl.full([1, QPAD], float("-inf"), dtype=tl.float32)
+    # WINDOW>0 时窗口掩掉前导块 → 若 m 从 -inf 起步，全掩块使 m_new 保持 -inf，
+    # alpha=exp(-inf-(-inf))=NaN。m 从 0 起步：softmax 平移不变，结果数学等价，
+    # 且全掩块阶段 alpha=exp(0-0)=1、l/acc 贡献为 0，无 NaN。
+    m = tl.full([1, QPAD], float("-inf") if WINDOW == 0 else 0.0, dtype=tl.float32)
     l = tl.zeros([1, QPAD], dtype=tl.float32)
 
     num_blocks = (seqlen + BLOCK_SIZE - 1) // BLOCK_SIZE
@@ -84,7 +88,12 @@ def paged_decode_attention_fp8_kernel(
         base = block_id * block_stride + kv_head * head_dim
         for t in range(0, BLOCK_SIZE, BLOCK_T):
             offs_t = t + tl.arange(0, BLOCK_T)
-            tok_mask = (b * BLOCK_SIZE + offs_t) < seqlen
+            key_pos = b * BLOCK_SIZE + offs_t
+            # SWA 窗口掩码：与 flash window_size=(W-1, 0) 语义一致（见 Attention.__init__
+            # 的 _flash_window 注释；WINDOW=滑动窗口大小，含自己）——WINDOW=0 时恒真
+            tok_mask = key_pos < seqlen
+            if WINDOW > 0:
+                tok_mask = tok_mask & (key_pos >= seqlen - WINDOW)
             k_ptrs = k_cache_ptr + base + offs_t[:, None] * (kv_heads * head_dim) + offs_d[None, :]
             k16 = (tl.load(k_ptrs).to(tl.float32) * k_scale).to(tl.float16)  # [T, D]
             s = tl.dot(k16, q16, out_dtype=tl.float32) * softmax_scale       # [T, QPAD]
@@ -105,7 +114,8 @@ def paged_decode_attention_fp8_kernel(
 
 def paged_decode_attention_fp8(q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor,
                                block_table: torch.Tensor, cache_seqlens: torch.Tensor,
-                               k_scale: float, v_scale: float, softmax_scale: float) -> torch.Tensor:
+                               k_scale: float, v_scale: float, softmax_scale: float,
+                               window: int = 0) -> torch.Tensor:
     bs, num_heads, head_dim = q.shape
     kv_heads = k_cache.shape[2]
     max_blocks = block_table.shape[1]
@@ -119,6 +129,7 @@ def paged_decode_attention_fp8(q: torch.Tensor, k_cache: torch.Tensor, v_cache: 
         max_blocks, num_heads, kv_heads,
         head_dim=head_dim, num_groups=num_groups, QPAD=qpad,
         BLOCK_SIZE=k_cache.shape[1], BLOCK_T=32,
+        WINDOW=window,
         num_warps=1,
     )
     return o
@@ -131,6 +142,7 @@ def paged_varlen_attention_fp8_kernel(
     max_blocks, num_heads, kv_heads,
     head_dim: tl.constexpr, num_groups: tl.constexpr, QPAD: tl.constexpr,
     BLOCK_SIZE: tl.constexpr, BLOCK_T: tl.constexpr,
+    WINDOW: tl.constexpr,
 ):
     """Paged varlen attention over an FP8 (E4M3) KV cache（v7，verify步用）。
 
@@ -158,7 +170,8 @@ def paged_varlen_attention_fp8_kernel(
     q16 = q.to(tl.float16)
 
     acc = tl.zeros([head_dim, QPAD], dtype=tl.float32)
-    m = tl.full([1, QPAD], float("-inf"), dtype=tl.float32)
+    # 同 decode 内核：WINDOW>0 时 m 从 0 起步避免全掩块 NaN（softmax 平移不变）
+    m = tl.full([1, QPAD], float("-inf") if WINDOW == 0 else 0.0, dtype=tl.float32)
     l = tl.zeros([1, QPAD], dtype=tl.float32)
     num_blocks = (seqlen + BLOCK_SIZE - 1) // BLOCK_SIZE
     block_stride = BLOCK_SIZE * kv_heads * head_dim
@@ -169,7 +182,10 @@ def paged_varlen_attention_fp8_kernel(
         for t in range(0, BLOCK_SIZE, BLOCK_T):
             offs_t = t + tl.arange(0, BLOCK_T)
             key_pos = b * BLOCK_SIZE + offs_t
+            # SWA 窗口掩码：query r 的 key 下限 = key_upper - WINDOW + 1（含自己，WINDOW=窗口大小）
             tok_mask = key_pos[:, None] <= key_upper[None, :]   # <=：含query自己的key
+            if WINDOW > 0:
+                tok_mask = tok_mask & (key_pos[:, None] >= key_upper[None, :] - WINDOW + 1)
             k_ptrs = k_cache_ptr + base + offs_t[:, None] * (kv_heads * head_dim) + offs_d[None, :]
             k16 = (tl.load(k_ptrs).to(tl.float32) * k_scale).to(tl.float16)  # [T, D]
             s = tl.dot(k16, q16, out_dtype=tl.float32) * softmax_scale       # [T, QPAD]
@@ -191,7 +207,8 @@ def paged_varlen_attention_fp8_kernel(
 def paged_varlen_attention_fp8(q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor,
                                cu_seqlens_q: torch.Tensor, key_lens: torch.Tensor,
                                block_table: torch.Tensor,
-                               k_scale: float, v_scale: float, softmax_scale: float) -> torch.Tensor:
+                               k_scale: float, v_scale: float, softmax_scale: float,
+                               window: int = 0) -> torch.Tensor:
     """verify步（Q=γ+1≤5的varlen多查询）fp8 paged attention。"""
     total, num_heads, head_dim = q.shape
     n_seqs = cu_seqlens_q.size(0) - 1
@@ -205,6 +222,7 @@ def paged_varlen_attention_fp8(q: torch.Tensor, k_cache: torch.Tensor, v_cache: 
         block_table.shape[1], num_heads, kv_heads,
         head_dim=head_dim, num_groups=num_groups, QPAD=16,
         BLOCK_SIZE=k_cache.shape[1], BLOCK_T=32,
+        WINDOW=window,
         num_warps=1,
     )
     return o
@@ -218,12 +236,24 @@ class Attention(nn.Module):
         head_dim,
         scale,
         num_kv_heads,
+        window_size: int | None = None,
+        logit_softcapping: float | None = None,
     ):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.scale = scale
         self.num_kv_heads = num_kv_heads
+        # ---- SWA 滑动窗口（Mistral / Gemma-2 local 层） ----
+        # window_size = 滑动窗口大小（HF config.sliding_window 语义：query i 关注
+        # keys ∈ [i-window+1, i]，含自己，共 window 个 key）。flash-attn 的
+        # window_size=(left, right) 语义为 [i-left, i+right] 含两端 → 传
+        # (window_size-1, 0) 与之对齐（benchmarks/_swa_probe.py 验证）。
+        # 自研 fp8 内核的 WINDOW 掩码用同一约定（key_pos >= seqlen - window）。
+        self.window_size = window_size
+        self.logit_softcapping = logit_softcapping
+        self._flash_window = (window_size - 1, 0) if window_size else (-1, -1)
+        self._flash_softcap = logit_softcapping or 0.0
         self.k_cache = self.v_cache = torch.tensor([])
         # ---- FP8 KV cache 状态（由ModelRunner在allocate_kv_cache/校准时设置） ----
         self.use_fp8 = False                 # 是否启用fp8(E4M3) KV存储
@@ -236,6 +266,11 @@ class Attention(nn.Module):
         self.cal_max_v = 0.0
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
+        # logit soft-cap（Gemma-2）依赖 flash-attn 的 softcap 参数（内核内 tanh）——
+        # 自研 fp8 内核无 softcap → 软上限层必须用 fp16 KV
+        assert not (self.use_fp8 and self.logit_softcapping), (
+            "attn logit softcapping (Gemma-2) 不支持 fp8 KV cache "
+            "（自研 fp8 内核无 softcap；请用 kv_cache_dtype=auto）")
         context = get_context()
         k_cache, v_cache = self.k_cache, self.v_cache
         # 校准时记录K/V动态范围（在store之前）
@@ -270,6 +305,7 @@ class Attention(nn.Module):
                                            max_seqlen_q=context.max_seqlen_q, cu_seqlens_q=context.cu_seqlens_q,
                                            max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
                                            softmax_scale=self.scale, causal=True,
+                                           window_size=self._flash_window, softcap=self._flash_softcap,
                                            block_table=context.prefill_block_tables)
                 return o
             # prefill组：flash varlen；若本组存在分块序列（key_len>query_len，含自己
@@ -289,17 +325,21 @@ class Attention(nn.Module):
                                            max_seqlen_q=context.max_seqlen_q, cu_seqlens_q=context.cu_seqlens_q,
                                            max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
                                            softmax_scale=self.scale, causal=True,
+                                           window_size=self._flash_window, softcap=self._flash_softcap,
                                            block_table=context.prefill_block_tables)
             q_dec = q[n_pre:]
             if self.use_fp8:
                 o_dec = paged_decode_attention_fp8(q_dec, k_cache, v_cache,
                                                    context.block_tables, context.context_lens,
-                                                   self.k_scale, self.v_scale, self.scale)
+                                                   self.k_scale, self.v_scale, self.scale,
+                                                   window=self.window_size or 0)
             else:
                 o_dec = flash_attn_with_kvcache(q_dec.unsqueeze(1), k_cache, v_cache,
                                                 cache_seqlens=context.context_lens,
                                                 block_table=context.block_tables,
-                                                softmax_scale=self.scale, causal=True).squeeze(1)
+                                                softmax_scale=self.scale, causal=True,
+                                                window_size=self._flash_window,
+                                                softcap=self._flash_softcap).squeeze(1)
             return torch.cat([o_pre, o_dec], dim=0)
         if context.is_prefill:
             if context.block_tables is not None:    # prefix cache：KV来自缓存
@@ -311,7 +351,8 @@ class Attention(nn.Module):
                         o = paged_varlen_attention_fp8(q, k_cache, v_cache,
                                                        context.cu_seqlens_q, key_lens,
                                                        context.block_tables,
-                                                       self.k_scale, self.v_scale, self.scale)
+                                                       self.k_scale, self.v_scale, self.scale,
+                                                       window=self.window_size or 0)
                         return o
                     # 普通prefill（前缀复用）：反量化成模型dtype再交给flash-attn
                     # （prefill步少，全缓存反量化的代价可接受）
@@ -322,15 +363,19 @@ class Attention(nn.Module):
             o = flash_attn_varlen_func(q, k, v,
                                        max_seqlen_q=context.max_seqlen_q, cu_seqlens_q=context.cu_seqlens_q,
                                        max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
-                                       softmax_scale=self.scale, causal=True, block_table=context.block_tables)
+                                       softmax_scale=self.scale, causal=True, block_table=context.block_tables,
+                                       window_size=self._flash_window, softcap=self._flash_softcap)
         else:    # decode
             if self.use_fp8:
                 # 读路径：自研Triton内核直接读fp8缓存，寄存器内反量化
                 o = paged_decode_attention_fp8(q, k_cache, v_cache,
                                                context.block_tables, context.context_lens,
-                                               self.k_scale, self.v_scale, self.scale)
+                                               self.k_scale, self.v_scale, self.scale,
+                                               window=self.window_size or 0)
             else:
                 o = flash_attn_with_kvcache(q.unsqueeze(1), k_cache, v_cache,
                                             cache_seqlens=context.context_lens, block_table=context.block_tables, 
-                                            softmax_scale=self.scale, causal=True)
+                                            softmax_scale=self.scale, causal=True,
+                                            window_size=self._flash_window,
+                                            softcap=self._flash_softcap)
         return o

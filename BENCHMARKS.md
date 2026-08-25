@@ -334,7 +334,7 @@ python benchmarks/compare_merge.py results/compare_*.json   # → results/compar
 
 **双路径模式的权衡**：吞吐从"bs=8 持平 / bs=256 0.64×"变成"**bs=8 +35%、bs=256 +3~6%、TTFT 恢复**"（decode M≤128 的 qkv/gate_up/lm_head 走 int4 赢、o/down 走稠密不亏、大 M 全稠密），代价是**权重显存 1.730GB——比 fp16 的 1.503GB 还大 15%**（int4 220MB + w_deq 881MB + scale 7MB，w_deq 是 bf16 全尺寸副本）。`int4_dense_path=False` 回到纯 int4 显存模式（0.850GB）。精度不变（KL 1.08 / awq ppl 3.76；int4+fp8 KV 组合 KL 1.13 正常）。
 
-**诚实解读**：软件 int4 的赢面只在**权重带宽主导的小 M GEMM**——微基准 gate_up M=8 **4.36×**、lm_head M=8 3.42×、qkv 1.6-2.0×；但 down_proj（K=4096）只有 0.40×，M≥128 全输（0.2-0.6×，MMA 计数与稠密相同 + 反量化开销，cuBLAS 不可战胜）。**双路径把"每层走自己赢的形态"落地**：端到端吞吐反超 fp16（小 batch 明显、大 batch 微赢），代价是显存。这是"带宽优化型内核在计算主导区间的天花板"的正面解法——不是跟 cuBLAS 硬碰，而是按形态路由。纯 int4 仍是显存优先选项（0.85GB，0.57×）。
+**诚实解读**：软件 int4 的赢面只在**权重带宽主导的小 M GEMM**——微基准 gate_up M=8 **4.36×**、lm_head M=8 3.42×、qkv 1.6-2.0×；但 down_proj（K=4096）只有 0.40×，M≥128 全输（0.2-0.6×，MMA 计数与稠密相同 + 反量化开销，cuBLAS 不可战胜）。**双路径把"每层走自己赢的形态"落地**：端到端吞吐反超 fp16（小 batch 明显、大 batch 微赢），代价是显存。这是"带宽优化型内核在计算主导区间的天花板"的正面解法——不是跟 cuBLAS 硬碰，而是按形态路由。纯 int4 仍是显存优先选项（0.85GB）——**tile 搜索（`benchmarks/_kernel_roofline.md`）后大 M 用 BM16/BN128（regs 255→128）→ 纯 int4 bs=256 从 0.64× 提到 0.82× fp16（3067→3916.5 tok/s，+28%）**。
 
 #### 10.2 AWQ（激活感知缩放 + 按层 α 搜索）
 
@@ -355,6 +355,28 @@ python benchmarks/compare_merge.py results/compare_*.json   # → results/compar
 **性能**：只有大 N 小 M 的权重带宽主导 GEMM 赢（gate_up M=8 **1.84×**、lm_head M=8 1.24×），其余 0.2-0.5×；引擎级 **bs=8 0.35×、bs=256 0.49×**（decode 步 28.7ms vs 13.3ms）。软件 2:4 的硬限制：**MMA 数与稠密相同**（Triton 无稀疏 MMA 指令），4 路掩码重建是纯开销——它只是带宽优化，真正的 2:4 计算加速需要硬件稀疏 MMA（Ampere 专用指令/cuSPARSELt 高效封装），在 sm_120 上本仓库的结论是**做显存/带宽优化可、做吞吐加速不可**。
 
 **结论与路线**：INT4/AWQ 是"完成且可用"的（双路径：ppl +13%、吞吐超 fp16、显存 1.73GB；纯 int4：显存 0.57×、大 batch 慢；按需二选一）。进一步路线 = Marlin 式持久内核 / w_deq 降精度存储（fp8 会引入 dequant 流量，不划算）收显存。2:4 的落地瓶颈在剪枝算法与硬件支持，而非内核。全部结论条件：RTX 5060 Ti（sm_120）、Qwen3-0.6B、bf16、WSL2 单卡。
+
+### 11. 新模型端口：Mistral-7B（SWA）与 Gemma-2-2B（2026-08-24，RTX 5060 Ti 16GB）
+
+**正确性（HF 参考 prefill logits，`benchmarks/_parity.py`）**：
+
+| 模型 | top-1 一致率 | mean diff | max diff | 说明 |
+|---|---|---|---|---|
+| Mistral-7B-v0.1 | **100%** | 0.014 | 0.094 | 首跑即过；SWA 窗口在短 prompt 下不生效，窗口数学由 `_swa_probe.py` 独立验证 |
+| gemma-2-2b-it | **100%** | 0.022 | 0.188 | 三个隐藏架构细节修完后通过（embed ×√d、RMSNorm (1+w)、双残差四 norm） |
+
+**吞吐（`benchmarks/bench.py`，int4，干净 workload in 128-1024 / out 64-512，0 抢占）**：
+
+| 模型 | seqs | 吞吐 | decode | TPOT avg/p50 | TTFT avg | 权重 | 峰值 | KV |
+|---|---|---|---|---|---|---|---|---|
+| Mistral-7B（int4 流式纯 int4） | 32 | **311.4 tok/s** | 475 tok/s | 46.8 / 49.0ms | 10.7s | 4.14GB | 11.37GB | 213 块 |
+| gemma-2-2b（int4 双路径） | 64 | **1094.7 tok/s** | 1211 tok/s | 35.9 / 34.6ms | 2.47s | ~4GB | 12.35GB | 220 块 |
+
+**要点**：
+- Mistral 的 TTFT 10.7s = 32×~576 token 的预填充批（~18k token 分块两步）在 7B int4 上的真实成本——吞吐 311 tok/s 与 Llama-3.1-8B 的 303.5 tok/s（bs=16）同量级，两代 7B+ 端口互相印证。
+- **SWA 长上下文**（`benchmarks/_swa_long.py`，4876-token prompt 跨 sliding_window=4096）：分块 prefill + decode 全路径跑通（957 tok/s prefill），无 NaN/崩溃——窗口掩码 + 块表路径在跨窗口 chunk 下正确。
+- **attn soft-cap 量级**（`_softcap_probe.py`，层0）：原始 logits ±11 时 cap=50 的 tanh 最大只改 **1.7%**（近线性区）——flash 原生 softcap 精确实现；final cap=30 压 logits ±30+，必须实现。
+- **诚实限制**：SWA 只掩码不滚动（KV 不封顶，与 vLLM 一致；真省显存需 flash fork）；gemma2 softcap 层不支持 fp8 KV（断言拦截）；WSL2 单卡、bf16、flash-attn 2.8.3.post1。
 
 ## Profiling
 

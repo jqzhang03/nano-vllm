@@ -154,17 +154,18 @@ def int4_gemm(a: torch.Tensor, b_int4: torch.Tensor, b_scale: torch.Tensor) -> t
     """INT4 线性：a [M, K] bf16 × 打包 int4 [N, K//2] → [M, N]（bf16）。
 
     b_scale: [N, num_groups]（K 维按 128 分组）；b_int4 低/高半字节 = k=2j/2j+1。
-    tile 按 M 自适应：小 M（decode，权重带宽主导）用 16×128；大 M 用 64×256。
+    tile 按 M 自适应（`benchmarks/_kernel_roofline.py` 网格搜索 + `_kernel_verify.py`
+    高迭代复测）：小 M（decode，权重带宽主导）用 16×128；**大 M 用 16×128 而非 64×256**——
+    大 tile 的 acc 寄存器压力把 regs/thread 打到 255（occupancy ~17%），小 tile（regs=128，
+    occupancy 2×）靠并行度反超（N=K=4096 实测 +19%）。与 int8/fp8/sparse 的"大 M 用 64×256"
+    直觉相反——int4 的寄存器内反量化让大 tile 的寄存器成本更高。
     """
     M, K = a.shape
     N = b_scale.shape[0]
     assert b_int4.shape == (N, K // 2), f"expected packed [N, K//2], got {b_int4.shape}"
     assert K % 128 == 0, "group size 128 must divide K"
     out = torch.empty(M, N, device=a.device, dtype=torch.bfloat16)
-    if M <= 128:
-        bm, bn, warps = 16, 128, 4
-    else:
-        bm, bn, warps = 64, 256, 8
+    bm, bn, warps = 16, 128, 4
     grid = (triton.cdiv(M, bm) * triton.cdiv(N, bn),)
     gemm_int4_kernel[grid](
         a, b_int4, out, b_scale,

@@ -124,26 +124,28 @@
 
 ---
 
-## 阶段 7：多模型适配（已完成：注册表 + 按层加载 + Qwen2.5 + Llama-3.1 + 脚本 argv 化；其余规划中）
+## 阶段 7：多模型适配（已完成：注册表 + 按层加载 + Qwen2.5 + Llama-3.1 + Mistral（SWA）+ Gemma-2（soft-cap）+ 脚本 argv 化）
 
 | 功能 | 读什么 | 状态 |
 |---|---|---|
-| 模型注册表 | `models/registry.py`（`get_model_class(model_type)`）；`model_runner.py` 第 34 行 | **已实现**：qwen3 / qwen2 / llama；mistral/gemma2 占位（构造时报具体卡点） |
+| 模型注册表 | `models/registry.py`（`get_model_class(model_type)`）；`model_runner.py` 第 34 行 | **已实现**：qwen3 / qwen2 / llama / mistral / gemma2；mixtral 占位（构造时报具体卡点） |
 | Qwen2.5 端口 | `models/qwen2.py`（模板 `models/qwen3.py` 删 QK-Norm） | **已实现**：0.5B/7B 验证（0.5B 与 HF 参考 top-1 100% 一致） |
 | Llama-3.1 端口 | `models/llama3.py`（qwen2.py 模板，`attention_bias` 默认 False） | **已实现**：8B int4/w8a8 流式 16GB 卡跑通（int4 峰值 11.62GB）；`rope_scaling` llama3 变体已实现并单元对照 HF（0 误差） |
-| 按层流式加载 + 即时量化 | `loader.py` `load_model(streaming=True)` + `_load_streaming`；`model_runner.py` `_decide_streaming`/`_streaming_quant_hook`/`_finalize_streaming` | **已实现**：Qwen2.5-7B（峰值 10.66GB）/ Llama-3.1-8B（峰值 11.62GB） |
+| Mistral-7B 端口（SWA） | `models/mistral.py`（llama3.py 模板 + `sliding_window`）；`layers/attention.py` 的 `window_size`/`_flash_window`；fp8 内核 `WINDOW` | **已实现**：与 HF 参考 top-1 100%（mean diff 0.014）；int4 流式 16GB 卡峰值 11.37GB；4876-token 跨窗口压测通过；bs=32 311 tok/s |
+| Gemma-2 端口 | `models/gemma2.py`（`gemma2_layer_types` / embed ×√d / 层内双残差四 norm / soft-cap / gelu_tanh）；`layers/layernorm.py` 的 `weight_offset` | **已实现**：2B 与 HF 参考 top-1 100%（mean diff 0.022）；bs=64 1095 tok/s；三个"读源码才能发现"的架构细节见 note.md 故事 15 |
+| 按层流式加载 + 即时量化 | `loader.py` `load_model(streaming=True)` + `_load_streaming`；`model_runner.py` `_decide_streaming`/`_streaming_quant_hook`/`_finalize_streaming` | **已实现**：Qwen2.5-7B（峰值 10.66GB）/ Llama-3.1-8B（峰值 11.62GB）/ Mistral-7B（峰值 11.37GB） |
 | 脚本 argv 化 | benchmarks/ 全部脚本（模型路径 = 第一位置参数 / `--model`，缺省 Qwen3-0.6B） | **已实现**：22+ 个脚本，新模型可直接复用全部基准/诊断 |
 
 ### 卡点清单（剩余模型适配的阻塞点，对应 registry 里的 `_PLANNED_BLOCKERS`）
 
 | 模型 | 需要的改动 | 卡点 / 依赖 | 工作量 |
 |---|---|---|---|
-| **Mistral-7B** | llama 同款 + 滑动窗口注意力 | `attention.py` 的 prefill/decode 调用都要传 `window_size`（flash-attn 参数）；**fp8 KV 内核不支持窗口组合**（需 fp8 内核加窗口掩码，或窗口场景回落 fp16 KV）；无 QK-Norm | ~1 天（窗口掩码是唯一真框架改动） |
-| **Gemma-2** | 激活换 `GeluAndMul`（gelu_pytorch_tanh）；LM head **logit soft-cap**（`logits·tanh(soft_cap)`）；QK-Norm 带 abs 缩放；交替 window/global 局部注意力 | activation.py 加 gelu 门控；embed_head 加 soft-cap；attention.py 支持按层 window 开关；head_dim=256 全旋转（get_rope 直接支持） | ~1.5 天 |
+| **Mixtral / MoE** | MoE 层：router + top-k + expert FFN + load-balancing aux loss + 专家并行分片 | registry 已占位（构造报错）；本机无小 MoE 真模型可验证（Qwen3-30B-A3B int4≈15.3GB 放不下 16GB）；只能合成小 MoE 验证机制 | ~1-1.5 天（概念必会，本机验证受限） |
 | **通用** | `get_rope` 其余 `rope_scaling`（yarn/linear/dynamic） | llama3 变体已实现（波长分段缩放，`_scaled_inv_freq_llama3`，单元对照 HF 0 误差）；yarn/linear/dynamic 仍未实现 | 半天（频率插值内核） |
+| **通用** | SWA 滚动块复用（真省 KV 显存） | 当前只掩码不滚动（与 vLLM 一致）；flash-attn 从块表索引推导 key 位置 → 滚动表需 flash fork 或自研内核 | ~1 天（明确设计，未实现） |
 | **通用** | 流式加载限制 | int4 强制纯 int4（无 w_deq 双路径）、w8a8 无 SmoothQuant 校准、awq 仅预生成 scales（内联校准需全 fp16 模型） | 已知限制，非阻塞 |
 
-**已解决的卡点**：Llama 的 `attention_bias` 默认 False（llama3.py 用 `getattr(config, 'attention_bias', False)`）；`rope_scaling` 的 llama3 变体（Llama-3.2 官方 / Llama-3.1 unsloth 转换版都带，波长分段缩放与 transformers 完全一致）。
+**已解决的卡点**：Llama 的 `attention_bias` 默认 False；`rope_scaling` 的 llama3 变体；**Mistral 滑动窗口**（`window_size=(W-1,0)` 约定 + fp8 内核 WINDOW 掩码 + m 从 0 起步的 NaN 修复）；**Gemma-2**（layer_types 复刻安装版默认、embed ×√d、RMSNorm (1+weight) 偏移、层内双残差四 norm、flash 原生 softcap、fp8 KV 断言拦截）。
 
 **流式加载的坑（阶段 7 特有）**：①meta 物化必须用 `to_empty`（torch 2.8 禁止 `.to()` 与 set_data 跨 meta）；②`to_empty` 替换 Parameter 对象 → 丢掉 `weight_loader`，须按模块重挂；③**计算型 buffer（RoPE `cos_sin_cache`）在 meta 上无数据，物化后是全零 → q/k 被零旋转 → 逐层发散**——`_finalize_streaming` 必须 `build_cache()` 重建；④tie 词表时文件不含 `lm_head.weight` → 加载后重绑（先物化再 `weight.data =` 共享存储）。
 
@@ -159,7 +161,11 @@
 
 | 脚本 | 验证什么 | 何时跑 |
 |---|---|---|
-| `python -m pytest tests/ -q` | 调度/块管理/投机纯 Python 逻辑（30 个用例） | 任何引擎改动后 |
+| `python -m pytest tests/ -q` | 调度/块管理/投机/注册表/layer_types 纯 Python 逻辑（41 个用例） | 任何引擎改动后 |
+| `benchmarks/_swa_probe.py` | SWA window/softcap 约定 + fp8 内核窗口掩码 vs torch 参考 | 动 attention.py / 内核后 |
+| `benchmarks/_parity.py <model>` | 新架构端口 vs HF 参考 logits（top-1 100% = 端口正确） | 新增/修改模型文件后 |
+| `benchmarks/_port_smoke.py <model> int4 --long` | 新模型 int4 冒烟 + 长上下文（跨 SWA 窗口） | 新增模型后 |
+| `benchmarks/_softcap_probe.py <model>` | attn soft-cap 的 tanh 近似误差（真实 logits 上） | 动 gemma2 后 |
 | `benchmarks/_fp8_kernel_check.py` | fp8 注意力内核 vs 参考 | 动 attention.py 后 |
 | `benchmarks/_int4_check.py` | int4 内核 + 双路径一致性 | 动 linear.py 后 |
 | `benchmarks/_sparse24_check.py` | 2:4 内核 vs 剪枝参考 | 动 sparse24 后 |
