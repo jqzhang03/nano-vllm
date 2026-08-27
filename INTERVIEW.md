@@ -377,3 +377,235 @@ KL 8.5 修到可用）；③精度方法论：校准集设计、离群通道分�
 - llama.cpp：GGUF 量化与 kernel 设计（阶段1/4）；
 - 论文：FlashAttention（阶段1）、MLA 原论文（阶段2）、PD 分离/Mooncake（阶段3）、GPTQ/
   AWQ/SmoothQuant（阶段4）、Megatron 1F1B/DeepSeek MoE（阶段5）。
+
+---
+
+## 7. 附录：代码地图（功能 → 文件 → 函数 + 运行链）
+
+> 用途：精读源码时的定位索引（行号为当前版本真实位置，可直接跳转）。先看运行链（§7.3），
+> 再按 §6 阶段顺序逐模块读；`git log` 的 commit message 是"为什么这么写"的第一手材料
+> （本项目每个 commit 都带动机）。
+
+### 7.1 文件地图（谁是谁）
+
+| 文件 | 职责 | 核心类/函数 |
+|---|---|---|
+| `nanovllm/llm.py` | 公共 API 入口 | `LLM(LLMEngine)` L4——纯别名，没逻辑 |
+| `nanovllm/config.py` | 引擎配置解析 | `Config` L7、`__post_init__` L36（断言合法性） |
+| `nanovllm/sampling_params.py` | 采样参数 | `SamplingParams` L6 |
+| `nanovllm/engine/llm_engine.py` | **引擎主循环** | `LLMEngine` L17：`add_request` L53 / `step` L203 / `generate` L290 / `_verify` L61 / `_medusa_drafts` L99 / `_eagle_drafts` L144 / `collect_metrics` L353 |
+| `nanovllm/engine/scheduler.py` | **调度器**（批组成、抢占、swap） | `Scheduler` L12：`schedule` L54 / `_schedule_mixed` L111 / `_schedule_prefill` L258 / `_schedule_decode` L309 / `_schedule_spec` L212 / `preempt` L337 / `swap_out` L361 / `swap_in` L394 / `postprocess` L432 / `postprocess_spec` L446 |
+| `nanovllm/engine/sequence.py` | 序列状态（CPU 侧唯一真源） | `Sequence` L15、`SequenceStatus` L8 |
+| `nanovllm/engine/block_manager.py` | **KV 块池 + 前缀缓存 + COW** | `BlockManager` L26：`compute_hash` L37 / `can_allocate` L62 / `allocate` L92 / `cow_block` L183 / `hash_blocks` L209 / `can_append` L146 / `can_append_spec` L158 |
+| `nanovllm/engine/model_runner.py` | **批处理打包 + GPU 执行** | `ModelRunner` L16：`__init__` L18（启动链）/ `call` L163（TP）/ `warmup_model` L202 / 各 `quantize_*` L266-285 / `allocate_kv_cache` L477 / `prepare_prefill` L521 / `prepare_mixed` L572 / `prepare_spec` L642 / `prepare_decode` L747 / `run_model` L776 / `capture_cudagraph` L945 / `capture_spec_graph` L858 / `run` L916 |
+| `nanovllm/engine/ngram.py` | n-gram 投机（纯函数，无状态） | `find_ngram_draft` L15、`verify_drafts` L54 |
+| `nanovllm/models/registry.py` | 按 `model_type` 选模型类 | `get_model_class` L44 |
+| `nanovllm/models/qwen3.py` 等 5 个 | 模型定义（结构模板完全一致） | `*ForCausalLM`（含 `packed_modules_mapping`）/ `*Model` / `*DecoderLayer` / `*Attention` / `*MLP` / `compute_logits` |
+| `nanovllm/layers/attention.py` | **注意力：写 KV + flash/fp8 路由** | `store_kvcache` L33、`paged_decode_attention_fp8` L115、`paged_varlen_attention_fp8` L207、`Attention.forward` L268 |
+| `nanovllm/layers/linear.py` | **全部 GEMM + 权重量化** | Triton 内核：`gemm_int8_kernel` L24 / `gemm_int4_kernel` L98 / `gemm_fp8_kernel` L298 / `gemm_sparse24_kernel` L183；封装：`int4_gemm` L153 / `fp8_gemm` L346 / `w8a8_gemm` L74 / `sparse24_gemm` L248；量化：`WeightQuantMixin` L372（`quantize_int4` L386 / `quantize_fp8` L448 / `quantize_sparse24` L489）；并行层：`ColumnParallelLinear` L619 / `MergedColumnParallelLinear` L649 / `QKVParallelLinear` L669 / `RowParallelLinear` L704 |
+| `nanovllm/layers/layernorm.py` | RMSNorm（含 Gemma-2 变体） | `RMSNorm` L5：`rms_forward` L24 / `add_rms_forward` L37 |
+| `nanovllm/layers/rotary_embedding.py` | RoPE（含 Llama-3 缩放） | `RotaryEmbedding` L48、`build_cache` L73、`get_rope` L111 |
+| `nanovllm/layers/activation.py` | SwiGLU 融合激活 | `SiluAndMul` L6 |
+| `nanovllm/layers/sampler.py` | Gumbel 采样 | `Sampler` L5 |
+| `nanovllm/layers/embed_head.py` | Embedding + LM Head（TP 感知） | `VocabParallelEmbedding` L10、`ParallelLMHead` L46（继承 WeightQuantMixin） |
+| `nanovllm/layers/medusa.py` / `eagle.py` | 投机草稿头 | `MedusaHeads` L39 / `EagleLayer` L46 |
+| `nanovllm/utils/context.py` | **每步张量的全局契约** | `Context` L6、`set_context` L27、`get_context` L24、`reset_context` L37 |
+| `nanovllm/utils/loader.py` | 权重加载（eager + 流式） | `load_model` L32、`_load_eager` L54、`_load_streaming` L85、`default_weight_loader` L8 |
+
+### 7.2 功能 → 文件 → 函数（按学习主题）
+
+**① 入口与配置**：用户入口 `llm.py:4`；全部引擎参数 `config.py:7`（quantization /
+speculative / tensor_parallel_size / kv_swap_space_gb / max_num_batched_tokens）；
+采样参数校验 `sampling_params.py:6`（禁 greedy——Sampler 用 Gumbel，必须 temperature>1e-10）。
+
+**② 引擎主循环**（必读核心）：提交请求 `llm_engine.py:53 add_request`；**每步推进**
+`llm_engine.py:203 step`（调度→COW/swap→跑模型→采样→后处理→草稿）；外层循环
+`llm_engine.py:290 generate`（含逐步吞吐统计与输出 decode）；投机验收
+`llm_engine.py:61 _verify`；Medusa/EAGLE 下轮草稿 `llm_engine.py:99 _medusa_drafts` /
+`:144 _eagle_drafts`；基准指标导出 `llm_engine.py:353 collect_metrics`。
+
+**③ 调度与抢占**：决定本步 kind（prefill/decode/mixed/spec）`scheduler.py:54 schedule`
+（先 `_try_swap_in`；waiting+running 都非空 → mixed）；mixed 批组成（prefill 在前、
+decode 在后共享 token 预算）`scheduler.py:111`（vLLM V1 同款）；prefill/decode 批
+`scheduler.py:258 / :309`（只有首个序列可被 chunk 拆分）；KV 不足抢占 `scheduler.py:337
+preempt`（decode/spec 优先 swap_out）；swap 换出/换入 `scheduler.py:361 / :394 / :404`
+（换入优先，bit-exact 免重 prefill）；步后处理 `scheduler.py:432 postprocess` /
+`:446 postprocess_spec`（spec 版只提交被接受 token）。
+
+**④ KV Cache：块管理 + 前缀缓存 + COW + swap**：块哈希链（xxhash + 前块哈希）
+`block_manager.py:37 compute_hash`；能否复用缓存块 `block_manager.py:62 can_allocate`
+（检查部分块 ceiling end）；分配/共享块（refcount）`block_manager.py:92 allocate`；
+**写共享块前的复制** `block_manager.py:183 cow_block`（返回 (old,new) 对 → GPU 侧拷贝在
+`step` 里 `model_runner.call("cow_block")`）；新哈希发布 `block_manager.py:209 hash_blocks`
+（带 guard 删除，防 COW 副本撞哈希）；decode/spec 追加 `block_manager.py:146 can_append` /
+`:158 can_append_spec` / `:175 may_append_spec`（跨块写跨度）；释放 `block_manager.py:137
+deallocate`；GPU 侧拷贝/swap `model_runner.py:171 cow_block` / `:180 swap_out` /
+`:190 swap_in`（swap_in 必须 `index_copy_`——list 高级索引返回临时副本会静默写垃圾）。
+
+**⑤ 批处理打包（prepare_* + Context 契约）**：KV cache 分配+绑层 `model_runner.py:477
+allocate_kv_cache`（`[2, L, num_blocks, block_size, kv_heads, head_dim]`）；prefill 打包
+`model_runner.py:521 prepare_prefill`（含 chunked seq 的缓存形状 K/V）；mixed 打包
+`model_runner.py:572 prepare_mixed`（设 `Context.is_mixed` / `n_prefill_tokens`）；decode
+打包 `model_runner.py:747 prepare_decode`（slot_mapping + context_lens）；spec 打包
+（verify 行 = chunked prefill）`model_runner.py:642 prepare_spec` / `:690
+_prepare_mixed_spec`；张量交接 `context.py:27 set_context` / `:37 reset_context`（每步 reset）。
+
+**⑥ 模型定义**：注册表 `registry.py:44`；5 个同构模型文件 `models/qwen3.py:212` /
+`qwen2.py:209` / `llama3.py:215` / `mistral.py:192` / `gemma2.py:219`；前向链
+（embed → L 层 → norm）各 `*Model.forward`（如 `qwen3.py:199`）；层内链（attn + mlp +
+残差）各 `*DecoderLayer.forward`（如 `qwen3.py:169`）；logits 各 `compute_logits`
+（如 `qwen3.py:243`，LM Head 在图外执行）；HF 权重名→打包参数映射各 `packed_modules_mapping`
+（如 `qwen3.py:214`）。
+
+**⑦ 注意力（写 KV + 读路由）**：写 K/V 到分页缓存 `attention.py:33 store_kvcache`
+（Triton 按 `slot_mapping` 散写；fp8 写路径先 clamp 448 再 cast 防 NaN 位模式）；fp8
+decode 读内核 `attention.py:115 paged_decode_attention_fp8`（寄存器内反量化 + WINDOW 掩码）；
+fp8 varlen 读内核 `attention.py:207 paged_varlen_attention_fp8`；**路由总入口**
+`attention.py:268 Attention.forward`（先写 KV → 按 is_mixed/is_spec/use_fp8/分块与否选
+flash varlen / flash kvcache / 自研 fp8 内核）。
+
+**⑧ 量化 GEMM（`linear.py` 一条龙）**：int4 打包 `[N, K//2]` + per-group 128 scale +
+2-dot 去量化 GEMM `linear.py:98` 内核 / `:153 int4_gemm` / `:386 quantize_int4`；int4 形状
+路由（dual-path：小 M 走内核、大 M 走 `w_deq` cuBLAS）`linear.py:431 _int4_forward`
+（阶段 1 的 BM16/BN128 tile 在这条链上）；fp8 权重-only Triton（小 M）+ 硬件
+`torch._scaled_mm`（大 M）`linear.py:346 fp8_gemm` / `:448 quantize_fp8` / `:468
+_fp8_forward`；w8a8 SmoothQuant 折叠 `linear.py:24` / `:547` / `:577`；sparse24 2:4 剪枝
+`linear.py:183` / `:248` / `:489` / `:513`；引擎侧调用点 `model_runner.py:266
+quantize_int4_weights`（streaming 钩子 `:377`）。
+
+**⑨ 投机解码**：n-gram 草稿搜索 + 验收（纯函数）`ngram.py:15 find_ngram_draft` /
+`:54 verify_drafts`；每步算草稿 `scheduler.py:90 _compute_draft`；verify 行打包
+`model_runner.py:642 prepare_spec`；验收+提交 `llm_engine.py:61 _verify` +
+`scheduler.py:446 postprocess_spec`（hash 范围只含接受 token）；spec CUDA graph
+`model_runner.py:858 capture_spec_graph` / `:829 _spec_graph_hidden`；Medusa 头 / EAGLE 层
+`medusa.py:39` / `eagle.py:46`。
+
+**⑩ 张量并行 / 权重加载**：TP 命令分发（共享内存 + Event）`model_runner.py:163 call` /
+`:138 read_shm` / `:130 loop`（worker 死循环）；权重切分各并行层 `weight_loader`
+（`linear.py:630/660/687/715`、`embed_head.py:28`）；eager 加载 `loader.py:32 load_model` /
+`:54 _load_eager`；**流式加载**（meta 构造 → 逐层物化 → 立即量化）`loader.py:85
+_load_streaming` + `model_runner.py:343 _decide_streaming` / `:377 _streaming_quant_hook` /
+`:433 _finalize_streaming`（重建 RoPE 缓存）。
+
+### 7.3 运行链
+
+**链 A：进程启动（只跑一次）**
+
+```
+LLM(...) → LLMEngine.__init__ [llm_engine.py:19]
+ ├─ Config 解析 + tokenizer 加载
+ └─ ModelRunner.__init__ [model_runner.py:18]
+     ├─ dist.init_process_group("nccl", ...)          # 无条件，TP=1 也初始化
+     ├─ get_model_class(model_type) → 选模型类         # registry.py:44
+     ├─ _decide_streaming() → load_model(...)          # 大模型走流式（逐层物化+量化）
+     ├─ 量化：quantize_int4/fp8/w8a8/awq/sparse24      # model_runner.py:266-285
+     ├─ warmup_model()                                 # 真实形状跑一次：JIT编译+测峰值显存
+     ├─ allocate_kv_cache()                            # 大块KV + 绑到各Attention层
+     ├─ capture_cudagraph()                            # decode图族 [1,2,4,8,16..512]
+     └─ capture_spec_graph()                           # 投机：stride家族 × 行容量家族
+```
+
+**链 B：每步推理循环（`generate` 内 `while not is_finished()`）**
+
+```
+step() [llm_engine.py:203]
+ ├─ scheduler.schedule() → (seqs, kind)                # scheduler.py:54
+ │   ├─ _try_swap_in()                                 # 先把换出的KV换回
+ │   ├─ 投机：先给 running 全算草稿 (_compute_draft)
+ │   └─ 分支：waiting+running→mixed | waiting→prefill | 其余→decode/spec
+ ├─ COW 拷贝：cow_pairs → call("cow_block")            # run() 之前，prepare 需要新表
+ ├─ swap 拷贝：swap_pairs → call("swap_out"/"swap_in")
+ ├─ model_runner.call("run", seqs, kind)               # model_runner.py:916
+ │   ├─ prepare_prefill/decode/mixed/spec              # 打包 → set_context()
+ │   ├─ run_model(input_ids, positions, kind)          # model_runner.py:776
+ │   │   ├─ kind=spec → spec CUDA graph 重放（填零长行）
+ │   │   ├─ kind=decode 且 bs≤512 且非eager → decode CUDA graph 重放
+ │   │   └─ 否则 eager：model(input_ids, positions)    # 模型前向（链C）
+ │   ├─ model.compute_logits(hidden)                   # LM Head（图外）
+ │   └─ Sampler(logits, temperatures) → token_ids      # Gumbel采样
+ │       └─ reset_context()                            # 每步清空契约
+ ├─ 投机：_verify() → postprocess_spec()               # 验收+只提交接受token
+ │         → _medusa_drafts/_eagle_drafts()            # 用hidden生成下轮草稿
+ ├─ 否则：postprocess()                                # 追加token/EOS/rehash
+ └─ 收集 finished 序列 → outputs
+```
+
+**链 C：单层前向（以 Qwen3 为例，每步每条 token 都走）**
+
+```
+Qwen3ForCausalLM.forward [qwen3.py:235]
+ └─ Qwen3Model.forward [qwen3.py:199]
+     ├─ embed_tokens(input_ids) → hidden
+     ├─ for layer in layers: Qwen3DecoderLayer.forward [qwen3.py:169]
+     │   ├─ Qwen3Attention.forward [qwen3.py:80]
+     │   │   ├─ qkv_proj(x) → q,k,v                      # QKVParallelLinear
+     │   │   ├─ RotaryEmbedding(q,k)                     # 按 positions 旋转
+     │   │   ├─ Attention.forward [attention.py:268]     # 链D
+     │   │   └─ o_proj(o)
+     │   ├─ Qwen3MLP.forward [qwen3.py:132]
+     │   │   ├─ gate_up_proj(x) → SiluAndMul → down_proj
+     │   │   └─ 残差相加（layer norm 走 add_rms_forward）
+     ├─ norm(hidden, residual)                           # RMSNorm（残差融合）
+     └─ compute_logits → ParallelLMHead                  # 词表映射（TP>1 时 gather）
+```
+
+**链 D：Attention 数据流（Context 契约——本项目最核心的接口设计）**
+
+```
+prepare_* 构建 GPU 张量 ──set_context()──> Context（全局单例）
+   [cu_seqlens_q/k, max_seqlen_q/k, slot_mapping,
+    context_lens, block_tables, n_prefill_tokens, is_mixed, is_spec]
+                    │
+Attention.forward [attention.py:268]  ← get_context()
+ ├─ store_kvcache(k, v, k_cache, v_cache, slot_mapping)  # 本步K/V散写入分页缓存
+ └─ 读路由（按批次形态）：
+     ├─ is_spec        → 全批次 flash_attn_varlen_func（K/V=缓存形状）
+     ├─ is_mixed       → prefill组 varlen（分块序列用缓存形状K/V）
+     │                    + decode组 fp16→flash_attn_with_kvcache / fp8→自研内核
+     ├─ 纯 prefill     → flash_attn_varlen_func（连续K/V）
+     └─ 纯 decode      → fp16→flash_attn_with_kvcache / fp8→paged_decode_attention_fp8
+```
+
+**链 E：量化路由决策（以 int4 为例）**
+
+```
+模型forward里 LinearBase.forward [linear.py:590]
+ └─ 已量化? → _int4_forward [linear.py:431]
+     ├─ M≤128 且 N≥2048 → Triton int4_gemm（阶段1的 BM16/BN128 tile）
+     └─ 否则            → F.linear(x, w_deq)（bf16反量化副本，cuBLAS）
+权重来源：quantize_int4 [linear.py:386] 在 warmup 前一次性打包
+        （dual-path 同时存 q/scale 和 w_deq；纯 int4 模式不存 w_deq）
+```
+
+**链 F：投机解码完整链路**
+
+```
+Scheduler._compute_draft [scheduler.py:90]  ─每步CPU─> 写 seq.draft_tokens
+ → schedule() → kind="spec"（纯verify）或 "mixed"（prefill在前）
+ → prepare_spec/_prepare_mixed_spec [model_runner.py:642/690]
+     verify行 = query=[last_token, 草稿...] 的 chunked prefill，num_cached=len-1
+ → run_model：spec CUDA graph（stride×容量家族）或 eager varlen
+ → LLMEngine._verify [llm_engine.py:61]
+     γ+1 行采样 s_i ↔ 草稿 d_i 逐个验收；末行 bonus
+ → postprocess_spec [scheduler.py:446]
+     只提交接受 token；hash 范围 [num_tokens-n_acc-1, num_tokens-1)（被拒草稿不进前缀缓存）
+ → medusa/eagle：_medusa_drafts/_eagle_drafts 用 hidden 生成下轮草稿（写回 draft_tokens）
+```
+
+### 7.4 推荐阅读顺序（从浅到深，每步都有可验证出口）
+
+| 步 | 读什么 | 验证出口 |
+|---|---|---|
+| 1 | `example.py` + `llm.py` + `config.py` | 跑通 `python example.py` |
+| 2 | `llm_engine.py` 的 `generate`/`step` | 打断点看每步的 kind 变化 |
+| 3 | `scheduler.py` 的 `schedule` + 四个 `_schedule_*` | 打印每步 (seqs, kind) |
+| 4 | `model_runner.py` 的 `prepare_*` + `context.py` | 打印 `set_context` 的各张量 shape |
+| 5 | `models/qwen3.py`（一个模型吃透，其他 4 个是变体） | 对照 HF 实现看逐层等价 |
+| 6 | `layers/attention.py` 的 `forward` 路由 | 三种批次形态各跑一次 |
+| 7 | `layers/linear.py`（量化全链） | `--quantization int4` 对比输出 |
+| 8 | `block_manager.py`（前缀缓存 + COW） | `--shared-prefix-len 512` 看命中 |
+| 9 | `model_runner.py` 的 CUDA graph 两段 | `enforce_eager` 开/关对比 |
+| 10 | 投机（`ngram.py` → `_verify` → spec graph）→ TP → 流式加载 | `benchmarks/spec_bench.py` |
+
+穿插阅读：`CLAUDE.md`/`AGENTS.md` 的 Architecture 一节是维护者视角的浓缩；§2 深水区是
+这份地图的"人话版"。
