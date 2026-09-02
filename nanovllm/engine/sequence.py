@@ -7,9 +7,9 @@ from nanovllm.sampling_params import SamplingParams
 
 class SequenceStatus(Enum):
     # auto()自动为枚举对象赋值，从1开始
-    WAITING = auto()
-    RUNNING = auto()
-    FINISHED = auto()
+    WAITING = auto() # 1
+    RUNNING = auto() # 2
+    FINISHED = auto() # 3
 
 
 class Sequence:
@@ -87,6 +87,7 @@ class Sequence:
         self.last_token = token_ids[-1]
         self.num_tokens += len(token_ids)
 
+    # 跨进程同步通信
     def __getstate__(self):
         last_state = self.last_token if not self.is_prefill else self.token_ids
         return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.block_table, last_state, self.draft_tokens)
