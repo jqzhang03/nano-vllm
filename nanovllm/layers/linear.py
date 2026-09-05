@@ -543,6 +543,7 @@ class LinearBase(WeightQuantMixin, nn.Module):
         self.int4 = False  # w_int4/w_int4_scale/awq_scale缓冲由quantize_int4创建
         self.sparse24 = False  # w_s24_v/w_s24_idx缓冲由quantize_sparse24创建
         self.fp8 = False  # w_fp8/w_fp8_scale缓冲由quantize_fp8创建
+        self.quantize_exclude = False  # True：跳过量化（MoE router——gate 精度决定路由）
 
     def quantize_w8a8(self, x_max: torch.Tensor | None = None):
         """per-group（K维按128分组，AWQ标准）int8权重量化 + scale；TP分片按各自输出维量化。

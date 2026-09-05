@@ -259,6 +259,7 @@ class ModelRunner:
         from nanovllm.layers.linear import LinearBase
         from nanovllm.layers.embed_head import ParallelLMHead
         mods = [m for m in self.model.modules() if isinstance(m, (LinearBase, ParallelLMHead))]
+        mods = [m for m in mods if not getattr(m, "quantize_exclude", False)]
         if not self.config.quantize_lm_head or self.config.hf_config.tie_word_embeddings:
             mods = [m for m in mods if not isinstance(m, ParallelLMHead)]
         return mods

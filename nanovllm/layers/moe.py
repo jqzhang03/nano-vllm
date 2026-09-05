@@ -67,6 +67,7 @@ class MoE(nn.Module):
         self.top_k = top_k
         self.norm_topk_prob = norm_topk_prob
         self.gate = ReplicatedLinear(hidden_size, num_experts, bias=False)  # [E, H]
+        self.gate.quantize_exclude = True  # router 精度决定路由 → 永不量化
         self.experts = nn.ModuleList(
             [ExpertFFN(hidden_size, moe_intermediate_size)
              for _ in range(num_experts)])
@@ -90,10 +91,12 @@ class MoE(nn.Module):
         out = torch.zeros_like(x)                            # x dtype 累加（同 HF）
         for e in range(self.num_experts):
             m = idx_flat == e                                # 谁路由给了 e
-            if bool(m.any()):
-                xs = x.index_select(0, tgt[m])               # [n_e, H] gather
-                ys = self.experts[e](xs)                     # 复用量化路径
-                out.index_add_(0, tgt[m], ys * w_flat[m][:, None])
+            # 无条件执行（不做 bool(m.any()) host sync）：空专家 → 空 gather/FFN/add
+            # = GPU 侧无操作，但省掉每专家一次 device→host 同步（~ms 级固定税，
+            # 见 benchmarks/_moe_imbalance.py 的 T 扫描：时间与 T 无关）
+            xs = x.index_select(0, tgt[m])                   # [n_e, H] gather
+            ys = self.experts[e](xs)                         # 复用量化路径
+            out.index_add_(0, tgt[m], ys * w_flat[m][:, None])
         return out
 
     @torch.no_grad()
