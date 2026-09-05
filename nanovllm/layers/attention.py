@@ -408,12 +408,15 @@ class Attention(nn.Module):
         """
         k_cache, v_cache = self.k_cache, self.v_cache
         if self.use_fp8:
+            # fp8+环（阶段 2b 扩展）：fp8 内核同样从表下标推位置，环表必须传每行
+            # 首块序号 chunk_starts（非滚动行 = None → 内核全 0，语义不变）。
             return paged_decode_attention_fp8(q, k_cache, v_cache,
                                               context.block_tables,
                                               context.context_lens,
                                               self.k_scale, self.v_scale,
                                               self.scale,
-                                              window=self.window_size or 0)
+                                              window=self.window_size or 0,
+                                              chunk_starts=context.chunk_starts)
         if self.rolling and context.chunk_starts is not None:
             return paged_decode_attention_bf16(
                 q, k_cache, v_cache, context.block_tables,

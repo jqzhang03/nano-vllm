@@ -445,7 +445,7 @@ class WeightQuantMixin:
             y = y + bias
         return y
 
-    def quantize_fp8(self):
+    def quantize_fp8(self, keep_dense: bool = False):
         """FP8(e4m3) 全量化：权重 per-column scale + 激活 per-token scale（vLLM 同款方案）。
 
         权重 [N, K] → w_fp8 e4m3 + w_scale [N,1]（per-column = amax/448，scale 与 K 无关
@@ -454,6 +454,12 @@ class WeightQuantMixin:
         prefill 大 M 走 torch._scaled_mm（**硬件 FP8 MMA**，sm_120 实测可用，b 需列主序
         w.t()）——与 int4 不同，fp8 大 M 不再输给 cuBLAS，无需 w_deq 双路径。
         字节 = 0.5×bf16（比 int8 还省一半，精度靠 e4m3 的 3 位尾数 + 每列 scale）。
+
+        keep_dense（MLA kv_b 专用，阶段 2b 扩展）：额外保留一份 fp8 权重的
+        精确反量化副本 w_deq（fp8→fp32×scale→模型 dtype）。只影响 MLA 吸收式
+        decode 的 W_UK/W_UV 读出（_float_weight 优先取 w_deq）——kv_b 本身
+        占参数量 ~1%，换来纯 fp8/int4 流式模型不落入稠密兜底/eager。本层
+        forward 仍走 fp8 内核/MMA（w_deq 仅供读出，不参与路由）。
         """
         w = self.weight.detach().float()
         N, K = w.shape
@@ -462,6 +468,9 @@ class WeightQuantMixin:
         self.register_buffer("w_fp8", w_fp8.contiguous())
         # scale 存 fp32：torch._scaled_mm 要求 fp32 scale（bf16 会报错）
         self.register_buffer("w_fp8_scale", w_scale.contiguous())
+        if keep_dense:
+            w_deq = (w_fp8.float() * w_scale).to(self.weight.dtype)
+            self.register_buffer("w_deq", w_deq.contiguous())
         self.fp8 = True
         del self.weight  # 释放fp16权重（weight_loader只在加载期使用）
 

@@ -17,17 +17,17 @@ class Scheduler:
         self.eos = config.eos
         self.block_size = config.kvcache_block_size
         # ---- SWA 滚动缓冲（阶段 2b）----
-        # 前置：全层统一滑动窗口的 bf16 MHA 模型（当前支持 mistral 系列）；
-        # 环驱逐需要"未来回读余量"（spec verify 会回读 γ）→ 组合未实现；
-        # fp8 KV 无环内核 → 组合未实现（runner 侧再校验一次）。
+        # 前置：全层统一滑动窗口的 bf16/fp8 KV MHA 模型（当前支持 mistral）；
+        # 环驱逐需要"未来回读余量"（spec verify 会回读 γ）→ 投机组合待扩展；
+        # fp8 KV 环 decode 走自研 fp8 内核（runner 侧再校验一次）。
         self.rolling = config.rolling_cache
         ring_window = None
         if self.rolling:
             hf = config.hf_config
             assert config.speculative == "none", \
                 "rolling_cache + 投机解码未实现（verify 行窗口回读的环余量语义）"
-            assert config.kv_cache_dtype == "auto", \
-                "rolling_cache 需要 bf16 KV（fp8 无环内核）"
+            assert config.kv_cache_dtype in ("auto", "fp8_e4m3"), \
+                "rolling_cache 需要 bf16 或 fp8 KV"
             assert hf.model_type == "mistral", \
                 f"rolling_cache 仅支持全层统一滑动窗口模型（mistral）；model_type={hf.model_type!r}"
             ring_window = getattr(hf, "sliding_window", None)

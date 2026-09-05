@@ -68,7 +68,11 @@ def mla_store_kernel(
 
 def mla_store(c_kv: torch.Tensor, k_pe: torch.Tensor, mla_cache: torch.Tensor,
               slot_mapping: torch.Tensor):
-    """写 [c_kv | k̃_pe] 到 fused cache（T 与 slot_mapping 对齐；-1 跳过）。"""
+    """写 [c_kv | k̃_pe] 到 fused cache（T 与 slot_mapping 对齐；-1 跳过）。
+
+    fp8 KV 时 c_kv/k_pe 已是本层 scale 量化后的 e4m3 张量（host 侧 clamp+cast，
+    同 MHA 的 store 前量化）——内核只搬运，dtype 自适应。
+    """
     T, kv_lora = c_kv.shape
     rope = k_pe.shape[-1]
     assert k_pe.shape[0] == T and mla_cache.shape[-1] == kv_lora + rope
@@ -77,6 +81,61 @@ def mla_store(c_kv: torch.Tensor, k_pe: torch.Tensor, mla_cache: torch.Tensor,
     mla_store_kernel[(T,)](c_kv, k_pe, mla_cache, slot_mapping,
                            KV_LORA=kv_lora, ROPE=rope,
                            BLOCK_SIZE=mla_cache.shape[1])
+
+
+# ---------------------------------------------------------------------------
+# fused cache 行的 fp8 反量化 gather（每行 [c|cscale | k̃|rscale] → 模型 float
+# dtype）。torch index_select 对 float8 无支持 → 自研行 gather 内核（MHA fp8
+# cache-shaped 行由整缓存 .to() 反量化，MLA 的 fused 行按段反量化、零整拷贝）。
+# ---------------------------------------------------------------------------
+@triton.jit
+def mla_gather_dequant_kernel(
+    cache_ptr, idx_ptr, out_ptr,
+    c_scale, r_scale,
+    KV: tl.constexpr, ROPE: tl.constexpr,
+    KV_P2: tl.constexpr, ROPE_P2: tl.constexpr,
+    OUT_DTYPE: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    slot = tl.load(idx_ptr + pid)
+    D = KV + ROPE
+    base = slot * D
+    offs_c = tl.arange(0, KV_P2)
+    cm = offs_c < KV
+    c = tl.load(cache_ptr + base + offs_c, mask=cm, other=0.0)
+    offs_r = tl.arange(0, ROPE_P2)
+    rm = offs_r < ROPE
+    r = tl.load(cache_ptr + base + KV + offs_r, mask=rm, other=0.0)
+    out_base = pid * D
+    tl.store(out_ptr + out_base + offs_c,
+             (c.to(tl.float32) * c_scale).to(OUT_DTYPE), mask=cm)
+    tl.store(out_ptr + out_base + KV + offs_r,
+             (r.to(tl.float32) * r_scale).to(OUT_DTYPE), mask=rm)
+
+
+def _tl_dtype(dt: torch.dtype):
+    return {torch.float16: tl.float16, torch.bfloat16: tl.bfloat16,
+            torch.float32: tl.float32}[dt]
+
+
+def mla_gather_dequant(mla_cache: torch.Tensor, idx: torch.Tensor,
+                       c_scale: float, r_scale: float,
+                       kv_lora: int, rope: int,
+                       out_dtype: torch.dtype) -> torch.Tensor:
+    """按槽位索引 gather 并反量化 fused cache 行（fp8 KV 路径，行序 = idx 序）。"""
+    n = idx.numel()
+    out = torch.empty(n, kv_lora + rope, device=mla_cache.device,
+                      dtype=out_dtype)
+    if n == 0:
+        return out
+    mla_gather_dequant_kernel[(n,)](
+        mla_cache, idx, out, c_scale, r_scale,
+        KV=kv_lora, ROPE=rope,
+        KV_P2=triton.next_power_of_2(kv_lora),
+        ROPE_P2=triton.next_power_of_2(rope),
+        OUT_DTYPE=_tl_dtype(out_dtype),
+    )
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -94,7 +153,7 @@ def mla_store(c_kv: torch.Tensor, k_pe: torch.Tensor, mla_cache: torch.Tensor,
 @triton.jit
 def mla_decode_kernel(
     q_abs_t_ptr, q_pe_t_ptr, cache_ptr, block_table_ptr, cache_seqlens_ptr,
-    o_ptr, softmax_scale, max_blocks,
+    o_ptr, softmax_scale, c_scale, r_scale, max_blocks,
     KV_LORA: tl.constexpr, ROPE: tl.constexpr, H: tl.constexpr,
     BLOCK_SIZE: tl.constexpr, BLOCK_T: tl.constexpr,
 ):
@@ -125,13 +184,15 @@ def mla_decode_kernel(
             offs_t = t + tl.arange(0, BLOCK_T)
             tok_mask = (b * BLOCK_SIZE + offs_t) < seqlen
             c_ptrs = cache_ptr + base + offs_t[:, None] * D + offs_k[None, :]
-            c_t = tl.load(c_ptrs, mask=tok_mask[:, None],
-                          other=0.0).to(tl.float16)                 # [T, KV]
+            # fp8 KV：e4m3 存储，按段 scale 反量化到 fp16（scale=1 恒等 = bf16 路径，
+            # bf16→fp32→fp16 转换与直转 fp16 位级一致——旧路径语义不变）
+            c_t = (tl.load(c_ptrs, mask=tok_mask[:, None], other=0.0)
+                   .to(tl.float32) * c_scale).to(tl.float16)          # [T, KV]
             s = tl.dot(c_t, q_abs, out_dtype=tl.float32)            # [T, H] nope
             k_ptrs = cache_ptr + base + offs_t[:, None] * D \
                 + KV_LORA + offs_r[None, :]
-            k_t = tl.load(k_ptrs, mask=tok_mask[:, None],
-                          other=0.0).to(tl.float16)
+            k_t = (tl.load(k_ptrs, mask=tok_mask[:, None], other=0.0)
+                   .to(tl.float32) * r_scale).to(tl.float16)
             s = (s + tl.dot(k_t, q_pe, out_dtype=tl.float32)) \
                 * softmax_scale
             s = tl.where(tok_mask[:, None], s, float("-inf"))
@@ -151,25 +212,31 @@ def mla_decode_kernel(
 def mla_decode_attention(q_abs: torch.Tensor, q_pe: torch.Tensor,
                          mla_cache: torch.Tensor, block_table: torch.Tensor,
                          cache_seqlens: torch.Tensor,
-                         softmax_scale: float) -> torch.Tensor:
+                         softmax_scale: float,
+                         c_scale: float = 1.0, r_scale: float = 1.0
+                         ) -> torch.Tensor:
     """吸收式 MLA decode 内核入口。
 
     q_abs: [bs, H, kv_lora]（= q_nope @ W_UKᵀ）；q_pe: [bs, H, rope]（已旋转）
     返回 o_c [bs, H, kv_lora]（潜在加权和；v 投影在 kernel 外）。
+    fp8 KV：c_scale/r_scale = 本层两段反量化 scale（bf16 缓存 = 1 恒等）。
     """
     bs, H, kv_lora = q_abs.shape
     rope = q_pe.shape[-1]
     kv_lora_r = triton.next_power_of_2(kv_lora)
     rope_r = triton.next_power_of_2(rope)
     assert mla_cache.shape[-1] == kv_lora + rope
+    # 输出缓冲固定 fp16（内核内以 fp16 存储；bf16 缓存路径下 fp16→bf16 的舍入
+    # 原发生在 store，现发生在后续 einsum 的 .to(wuv.dtype)——同一次舍入，位级不变；
+    # fp8 缓存路径则避免把累加结果存进 e4m3）
     o = torch.empty(bs, H, kv_lora_r, device=mla_cache.device,
-                    dtype=mla_cache.dtype)
+                    dtype=torch.float16)
     grid = (bs,)
     mla_decode_kernel[grid](
         q_abs.transpose(1, 2).contiguous(),      # [bs, KV, H]
         q_pe.transpose(1, 2).contiguous(),       # [bs, R, H]
         mla_cache, block_table, cache_seqlens, o,
-        softmax_scale, block_table.shape[1],
+        softmax_scale, c_scale, r_scale, block_table.shape[1],
         KV_LORA=kv_lora_r, ROPE=rope_r, H=H,
         BLOCK_SIZE=mla_cache.shape[1], BLOCK_T=32,
         num_warps=4,
@@ -226,6 +293,10 @@ class MLAAttention(nn.Module):
         self.kv_b_proj = ColumnParallelLinear(
             kv_lora_rank, num_heads * (qk_nope_head_dim + v_head_dim),
             bias=False)
+        # MLA 吸收式 decode 需要 kv_b 的 float 视图（W_UK/W_UV 逐头读出）：
+        # 量化器对带此标记的层保留反量化副本（w_deq，int4 dual / fp8 keep_dense），
+        # 纯 int4/fp8（streaming）模型因此不落入稠密兜底/eager（占参 ~1%）。
+        self.kv_b_proj.is_mla_kv_b = True
         self.o_proj = RowParallelLinear(num_heads * v_head_dim, hidden_size,
                                         bias=attention_bias)
         # rope 头：64 维 interleaved-pairs（DeepSeek 约定，见 rotary_embedding）
@@ -235,7 +306,17 @@ class MLAAttention(nn.Module):
             interleaved=1)
         # 引擎绑定（allocate_kv_cache 按 cache_kind）：[nb, B, kv_lora+rope]
         self.mla_cache = torch.tensor([])
-        self.mla_fp8 = False          # MLA cache 仅 bf16（fp8 KV 在 runner 断言）
+        # ---- FP8 KV cache 状态（阶段 2b 扩展：fused [c|k̃] 行内两段独立 scale）----
+        # c_kv（潜在）与 k_pe（rope 头）量级不同 → 各自 amax 校准、写时分别量化、
+        # 读时分别反量化；bf16 模式 scale=1 恒等（mla_decode_kernel 两段共用）。
+        self.mla_fp8 = False          # 引擎 allocate 时置位：cache dtype = e4m3
+        self.mla_c_scale = 1.0        # c_kv 段反量化 scale（warmup 校准）
+        self.mla_r_scale = 1.0        # k_pe 段反量化 scale
+        self.inv_c_scale = 1.0
+        self.inv_r_scale = 1.0
+        self.calibrating = False      # 校准阶段：分别记录两段 max|·|
+        self.cal_c_max = 0.0
+        self.cal_r_max = 0.0
         self._wuk_t = None            # [h, qk_nope, kv_lora] 逐头 W_UK（惰性）
         self._wuv_t = None            # [h, v_head, kv_lora] 逐头 W_UV
 
@@ -327,7 +408,13 @@ class MLAAttention(nn.Module):
              torch.cumsum(s + f, 0)[:-1]])
         total = int((s + f).sum().item())
         flat = self.mla_cache.reshape(-1, self.mla_cache.shape[-1])
-        gathered = flat.index_select(0, gather_idx.long())     # [Σs, kv+rope]
+        if self.mla_fp8:
+            # fp8 缓存：行 gather + 两段反量化（torch index_select 无 float8）
+            gathered = mla_gather_dequant(
+                flat, gather_idx.long(), self.mla_c_scale, self.mla_r_scale,
+                self.kv_lora_rank, self.qk_rope_head_dim, k_dense.dtype)
+        else:
+            gathered = flat.index_select(0, gather_idx.long())
         gc, gk = gathered.split([self.kv_lora_rank,
                                  self.qk_rope_head_dim], dim=-1)
         gk_head, gv = self._expand(gc, gk, gc.shape[0])        # 缓存前缀稠密化
@@ -389,8 +476,21 @@ class MLAAttention(nn.Module):
                 .reshape(T, -1).to(hidden_states.dtype))
 
         # ---- 写路径：全批次 token 的 [c_kv | k̃]（写后才读，见各路径注释）----
+        # fp8 KV 校准：无缓存（cache_ready=False）时仍记录两段 max|·|（同 MHA）
+        if self.calibrating:
+            self.cal_c_max = max(self.cal_c_max, c_kv.abs().max().item())
+            self.cal_r_max = max(self.cal_r_max, k_pe_r.abs().max().item())
         if cache_ready and ctx.slot_mapping is not None:
-            mla_store(c_kv, k_pe_r, self.mla_cache, ctx.slot_mapping)
+            if self.mla_fp8:
+                # fused 行两段各自量化（E4M3；fp32→fp8 溢出产生 NaN 位模式，
+                # 必须先 clamp 到 ±448——同 MHA 的 fp8 store 语义）
+                cq = (c_kv.float() * self.inv_c_scale).clamp(-448.0, 448.0) \
+                    .to(torch.float8_e4m3fn)
+                kq = (k_pe_r.float() * self.inv_r_scale).clamp(-448.0, 448.0) \
+                    .to(torch.float8_e4m3fn)
+                mla_store(cq, kq, self.mla_cache, ctx.slot_mapping)
+            else:
+                mla_store(c_kv, k_pe_r, self.mla_cache, ctx.slot_mapping)
 
         q = torch.cat([q_nope, q_pe_r], dim=-1)      # [T, h, qk_head_dim]
 
@@ -486,7 +586,8 @@ class MLAAttention(nn.Module):
                              q_nope.to(wuk.dtype), wuk).to(torch.float16)
         o_c = mla_decode_attention(q_abs, q_pe_r.to(torch.float16),
                                    self.mla_cache, ctx.block_tables,
-                                   ctx.context_lens, self.scaling)
+                                   ctx.context_lens, self.scaling,
+                                   self.mla_c_scale, self.mla_r_scale)
         # v 投影（吸收进输出侧）：o_i = W_UV_i · o_c_i → [bs, h, v_head]
         wuv = self._wuv_t
         out = torch.einsum("bhk,hvk->bhv", o_c.to(wuv.dtype), wuv)

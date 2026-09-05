@@ -283,18 +283,24 @@ class ModelRunner:
         return mods
 
     def quantize_int4_weights(self):
-        """int4 per-group（128）权重量化，无激活缩放（Triton 反量化 GEMM）。"""
+        """int4 per-group（128）权重量化，无激活缩放（Triton 反量化 GEMM）。
+
+        MLA 模型的 kv_b（吸收式 decode 的 float 视图来源）强制保留 w_deq
+        双路径（即使 int4_dense_path=False）——占参 ~1%，换取不落稠密兜底。
+        """
         for m in self._quant_mods():
-            m.quantize_int4(dense_path=self.config.int4_dense_path)
+            dp = self.config.int4_dense_path or getattr(m, "is_mla_kv_b", False)
+            m.quantize_int4(dense_path=dp)
 
     def quantize_fp8_weights(self):
         """FP8(e4m3) 全量化（per-column 权重 + per-token 激活，vLLM 同款方案）。
 
         decode 小 M 走 Triton fp8 内核（0.5× 权重带宽），prefill 大 M 走硬件 FP8 MMA
         （torch._scaled_mm，sm_120 可用）——无需 int4 的 w_deq 双路径。
+        MLA 模型的 kv_b 例外保留反量化副本（keep_dense，吸收式 decode 读出用）。
         """
         for m in self._quant_mods():
-            m.quantize_fp8()
+            m.quantize_fp8(keep_dense=getattr(m, "is_mla_kv_b", False))
 
     def prune_sparse24(self):
         """2:4 结构化剪枝 + cuSPARSELt 半结构化权重（torch.sparse.semi_structured）。"""
@@ -416,6 +422,8 @@ class ModelRunner:
             print("[streaming] int4 双路径需要 w_deq 全尺寸 bf16 副本，与按层加载目的冲突 "
                   "→ 强制 dense_path=False（纯 int4，权重 0.27×）", flush=True)
             dp = False
+        # MLA kv_b 例外：只对这一层保留 w_deq（吸收式 decode 的 float 视图，
+        # 占参 ~1%；见 linear.quantize_int4/quantize_fp8 注释）
 
         def hook(chunk: nn.Module, chunk_path: str):
             for name, m in chunk.named_modules():
@@ -434,19 +442,20 @@ class ModelRunner:
                     continue
                 if not isinstance(m, LinearBase):
                     continue
+                kvb = getattr(m, "is_mla_kv_b", False)
                 if q == "w8a8":
                     m.quantize_w8a8(None)  # streaming 无 SmoothQuant（需全模型前向校准）
                 elif q == "int4":
                     m.quantize_int4(awq_scales.get(full) if awq_scales is not None else None,
-                                    dense_path=dp)
+                                    dense_path=dp or kvb)
                 elif q == "awq":
                     assert awq_scales is not None and full in awq_scales, \
                         f"awq scale missing for {full}"
-                    m.quantize_int4(awq_scales[full], dense_path=dp)
+                    m.quantize_int4(awq_scales[full], dense_path=dp or kvb)
                 elif q == "sparse24":
                     m.quantize_sparse24()
                 elif q == "fp8":
-                    m.quantize_fp8()  # 无需校准（per-column/动态 per-token）→ 流式直接可用
+                    m.quantize_fp8(keep_dense=kvb)  # 无需校准（per-column/动态 per-token）→ 流式直接可用
         return hook
 
     def _finalize_streaming(self):
@@ -488,10 +497,17 @@ class ModelRunner:
         self.run(seqs, "prefill")
         for m in layers:
             m.calibrating = False
-            m.k_scale = max(m.cal_max_k, 1e-6) / 448.0 * 1.1
-            m.v_scale = max(m.cal_max_v, 1e-6) / 448.0 * 1.1
-            m.inv_k_scale = 1.0 / m.k_scale
-            m.inv_v_scale = 1.0 / m.v_scale
+            if hasattr(m, "cal_c_max"):
+                # MLA fused 行：[c_kv | k̃_pe] 两段独立 scale（量级不同）
+                m.mla_c_scale = max(m.cal_c_max, 1e-6) / 448.0 * 1.1
+                m.mla_r_scale = max(m.cal_r_max, 1e-6) / 448.0 * 1.1
+                m.inv_c_scale = 1.0 / m.mla_c_scale
+                m.inv_r_scale = 1.0 / m.mla_r_scale
+            else:
+                m.k_scale = max(m.cal_max_k, 1e-6) / 448.0 * 1.1
+                m.v_scale = max(m.cal_max_v, 1e-6) / 448.0 * 1.1
+                m.inv_k_scale = 1.0 / m.k_scale
+                m.inv_v_scale = 1.0 / m.v_scale
 
     def _finalize_mla_mode(self):
         """MLA 模型（DeepSeek-V2 类）模式收尾：缓存类型识别 + decode 路径选择。
@@ -523,16 +539,20 @@ class ModelRunner:
         """SWA 滚动缓冲模式收尾（阶段 2b）：校验 + 标记注意力层。
 
         环 = 解码期窗口内容常驻、旧块到期释放（每序列块数收敛到 ~窗口/B+2）；
-        前置校验与 Scheduler 同源（mistral / bf16 KV / 无投机），并在层上置
-        rolling=True（Attention.forward 据此走自研 bf16 paged 内核）。
+        前置校验与 Scheduler 同源（mistral 统一窗口 / bf16 或 fp8 KV / 无投机
+        或 ngram），并在层上置 rolling=True（Attention.forward 据此走自研 paged
+        内核——fp8 KV 时同内核读 fp8 缓存、bf16 时 scale=1 恒等）。
         """
         cfg = self.config
         self._rolling = cfg.rolling_cache
         if not self._rolling:
             return
         hf = cfg.hf_config
-        assert cfg.kv_cache_dtype == "auto" and cfg.speculative == "none" \
-            and hf.model_type == "mistral" and getattr(hf, "sliding_window", None)
+        assert cfg.kv_cache_dtype in ("auto", "fp8_e4m3") \
+            and cfg.speculative == "none" \
+            and hf.model_type == "mistral" and getattr(hf, "sliding_window", None), \
+            ("rolling_cache 仅支持 mistral 统一窗口 + bf16/fp8 KV + 无投机"
+             "（组合矩阵见 config.py 注释；投机+环在阶段 2b 扩展中）")
         windows = {m.window_size for m in self.model.modules()
                    if hasattr(m, "window_size") and hasattr(m, "k_cache")}
         assert windows and windows == {hf.sliding_window}, \
@@ -558,11 +578,11 @@ class ModelRunner:
         # ---- 缓存类型：MHA（k_cache/v_cache 双张量）或 MLA（fused 单张量）----
         if self._mla_model:
             # MLA fused cache：[层, 块, block_size, kv_lora+qk_rope]（K/V 合一，
-            # 只存压缩潜在 + 旋转 rope key——账本 576 vs 4096 元素的来源）
+            # 只存压缩潜在 + 旋转 rope key——账本 576 vs 4096 元素的来源）。
+            # fp8 KV（阶段 2b 扩展）：行内 [c|k̃] 两段独立 scale（mla_c_scale/
+            # mla_r_scale，warmup 校准）→ e4m3 存储 1B/元素，容量翻倍；
+            # decode 吸收式内核与稠密组装都按段反量化。
             mla_mods = self._mla_modules
-            assert not use_fp8, (
-                "MLA cache 不支持 fp8 KV（fused [c|k̃] 无量化内核）；"
-                "DeepSeek 请用 kv_cache_dtype=auto")
             assert len(mla_mods) == num_layers, \
                 f"MLA 层数 {len(mla_mods)} != num_hidden_layers {num_layers}"
             self._kv_mla = True
@@ -574,12 +594,13 @@ class ModelRunner:
                 + current) // block_bytes
             assert config.num_kvcache_blocks > 0, \
                 f"MLA cache 块数 <=0（每块 {block_bytes/1e6:.1f}MB，预算不足）"
+            kv_dtype = torch.float8_e4m3fn if use_fp8 else hf_config.dtype
             self.kv_cache = torch.empty(num_layers, config.num_kvcache_blocks,
                                         self.block_size, kv_d,
-                                        dtype=hf_config.dtype)
+                                        dtype=kv_dtype)
             for i, module in enumerate(mla_mods):
                 module.mla_cache = self.kv_cache[i]
-                module.mla_fp8 = False
+                module.mla_fp8 = use_fp8
             return
 
         self._kv_mla = False
