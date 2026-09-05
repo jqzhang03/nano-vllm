@@ -279,19 +279,29 @@ norm_topk_prob）+ `mlp.experts.{i}.gate_proj/up_proj/down_proj`（2D per-expert
   **top-1 100%、mean diff 0.003**。
 - **Q：负载不均怎么办？** A：实测串行循环实现**免疫且偏好集中**（强制全 token 进一
   专家反而快 3.6-5×；k=8 sanity ≈1）——"最慢专家"瓶颈是并行/EP 形态的问题，不是
-  串行循环的。真正的问题是固定组织税：~3.5ms/层、T 与时间无关（Python 循环 + 每
-  专家 3 次小 GEMM 启动）；去掉每专家 host sync 省一半（6.9→3.6ms）。
+  串行循环的。真正的成本是固定组织税（~3.8ms/层、与 T 无关）——已被 1.5b 的
+  grouped 批量后端消除（见下）；新后端的代价在不均衡路由下 padding 放大到 E·max_n
+  （均衡路由近 1×），这是真段式内核（无 padding）的动机。
 - **Q：MoE 量化值不值？** A：decode 专家 GEMM 是权重带宽受限 → int4/fp8 ≈2×
   （toy 12-seq：fp16 185-475 → int4 927-1110 tok/s，方向稳健、绝对值受 WSL 时钟
   噪声）；层误差 fp8 6.4% / int4 12.5%（RTN 预期）。
+- **Q：吞吐路径怎么做快的（1.5b grouped 后端）？** A：组织税实测 3.8ms/层
+  （Python 循环 + 每专家启动）→ 排序分段 + **padded 批量 bmm**（gate_up 3D 融合 +
+  silu·up 融合 + down）→ 0.7ms（-80%），小 T 快 4-5×、T=4096 1.9×；可组条件 =
+  专家有 float 权重（未量化或 int4 dual-path 的 w_deq），纯 int4/fp8 回退循环；
+  不均衡时 padded 计算放大到 E·max_n（本尺度实测仅 +30%，大 E 需真段式内核）。
+  引擎观察：int4 dual 自动走 grouped（w_deq）→ toy decode 2588 tok/s（~2.4-2.8×）。
 - **Q：transformers 的坑？** A：5.15 专家 grouped_mm 仅 sm_90+，sm_120 崩 → 回退
   `_experts_implementation="eager"`。
 
 **数字**：parity top-1 100%（mean 0.003）；decode int4/fp8 ≈2×；量化层误差 fp8 6.4%/
-int4 12.5%（随机 toy）；顶层贴边证据：toy logits top1-top2 gap 仅 0.4-0.7σ。
-**诚实结论**：吞吐路径是 Python 循环（~3.5ms/层税、同 FLOPs 比 dense 慢 ~8×@4096）——
-生产需 fused/grouped kernel（vLLM 用 C++ 同因）；无真实模型精度数字（30B-A3B int4
-~15.5GB 超本机、V2-Lite ~8GB 可跑但 bf16 下载 ~30GB 需联网核对）。
+int4 12.5%（随机 toy）；顶层贴边证据：toy logits top1-top2 gap 仅 0.4-0.7σ；
+**1.5b grouped 后端**：组织税 3.8→0.7ms/层（-80%），小 T 快 4-5×、T=4096 1.9×；
+int4 dual-path 自动走 grouped（w_deq）→ toy decode 2588 tok/s（~2.4-2.8× 观察）。
+**诚实结论**：padded 批量在不均衡/大 E 时放大到 E·max_n（本尺度仅 +30%）——真段式
+grouped（Triton，无 padding）是 128+ 专家模型的下一步；量化纯 int4/fp8 无 float 视图
+仍回退循环；无真实模型精度数字（30B-A3B int4 ~15.5GB 超本机、V2-Lite ~8GB 可跑但
+bf16 下载 ~30GB 需联网核对）。
 **追问应对**：被问"怎么快"→ grouped GEMM（按专家排序批量）、路由 padding 入图、
 shared expert（Qwen3-235B 类，transformers 5.15 已删）、EP + all-to-all 通信模型
 （§6 阶段 5 的 DeepSeek MoE 理论项）。
@@ -407,10 +417,13 @@ qwen3_moe.py` 混合层端口 + registry；④验证链：数学同构参考位�
 引擎 decode **int4 ≈2-4× / fp8 ≈1.7-2.6×**（专家权重带宽受限形态）；反直觉实测：
 串行循环实现**偏好集中路由**（imbal/bal 0.2-0.28）、toy 量化 top-1 全翻是**顶层贴边**
 假警报（gap 0.4-0.7σ）；固定组织税 ~3.5ms/层（去 host sync 省一半）。
-**诚实边界**：吞吐仍是 Python 循环（同 FLOPs 比 dense 慢 ~8×@T=4096）——生产需
-fused/grouped kernel；无真实模型精度数字（30B-A3B int4≈15.5GB 超本机；V2-Lite/
+**诚实边界**：无真实模型精度数字（30B-A3B int4≈15.5GB 超本机；V2-Lite/
 Qwen1.5-MoE-A2.7B ≈8GB 可跑，bf16 下载 ~30GB 需联网核对——脚本
 `_moe_model_probe.py` 就绪，hub 从 WSL 当前不稳）。
+**1.5b（fused/grouped GEMM，✅ 提交 072a1cc）**：组织税 → sort + padded 批量 bmm
+（gate_up 3D 融合）**3.8 → 0.7ms/层**（小 T 快 4-5×）；auto 后端（w_deq 可组；
+纯 int4/fp8 回退循环）；不均衡 padding 放大实测 +30%；真段式/量化 grouped 是 128+
+专家模型的下一步。
 **下一步**：shared expert（Qwen3-235B 类，transformers 5.15 已删该结构）；EP 理论在
 阶段 5。
 

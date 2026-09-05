@@ -44,8 +44,40 @@
 |---|---|---|
 | 对负载不均 | imbalanced/balanced = 0.20-0.28（k=1/2）；k=8 全激活 sanity ≈1.0 | **串行循环偏好集中路由**（大 gather GEMM 效率高、启动少）；无"最慢专家"瓶颈（那是并行/EP 形态的问题） |
 | 固定组织税 | 每层 ~3.5ms/forward，**T 64→4096 时间平坦**（sync 移除后 6.9→3.6ms） | Python 循环 + 每专家 3 次小 GEMM 启动 + 中间张量；**小 T 完全被 CPU 税主导** |
-| 同 FLOPs dense 对照 | MoE/dense ≈ 8×（T=4096）~150×（T=256） | 循环专家是"正确性实现"，吞吐上限受组织税约束（见 §7） |
+| 同 FLOPs dense 对照 | MoE/dense ≈ 8×（T=4096）~150×（T=256） | 循环专家是"正确性实现"，吞吐上限受组织税约束 |
 | sync 移除优化 | `bool(m.any())` host 同步 → 无条件空 gather：**6.9 → 3.6ms（-48%）**，对照不变 | 教训：host 每专家同步是隐藏的 ms 级税 |
+
+## 4b. grouped GEMM 后端（阶段 1.5b：fused/grouped 批量路径，提交 072a1cc）
+
+**实现**（`moe.py`，forward 自动选择后端）：
+- **可组条件**：所有专家线性的 float 权重（未量化，或 int4 dual-path 的 `w_deq`
+  bf16 副本）→ 3D 堆叠（`[E,2I,H]` gate_up 融合 + `[E,H,I]` down，转置缓存一次）；
+  纯 int4/fp8/w8a8/sparse24（无 float 视图）→ 回退逐专家循环（各自量化内核）。
+- `_forward_grouped`：top-k → **按专家稳定排序**（段连续）→ 排序行 gather →
+  padded `[E, max_n, H]`（每段放回自己的行带，其余 0）→ **单次批量 bmm × 3D
+  gate_up（gate/up 融合）→ silu(g)·u → 单次批量 bmm × 3D down** → 反排 →
+  加权 index_add（token 的 k 个 slot 合并）。Python 专家循环与每专家启动全消。
+- 正确性：10 GPU 场景对照 reference 全 PASS（多数 0 diff，最大 6e-5 = slot 累加
+  序尾差）。修过一个错位 bug：段在排序拼接里的 cumsum 起始 vs padded 的 `e*max_n`
+  行带不一致（前缀直铺错位；单段场景（全零输入）巧合正确掩盖过它——教训：多段
+  场景必须显式 scatter，别用"前缀拼接"捷径）。
+
+**基准**（settled、中位×5；层 H512/I768/E8/k2）：
+
+| T | grouped | loop | loop/grouped |
+|---|---|---|---|
+| 64 | 0.95 ms | 4.17 ms | **4.4×** |
+| 256 | 0.79 ms | 4.13 ms | **5.2×** |
+| 1024 | 0.73 ms | 3.48 ms | **4.8×** |
+| 4096 | 2.04 ms | 3.79 ms | 1.9× |
+
+固定组织税 **3.8 → ~0.7ms（-80%）**，小 T 批量路径由 bmm 主导（随 T 增长开始出现）。
+**不均衡（100%→e0）**：理论 padding 放大 E·max_n/R = 8×，实测时间只 +30%
+（vs 均衡 grouped）——小 GEMM 效率收益抵消 padding 计算（该尺度下；大 E/大 T 时
+padding 浪费会占优——真段式 grouped（无 padding）是下一步候选）。
+**引擎**：int4 dual-path 因 w_deq 自动走 grouped，toy decode 单次 2588 tok/s
+（此前 loop 档 927-1110，~2.4-2.8×）；fp16/fp8 档仍在 WSL 时钟噪声带内（引擎
+绝对值不可靠，以层级基准为准）。
 
 ## 5. 引擎吞吐（toy 12-seq × 16-token decode，多次运行取区间）
 
@@ -59,6 +91,9 @@
 每 token 激活行少）→ 量化字节减半直接 ≈2×（接阶段 1 的形态论）。**绝对值噪声大**
 （WSL 时钟波动 + CPU 组织税混合，fp16 档跨运行差 2.6×）——精确数字需真实模型 +
 更长基准复测；此处只做方向断言。
+**更新（阶段 1.5b，grouped 后端后）**：int4 dual-path 自动走 grouped（w_deq），
+toy decode 单次 2588 tok/s（此前 loop 档 927-1110）；fp16/fp8 仍在时钟噪声带——见
+§4b 层级基准（可靠证据）。
 
 ## 6. 真实模型边界（诚实标注：本机无 MoE 真权重；hub 网络本轮不可达 → 离线估算待核对）
 
@@ -73,9 +108,11 @@
 
 ## 7. 未做（诚实边界）+ 下一步
 
-- **吞吐路径**：逐专家 Python 循环 → fused/grouped GEMM（Triton 单 kernel 或按专家
-  排序 + 批量 GEMM），目标消掉 ~3.5ms/层固定税与 8× dense 组织税——生产 MoE 引擎的
-  必做项（vLLM 用 C++ 同款原因）。
+- **真段式 grouped（无 padding）**：当前 padded-bmm 在不均衡/大 E 时计算放大到
+  E·max_n（本尺度实测仅 +30%，效率摊销）；Triton/CUDA 段式 grouped kernel（offsets
+  驱动、逐专家实长段）可彻底消除 padding——大 E（128+）真实模型的下一步。
+- **量化专家的 grouped**：纯 int4/fp8 无 float 视图 → 回退循环；grouped 版需
+  打包权重按 3D 布局 + 专用内核（Triton 反量化 grouped），未做。
 - **CUDA graph**：路由 padding（decode 图内固定路由模式）未做——MoE 模型现在
   enforce_eager。
 - **TP/EP**：TP 分片语义可用（Column/Row 继承）但未实测；EP（专家并行 + all-to-all）
@@ -91,5 +128,7 @@
 - 能讲两个反直觉实测：①循环专家对负载不均**免疫且偏好集中**（0.20-0.28×）；②toy
   量化 top-1 全翻是**顶层贴边**（0.4-0.7σ gap）而非机制错——"判据先于结论"。
 - 能讲量化收益形态：decode 专家 GEMM 带宽受限 → int4/fp8 ≈2×（与 roofline 形态论一致）。
-- 诚实边界：吞吐路径仍是 Python 循环（~3.5ms/层税、8× dense），生产需 fused kernel；
-  无真实模型精度数字（下载边界见 §6）。
+- **能讲 grouped 后端演进**：组织税实测 3.8ms/层 → sort+padded bmm（fused gate_up）
+  后 0.7ms（-80%），小 T 快 4-5×；padded 批量在均衡路由下近 1× 计算、不均衡时放大
+  到 E·max_n（真段式是下一步）；int4 dual-path 因 w_deq 自动获益（引擎 ~2.4-2.8× 观察）。
+- 诚实边界：无真实模型精度数字；引擎绝对吞吐受 WSL 时钟噪声（以层级/同刻对比为准）。
