@@ -70,6 +70,8 @@ class Qwen3MoeDecoderLayer(nn.Module):
                 num_experts=config.num_experts,
                 top_k=config.num_experts_per_tok,
                 norm_topk_prob=getattr(config, "norm_topk_prob", False),
+                # Triton 真段式后端开关（config 字段；默认 bmm，边界见 moe_segment.py）
+                segment_backend=bool(getattr(config, "moe_segment_backend", False)),
             )
         else:
             self.mlp = Qwen3MoeMLP(

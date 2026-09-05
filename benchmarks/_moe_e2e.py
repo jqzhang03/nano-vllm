@@ -22,7 +22,7 @@ PROMPTS = ["The capital of France is", "Once upon a time"]
 SRC_TOK = os.path.expanduser("~/huggingface/Qwen3-0.6B")
 
 
-def build_toy():
+def build_toy(segment: bool = False):
     from transformers import Qwen3MoeConfig, Qwen3MoeForCausalLM
 
     if os.path.exists(TOY):
@@ -46,6 +46,8 @@ def build_toy():
         rope_theta=10000.0,
         tie_word_embeddings=True,
     )
+    if segment:
+        cfg.moe_segment_backend = True  # Triton 真段式后端（引擎 parity 复验用）
     cfg.torch_dtype = torch.bfloat16
     model = Qwen3MoeForCausalLM(cfg).to(torch.bfloat16).eval()
     model.save_pretrained(TOY)
@@ -56,7 +58,7 @@ def build_toy():
 
 
 def main():
-    build_toy()
+    build_toy(segment=True)
     dump = "/tmp/_moe_e2e_logits.pt"
 
     # ---- 阶段1：本引擎（bf16，不量化，MoE 动态 gather → enforce_eager） ----

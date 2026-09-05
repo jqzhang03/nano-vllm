@@ -60,7 +60,8 @@ class MoE(nn.Module):
     """
 
     def __init__(self, hidden_size: int, moe_intermediate_size: int,
-                 num_experts: int, top_k: int, norm_topk_prob: bool = False):
+                 num_experts: int, top_k: int, norm_topk_prob: bool = False,
+                 segment_backend: bool = False):
         super().__init__()
         assert num_experts > 0 and 1 <= top_k <= num_experts
         self.hidden_size = hidden_size
@@ -68,6 +69,10 @@ class MoE(nn.Module):
         self.num_experts = num_experts
         self.top_k = top_k
         self.norm_topk_prob = norm_topk_prob
+        # grouped 的批量实现：False = padded bmm（cuBLAS batched，默认——实测
+        # 全尺寸最优或接近）；True = Triton 真段式内核（无 padding；实测仅在
+        # 小 E + 极长段赢 43%，见 nanovllm/layers/moe_segment.py 头部边界表）
+        self.segment_backend = segment_backend
         self.gate = ReplicatedLinear(hidden_size, num_experts, bias=False)  # [E, H]
         self.gate.quantize_exclude = True  # router 精度决定路由 → 永不量化
         self.experts = nn.ModuleList(
@@ -164,28 +169,36 @@ class MoE(nn.Module):
         tgt = (torch.arange(T, device=x.device)
                .unsqueeze(1).expand(T, k).reshape(-1))
         R = idx_flat.numel()
-        # 1) 按专家稳定排序 → 段连续；gather 排序后的行与概率
+        if R == 0:
+            return torch.zeros_like(x)
+        # 1) 按专家稳定排序 → 段连续；gather 排序后的行
         order = torch.argsort(idx_flat, stable=True)         # [R]
         xs = x.index_select(0, tgt[order])                   # [R, H] 段连续（e 升序）
-        # 2) padded [E, max_n, H]：每段放回自己的行带（e*max_n + 段内偏移），
-        # 其余行保持 0（padding 行输入 0 → 批量 GEMM 输出精确 0）
         counts = torch.bincount(idx_flat[order], minlength=self.num_experts)
-        max_n = int(counts.max()) if R else 0
-        if R == 0 or max_n == 0:
-            return torch.zeros_like(x)
-        E = self.num_experts
-        e_row = idx_flat[order].to(torch.long)               # [R] 每行专家（非降）
-        seg_start = torch.cumsum(counts, 0) - counts         # [E] 每段在 xs 的起始
-        pos = e_row * max_n + (torch.arange(R, device=x.device)
-                               - seg_start[e_row])           # [R] dst 平面行号
-        dst = torch.zeros(E, max_n, x.size(1), device=x.device, dtype=x.dtype)
-        dst.reshape(-1, x.size(1)).index_copy_(0, pos, xs)
-        # 3) fused gate_up 批量 GEMM + silu·up（padding 行输入 0 → 输出精确 0）
-        gup = torch.bmm(dst, self._gup_t)                    # [E, max_n, 2I]
-        g, u = gup.chunk(2, dim=-1)
-        h = torch.nn.functional.silu(g) * u                  # [E, max_n, I]
-        out3 = torch.bmm(h, self._dn_t)                      # [E, max_n, H]
-        ys = out3.reshape(-1, x.size(1))[pos]                # 按平面行号取回 → xs 序
+        if self.segment_backend:
+            # Triton 真段式：offsets 驱动，无 padding（moe_segment.py）
+            from nanovllm.layers.moe_segment import moe_segment_mm
+            offs = torch.cumsum(counts, 0) - counts
+            gup = moe_segment_mm(xs, self._gup_t, offs, counts)      # [R, 2I]
+            g, u = gup.chunk(2, dim=-1)
+            h = torch.nn.functional.silu(g) * u                     # [R, I]
+            ys = moe_segment_mm(h, self._dn_t, offs, counts)        # [R, H]
+        else:
+            # padded bmm：每段放回自己的行带（e*max_n + 段内偏移），其余 0
+            max_n = int(counts.max())
+            E = self.num_experts
+            e_row = idx_flat[order].to(torch.long)           # [R] 每行专家（非降）
+            seg_start = torch.cumsum(counts, 0) - counts     # [E] 每段在 xs 的起始
+            pos = e_row * max_n + (torch.arange(R, device=x.device)
+                                   - seg_start[e_row])       # [R] dst 平面行号
+            dst = torch.zeros(E, max_n, x.size(1), device=x.device, dtype=x.dtype)
+            dst.reshape(-1, x.size(1)).index_copy_(0, pos, xs)
+            # 3) fused gate_up 批量 GEMM + silu·up（padding 行输入 0 → 输出精确 0）
+            gup = torch.bmm(dst, self._gup_t)                # [E, max_n, 2I]
+            g, u = gup.chunk(2, dim=-1)
+            h = torch.nn.functional.silu(g) * u              # [E, max_n, I]
+            out3 = torch.bmm(h, self._dn_t)                  # [E, max_n, H]
+            ys = out3.reshape(-1, x.size(1))[pos]            # 按平面行号取回 → xs 序
         # 4) 反排回 (t, slot) 序 → 加权 index_add 合并同一 token 的 slot
         inv = torch.empty_like(order)
         inv[order] = torch.arange(R, device=x.device)

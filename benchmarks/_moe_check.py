@@ -68,6 +68,25 @@ def main():
         d = (moe(x).float() - moe.reference(x).float()).abs().max().item()
     ok &= d == 0.0
     print(f"全零输入（router 均匀）: max_diff={d:.3e} ({'PASS' if d == 0 else 'FAIL'})")
+
+    # Triton 真段式后端（segment_backend=True → forward 走 moe_segment）
+    print("\n--- segment_backend（Triton 段式）---")
+    for (E, k, T) in [(8, 2, 100), (64, 4, 3), (8, 2, 4096)]:
+        moe = MoE(512, 768, num_experts=E, top_k=k,
+                  segment_backend=True).cuda().half()
+        with torch.no_grad():
+            for p in moe.parameters():
+                p.uniform_(-0.05, 0.05)
+        x = torch.randn(T, 512, device="cuda", dtype=torch.float16)
+        with torch.no_grad():
+            y_seg = moe(x)                     # 走 triton 段式
+            y_ref = moe.reference(x)
+        diff = (y_seg.float() - y_ref.float()).abs().max().item()
+        scale = max(1.0, y_ref.float().abs().max().item())
+        ok2 = diff <= 1e-4 * scale
+        ok &= ok2
+        print(f"seg E={E:3d} k={k} T={T:5d}: max_diff={diff:.3e} "
+              f"({'PASS' if ok2 else 'FAIL'})")
     print(f"\n{'ALL PASS' if ok else 'SOME FAILED'}")
 
 
