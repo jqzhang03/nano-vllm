@@ -356,6 +356,17 @@ BsT 行距 32→34 消 16-way 写冲突，实测 +86%**（bank = 行距与 32 �
 split-K 只在 block 数 < SM 数时赢（M=64 S=4 +59%），并行度够时部分和流量纯亏；
 persistent 本机全亏（0.89×，硬件 block 分发近零成本 + 动态均衡更优）。
 
+### 阶段 1.5：MoE 支持（router + 循环专家 FFN + 量化专家）——**进行中**
+**为什么插入**：DeepSeek-V2-Lite（阶段 2 的目标验证模型）是 **MLA + MoE** 双机制——两个
+新东西一起排错会互相污染归因，先把 MoE 单独做干净。且 MoE 是 DeepSeek-V3 面试主线。
+**具体动作**：①`layers/moe.py`：router（softmax + top-k）+ 循环专家 FFN（per-expert
+gather → 复用现有线性/量化路径 → scatter-add），与"全专家加权"参考数学同构对照
+（同求和顺序 → bit-exact）；②模型适配（DecoderLayer MLP→MoE + loader 的 per-expert
+权重 + registry）与随机小 MoE 端到端冒烟 + transformers 同构权重 parity；③quant
+experts（int4/fp8 逐 expert）与负载不均观察；④真实模型边界诚实标注（Qwen3-30B-A3B
+int4≈15.5GB 超本机；Qwen1.5-MoE-A2.7B / DeepSeek-V2-Lite ≈8GB 合适，下载前核对
+权重格式）。
+
 ### 阶段 2：MLA（DeepSeek 潜在注意力）+ SWA 滚动缓冲——**第二**
 **为什么第二**：注意力是推理的核心，DeepSeek 是当前面试必考；MLA 有真模型可验证
 （DeepSeek-V2-Lite int4≈8GB 本机可跑）；滚动缓冲把文档里的 TODO 变完成，且正好用上
