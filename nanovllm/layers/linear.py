@@ -100,7 +100,7 @@ def gemm_int4_kernel(
     M, N, K, num_groups,
     stride_am, stride_ak, stride_bn, stride_bk, stride_cm, stride_cn,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
-    GROUP_M: tl.constexpr,
+    GROUP_M: tl.constexpr, GROUP: tl.constexpr,
 ):
     """INT4 反量化 GEMM: C = A @ W_dequant（bf16 激活 × int4 权重，寄存器内反量化）。
 
@@ -123,28 +123,35 @@ def gemm_int4_kernel(
 
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)   # 输出通道
-    offs_k2 = tl.arange(0, BLOCK_K // 2)               # 打包列（k 对）
-
-    a_e_ptrs = a_ptr + offs_m[:, None] * stride_am + (2 * offs_k2)[None, :] * stride_ak
-    a_o_ptrs = a_e_ptrs + stride_ak
-    b_ptrs = b_ptr + offs_n[None, :] * stride_bn + offs_k2[:, None] * stride_bk
     a_mask = offs_m[:, None] < M
     b_mask = offs_n[None, :] < N
 
     acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-    for k in range(0, K, BLOCK_K):
-        a_e = tl.load(a_e_ptrs, mask=a_mask, other=0.0)                  # (BM, BK/2) 偶数k
-        a_o = tl.load(a_o_ptrs, mask=a_mask, other=0.0)                  # (BM, BK/2) 奇数k
-        b8 = tl.load(b_ptrs, mask=b_mask, other=0)                       # (BK/2, BN) int8
-        group = (k // BLOCK_K) % num_groups                              # 本K块恰为一组
-        s = tl.load(b_scale_ptr + offs_n * num_groups + group, mask=offs_n < N, other=1.0)
-        lo = ((b8 & 0x0F) - 8).to(tl.float32) * s[None, :]               # 偶数k真值
-        hi = (((b8 >> 4) & 0x0F) - 8).to(tl.float32) * s[None, :]        # 奇数k（>>算术移位，&0x0F遮符号扩展）
-        acc += tl.dot(a_e, lo.to(tl.bfloat16), out_dtype=tl.float32)
-        acc += tl.dot(a_o, hi.to(tl.bfloat16), out_dtype=tl.float32)
-        a_e_ptrs += BLOCK_K * stride_ak
-        a_o_ptrs += BLOCK_K * stride_ak
-        b_ptrs += (BLOCK_K // 2) * stride_bk
+    # K 不必是 BLOCK_K 的倍数（如 group64 的 10944）：上取整循环 + 尾部按 K 掩码
+    for k in range(0, (K + BLOCK_K - 1) // BLOCK_K * BLOCK_K, BLOCK_K):
+        # 组粒度 < 128（如 DeepSeek-V2-Lite 的 10944 = 64×171）：128 宽 K 块内含
+        # 多个组，按组静态展开（每组一个 scale、BLOCK_K//GROUP 次子点积）；
+        # GROUP=128 时只展开一次，与原实现同 scale/同累加次序。
+        for gg in tl.static_range(0, BLOCK_K // GROUP):
+            # 子块内打包列（k 对）：j ∈ [gg·G/2, (gg+1)·G/2)，byte 行号 = k//2 + j
+            jj = gg * (GROUP // 2) + tl.arange(0, GROUP // 2)
+            km = (k + 2 * jj) < K
+            a_e = tl.load(a_ptr + offs_m[:, None] * stride_am
+                          + (k + 2 * jj)[None, :] * stride_ak,
+                          mask=a_mask & km[None, :], other=0.0)
+            a_o = tl.load(a_ptr + offs_m[:, None] * stride_am
+                          + (k + 2 * jj + 1)[None, :] * stride_ak,
+                          mask=a_mask & km[None, :], other=0.0)
+            b8 = tl.load(b_ptr + offs_n[None, :] * stride_bn
+                         + (k // 2 + jj)[:, None] * stride_bk,
+                         mask=km[:, None] & b_mask, other=0)
+            group = ((k + gg * GROUP) // GROUP) % num_groups
+            s = tl.load(b_scale_ptr + offs_n * num_groups + group,
+                        mask=offs_n < N, other=1.0)
+            lo = ((b8 & 0x0F) - 8).to(tl.float32) * s[None, :]
+            hi = (((b8 >> 4) & 0x0F) - 8).to(tl.float32) * s[None, :]
+            acc += tl.dot(a_e, lo.to(tl.bfloat16), out_dtype=tl.float32)
+            acc += tl.dot(a_o, hi.to(tl.bfloat16), out_dtype=tl.float32)
 
     c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
     tl.store(c_ptrs, acc, mask=a_mask & b_mask)
@@ -163,17 +170,20 @@ def int4_gemm(a: torch.Tensor, b_int4: torch.Tensor, b_scale: torch.Tensor) -> t
     M, K = a.shape
     N = b_scale.shape[0]
     assert b_int4.shape == (N, K // 2), f"expected packed [N, K//2], got {b_int4.shape}"
-    assert K % 128 == 0, "group size 128 must divide K"
+    num_groups = b_scale.shape[1]
+    group = K // num_groups
+    assert group * num_groups == K and group % 2 == 0 \
+        and 128 % group == 0, f"组 {group} 须整除 K 且 128%组==0（K={K}）"
     out = torch.empty(M, N, device=a.device, dtype=torch.bfloat16)
     bm, bn, warps = 16, 128, 4
     grid = (triton.cdiv(M, bm) * triton.cdiv(N, bn),)
     gemm_int4_kernel[grid](
         a, b_int4, out, b_scale,
-        M, N, K, b_scale.shape[1],
+        M, N, K, num_groups,
         a.stride(0), a.stride(1),
         b_int4.stride(0), b_int4.stride(1),
         out.stride(0), out.stride(1),
-        BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=128, GROUP_M=8,
+        BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=128, GROUP_M=8, GROUP=group,
         num_warps=warps, num_stages=2,
     )
     return out

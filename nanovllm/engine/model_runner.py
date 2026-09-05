@@ -291,7 +291,7 @@ class ModelRunner:
         """
         for m in self._quant_mods():
             dp = self.config.int4_dense_path or getattr(m, "is_mla_kv_b", False)
-            m.quantize_int4(dense_path=dp)
+            m.quantize_int4(dense_path=dp, group_size=self.config.int4_group_size)
 
     def quantize_fp8_weights(self):
         """FP8(e4m3) 全量化（per-column 权重 + per-token 激活，vLLM 同款方案）。
@@ -321,13 +321,13 @@ class ModelRunner:
             found = 0
             for name, m in self.model.named_modules():
                 if name in state:
-                    m.quantize_int4(state[name], dense_path=dp)
+                    m.quantize_int4(state[name], dense_path=dp, group_size=self.config.int4_group_size)
                     found += 1
             assert found == len(mods), f"awq scales cover {found}/{len(mods)} quantized modules"
         else:
             scales = self._calibrate_awq_scales(mods)
             for m, s in zip(mods, scales):
-                m.quantize_int4(s, dense_path=dp)
+                m.quantize_int4(s, dense_path=dp, group_size=self.config.int4_group_size)
 
     def _calibrate_awq_scales(self, mods) -> list[torch.Tensor]:
         """内联校准：随机token prefill 收集每层输入逐通道 mean|X|，AWQ式 s = mean^0.5 归一化。"""
@@ -439,7 +439,7 @@ class ModelRunner:
                                 m.quantize_fp8()
                             else:
                                 s = awq_scales.get(full) if awq_scales is not None else None
-                                m.quantize_int4(s, dense_path=dp)
+                                m.quantize_int4(s, dense_path=dp, group_size=self.config.int4_group_size)
                     continue
                 if not isinstance(m, LinearBase):
                     continue
@@ -448,11 +448,13 @@ class ModelRunner:
                     m.quantize_w8a8(None)  # streaming 无 SmoothQuant（需全模型前向校准）
                 elif q == "int4":
                     m.quantize_int4(awq_scales.get(full) if awq_scales is not None else None,
+                                    group_size=self.config.int4_group_size,
                                     dense_path=dp or kvb)
                 elif q == "awq":
                     assert awq_scales is not None and full in awq_scales, \
                         f"awq scale missing for {full}"
-                    m.quantize_int4(awq_scales[full], dense_path=dp or kvb)
+                    m.quantize_int4(awq_scales[full], dense_path=dp or kvb,
+                                    group_size=self.config.int4_group_size)
                 elif q == "sparse24":
                     m.quantize_sparse24()
                 elif q == "fp8":

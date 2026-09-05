@@ -27,6 +27,7 @@ class Config:
     awq_scales_path: str = "" # AWQ激活感知缩放文件（.pt，benchmarks/awq_calibrate.py真实文本校准产出）；为空时用随机token内联校准
     quantize_lm_head: bool = False # 是否量化LM head（默认不量化——与w8a8一致：logits由lm_head点积直接决定，量化它精度损失最大，见BENCHMARKS.md §10）
     int4_dense_path: bool = True # int4双路径模式（默认开）：大M prefill/decode 与小N层走 w_deq 稠密反量化（cuBLAS，收掉大M亏损与TTFT回归），小M大N层走int4内核；代价是显存 1.73GB（比fp16的1.50还大）。False=纯int4（0.85GB，大batch慢），见BENCHMARKS.md §10。streaming 模式下自动强制 False（w_deq 全尺寸副本与按层加载目的冲突）
+    int4_group_size: int = 128 # int4 量化组大小（K 维，须整除各线性层 K）。DeepSeek-V2-Lite 的 dense 中间维 10944 = 64×171 不能被 128 整除 → 该模型需 64（精度代价小，官方社区 int4 同样受此约束）
     streaming_load: bool = False # 按层流式加载+即时量化（16GB 卡跑 7B+ 的前提，见 LEARNING.md 阶段7）：模型在 meta 设备构造（0显存）→ loader 逐 decoder layer 物化→加载→立即量化→释放 fp16。显式开启；或当估算 fp16 权重超过空闲显存 45% 且启用了权重量化时自动开启（7B+ 必触发）。限制：int4 强制纯 int4（无 w_deq）；w8a8 无 SmoothQuant 校准（需全模型前向）；awq 仅支持预生成 awq_scales_path（内联校准需全 fp16 模型）
     speculative: str = "none" # 投机解码："none" | "ngram"（n-gram/prompt-lookup草稿，无模型零显存，见BENCHMARKS.md §9）| "medusa"（Medusa多头，需medusa_path）| "eagle"（EAGLE-1草稿层：无RoPE transformer层 + 共享LM head 自回归草稿，需eagle_path）
     ngram_window: int = 4 # n-gram窗口上限（vLLM --ngram-prompt-lookup-max 默认同款）

@@ -232,14 +232,16 @@ def mla_decode_attention(q_abs: torch.Tensor, q_pe: torch.Tensor,
     o = torch.empty(bs, H, kv_lora_r, device=mla_cache.device,
                     dtype=torch.float16)
     grid = (bs,)
+    # 真实 V2-Lite（kv_lora=512, H=16）下 BLOCK_T=32 的 dot 操作数瓦片把共享内存
+    # 顶到 129KB > sm_120 的 101KB → BLOCK_T=16 + num_warps=8（toy 同款兼容）
     mla_decode_kernel[grid](
         q_abs.transpose(1, 2).contiguous(),      # [bs, KV, H]
         q_pe.transpose(1, 2).contiguous(),       # [bs, R, H]
         mla_cache, block_table, cache_seqlens, o,
         softmax_scale, c_scale, r_scale, block_table.shape[1],
         KV_LORA=kv_lora_r, ROPE=rope_r, H=H,
-        BLOCK_SIZE=mla_cache.shape[1], BLOCK_T=32,
-        num_warps=4,
+        BLOCK_SIZE=mla_cache.shape[1], BLOCK_T=16,
+        num_warps=8,
     )
     return o[..., :kv_lora]
 

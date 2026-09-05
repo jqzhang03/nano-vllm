@@ -24,7 +24,8 @@ def main():
     t0 = time.time()
     llm = LLM(MODEL, max_model_len=1024, quantization="int4",
               kv_swap=False, enforce_eager=True,
-              max_num_seqs=8, max_num_batched_tokens=4096)
+              max_num_seqs=8, max_num_batched_tokens=4096,
+              int4_group_size=64)
     mr = llm.model_runner
     print(f"[engine] streaming={mr.streaming} mla={mr._mla_model} "
           f"mla_dense_decode={mr._mla_dense_decode} enforce_eager={mr.enforce_eager}")
