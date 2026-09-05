@@ -32,6 +32,13 @@ class Context:
     # 掩码在段内下标上仍精确（装配外行本来就无资格被 attend）。
     ring_starts: torch.Tensor | None = None
     ring_idx: torch.Tensor | None = None
+    # ---- 阶段 2b 扩展：split（交替窗口）滚动 —— full 池（global 层）镜像 ----
+    # block_tables/…= 环池侧（local 层）；full_* = full 池侧（global 层）：
+    # full_block_tables（decode/纯prefill分页读）、full_slot_mapping（全批次写槽）、
+    # full_prefill_block_tables（混合批次 prefill 组）。split 之外为 None。
+    full_block_tables: torch.Tensor | None = None
+    full_slot_mapping: torch.Tensor | None = None
+    full_prefill_block_tables: torch.Tensor | None = None
 
 _CONTEXT = Context()
 
@@ -44,7 +51,9 @@ def set_context(is_prefill, cu_seqlens_q=None, cu_seqlens_k=None, max_seqlen_q=0
                 is_spec=False, n_prefill_rows=0,
                 chunk_starts=None, mla_pre_starts=None, mla_pre_idx=None,
                 mla_dec_starts=None, mla_dec_idx=None,
-                ring_starts=None, ring_idx=None):
+                ring_starts=None, ring_idx=None,
+                full_block_tables=None, full_slot_mapping=None,
+                full_prefill_block_tables=None):
     global _CONTEXT
     _CONTEXT = Context(is_prefill, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
                        slot_mapping, context_lens, block_tables,
@@ -52,7 +61,9 @@ def set_context(is_prefill, cu_seqlens_q=None, cu_seqlens_k=None, max_seqlen_q=0
                        is_spec, n_prefill_rows,
                        chunk_starts, mla_pre_starts, mla_pre_idx,
                        mla_dec_starts, mla_dec_idx,
-                       ring_starts, ring_idx)
+                       ring_starts, ring_idx,
+                       full_block_tables, full_slot_mapping,
+                       full_prefill_block_tables)
 
 def reset_context():
     global _CONTEXT

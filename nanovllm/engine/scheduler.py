@@ -17,27 +17,58 @@ class Scheduler:
         self.eos = config.eos
         self.block_size = config.kvcache_block_size
         # ---- SWA 滚动缓冲（阶段 2b/2b扩展）----
-        # 前置：全层统一滑动窗口的 bf16/fp8 KV MHA 模型（当前支持 mistral）；
-        # 投机仅限 ngram（草稿只看 token 历史，verify 行环回读由 slack 余量
-        # 覆盖；medusa/eagle 的引擎侧草稿环路未在环模型上验证）；
-        # 窗口 ≥ 块大小（spec 写 span 与驱逐边界的分离性保证）。
+        # 前置：统一窗口（mistral）或交替 local/global（gemma2，**split 模式**：
+        # local 层走环池、global 层走 full 池普通分页、永不驱逐）的 bf16/fp8 KV
+        # MHA 模型；投机仅限 ngram；窗口 ≥ 块大小。
         self.rolling = config.rolling_cache
         ring_window = None
+        self.rolling_split = False
         if self.rolling:
             hf = config.hf_config
             assert config.speculative in ("none", "ngram"), \
                 "rolling_cache + medusa/eagle 投机未实现（verify 行窗口回读的环余量语义）"
             assert config.kv_cache_dtype in ("auto", "fp8_e4m3"), \
                 "rolling_cache 需要 bf16 或 fp8 KV"
-            assert hf.model_type == "mistral", \
-                f"rolling_cache 仅支持全层统一滑动窗口模型（mistral）；model_type={hf.model_type!r}"
+            assert hf.model_type in ("mistral", "gemma2"), \
+                f"rolling_cache 支持 mistral（统一窗口）与 gemma2（交替窗口）；model_type={hf.model_type!r}"
             ring_window = getattr(hf, "sliding_window", None)
-            assert ring_window, "mistral 模型缺 sliding_window"
+            assert ring_window, "模型缺 sliding_window"
             assert ring_window >= config.kvcache_block_size, \
                 "滚动缓冲要求 sliding_window ≥ 块大小（spec 写 span/驱逐分离）"
-        self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size,
-                                          rolling_window=ring_window,
-                                          ring_slack=config.max_draft_len + 2)
+            # gemma2 交替 local/global：窗口层与非窗口层并存 → split 模式
+            # （runner 在 allocate 后写回 config.ring_blocks/full_blocks）
+            if hf.model_type == "gemma2":
+                from nanovllm.models.gemma2 import gemma2_layer_types
+                types = gemma2_layer_types(hf, hf.num_hidden_layers)
+                windows = {ring_window if t == "sliding" else None for t in types}
+                assert windows == {None, ring_window} or windows == {ring_window}, \
+                    f"gemma2 窗口模式未覆盖：{windows}"
+                self.rolling_split = windows == {None, ring_window}
+            if self.rolling_split:
+                assert config.speculative == "none", \
+                    "split（交替窗口）模式暂不支持投机"
+                assert config.kv_swap is False, \
+                    "split 模式暂不支持 KV swap（双池缓冲未实现）"
+        # split 模式（交替窗口，阶段 2b 扩展）：两个独立池
+        #   block_manager（环池，rolling）：local 层，窗口内容
+        #   full_block_manager（full 池，no_share）：global 层，全历史
+        if self.rolling_split:
+            nb_r = config.num_ring_kvcache_blocks
+            nb_f = config.num_full_kvcache_blocks
+            assert nb_r > 0 and nb_f > 0, \
+                "split（交替窗口）模式缺环池/full 池块数（runner 未设置？）"
+            self.block_manager = BlockManager(
+                nb_r, config.kvcache_block_size,
+                rolling_window=ring_window,
+                ring_slack=config.max_draft_len + 2)
+            self.full_block_manager = BlockManager(
+                nb_f, config.kvcache_block_size,
+                no_share=True, table_attr="kv_table")
+        else:
+            self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size,
+                                              rolling_window=ring_window,
+                                              ring_slack=config.max_draft_len + 2)
+            self.full_block_manager = None
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
         self.swapped: deque[Sequence] = deque()  # KV swap 抢占：KV 已换出到 CPU 的序列
@@ -111,6 +142,29 @@ class Scheduler:
             return self._schedule_prefill()
         return self._schedule_decode()
 
+    # ------------------------------------------------------------------
+    # split（交替窗口）模式双表辅助：非 split 时 full_block_manager=None，
+    # 辅助退化为原单表行为。
+    # ------------------------------------------------------------------
+    def _dec_can(self, seq: Sequence) -> bool:
+        """decode 步可追加：环表（可驱逐腾位）且 full 表（需新块时）都有位。"""
+        return self.block_manager.can_append(seq) and (
+            self.full_block_manager is None
+            or self.full_block_manager.can_append(seq))
+
+    def _alloc_prefill_blocks(self, seq: Sequence) -> bool:
+        """prefill 首次分配（双表同量块）：块不足返回 False（不做任何分配）。"""
+        if self.full_block_manager is not None and not seq.kv_table \
+                and self.full_block_manager.can_allocate(seq) == -1:
+            return False
+        num_cached_blocks = self.block_manager.can_allocate(seq)
+        if num_cached_blocks == -1:
+            return False
+        self.block_manager.allocate(seq, num_cached_blocks)
+        if self.full_block_manager is not None and not seq.kv_table:
+            self.full_block_manager.allocate(seq, 0)
+        return True
+
     def _compute_draft(self, seq: Sequence):
         """给一个running序列准备本步草稿。
 
@@ -140,7 +194,7 @@ class Scheduler:
         decode_seqs = []
         while self.running and len(decode_seqs) < self.max_num_seqs:
             seq = self.running.popleft()
-            while not self.block_manager.can_append(seq):
+            while not self._dec_can(seq):
                 if self.running:
                     self.preempt(self.running.pop())
                 else:
@@ -150,6 +204,8 @@ class Scheduler:
                 seq.num_scheduled_tokens = 1
                 seq.is_prefill = False
                 self.block_manager.may_append(seq)
+                if self.full_block_manager is not None:
+                    self.full_block_manager.may_append(seq)
                 pair = self.block_manager.cow_block(seq, seq.num_tokens - 1)
                 if pair is not None:
                     self.cow_pairs.append(pair)
@@ -165,10 +221,8 @@ class Scheduler:
             if remaining == 0:
                 break
             if not seq.block_table:
-                num_cached_blocks = self.block_manager.can_allocate(seq)
-                if num_cached_blocks == -1:
+                if not self._alloc_prefill_blocks(seq):
                     break
-                self.block_manager.allocate(seq, num_cached_blocks)
                 num_tokens = seq.num_tokens - seq.num_cached_tokens
             else:
                 num_tokens = seq.num_tokens - seq.num_cached_tokens
@@ -254,10 +308,8 @@ class Scheduler:
             if remaining == 0:
                 break
             if not seq.block_table:
-                num_cached_blocks = self.block_manager.can_allocate(seq)
-                if num_cached_blocks == -1:
+                if not self._alloc_prefill_blocks(seq):
                     break
-                self.block_manager.allocate(seq, num_cached_blocks)
                 num_tokens = seq.num_tokens - seq.num_cached_tokens
             else:
                 num_tokens = seq.num_tokens - seq.num_cached_tokens
@@ -297,14 +349,9 @@ class Scheduler:
                 break
             # 判断当前序列是否占用KV Cache block块
             if not seq.block_table:
-                # 计算当前序列匹配的共享前缀的KV Cache块个数，并不真正分配KV Cache块
-                num_cached_blocks = self.block_manager.can_allocate(seq)
-                # 返回-1则无法分配相应数量的KV Cache块
-                if num_cached_blocks == -1:
+                # 双表分配（split 模式）；can_allocate 返回-1则无法分配，不做任何分配
+                if not self._alloc_prefill_blocks(seq):
                     break
-                # 分配KV Cache块；allocate会按实际缓存长度设置seq.num_cached_tokens
-                # （部分块按真实token数记账，而非num_cached_blocks*block_size）
-                self.block_manager.allocate(seq, num_cached_blocks)
                 num_tokens = seq.num_tokens - seq.num_cached_tokens
             else:
                 num_tokens = seq.num_tokens - seq.num_cached_tokens
@@ -342,7 +389,7 @@ class Scheduler:
             # 检查当前分配的KV Cache块能否追加上一轮生成的、但还没写入KV Cache块的token
             # KV Cache写入逻辑是：如果当前序列的token数量%block_size==1，说明需要申请一个新的KV Cache块来存储上一轮生成的token
             # 否则直接在最后一个KV Cache块中追加即可
-            while not self.block_manager.can_append(seq):
+            while not self._dec_can(seq):
                 # 如果运行队列中还有其他序列，则中断当前序列，将其放回至等待队列中，释放其占用的资源
                 if self.running:
                     self.preempt(self.running.pop())
@@ -353,6 +400,8 @@ class Scheduler:
                 seq.num_scheduled_tokens = 1
                 seq.is_prefill = False
                 self.block_manager.may_append(seq)
+                if self.full_block_manager is not None:
+                    self.full_block_manager.may_append(seq)
                 # decode写入末块前，若末块是共享的部分块，先复制一块（COW）
                 pair = self.block_manager.cow_block(seq, seq.num_tokens - 1)
                 if pair is not None:
@@ -384,6 +433,8 @@ class Scheduler:
             seq.draft_tokens = None  # 回waiting的序列下次以prefill行重新调度，草稿作废
             seq.swapped = False
             self.block_manager.deallocate(seq)
+            if self.full_block_manager is not None and seq.kv_table:
+                self.full_block_manager.deallocate(seq)
             self.waiting.appendleft(seq)
 
     def swap_out(self, seq: Sequence):
@@ -460,6 +511,8 @@ class Scheduler:
             seq.status = SequenceStatus.FINISHED
             seq.t_completed = perf_counter()
             self.block_manager.deallocate(seq)
+            if self.full_block_manager is not None and seq.kv_table:
+                self.full_block_manager.deallocate(seq)
             self.running.remove(seq)
 
     def postprocess(self, seqs: list[Sequence], token_ids: list[int]):

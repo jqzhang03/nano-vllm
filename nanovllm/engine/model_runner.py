@@ -537,32 +537,56 @@ class ModelRunner:
             self.enforce_eager = True
 
     def _finalize_rolling(self):
-        """SWA 滚动缓冲模式收尾（阶段 2b）：校验 + 标记注意力层。
+        """SWA 滚动缓冲模式收尾（阶段 2b / 2b 扩展）：校验 + 标记注意力层。
 
-        环 = 解码期窗口内容常驻、旧块到期释放（每序列块数收敛到 ~窗口/B+2）；
-        前置校验与 Scheduler 同源（mistral 统一窗口 / bf16 或 fp8 KV / 无投机
-        或 ngram），并在层上置 rolling=True（Attention.forward 据此走自研 paged
-        内核——fp8 KV 时同内核读 fp8 缓存、bf16 时 scale=1 恒等）。
+        环 = 解码期窗口内容常驻、旧块到期释放（每序列块数收敛到 ~窗口/B+2）：
+        - **统一窗口**（mistral）：全层 rolling=True，bf16/fp8 KV + 无投机/ngram；
+        - **交替窗口 split**（gemma2 local/global）：local 层 rolling=True（环池），
+          global 层 split_full=True（full 池，全历史、普通分页）——双池分配在
+          allocate_kv_cache；spec 关、kv 仅 auto、decode 强制 eager（双池图未实现）。
         """
         cfg = self.config
         self._rolling = cfg.rolling_cache
+        self._ring_split = False
         if not self._rolling:
             return
         hf = cfg.hf_config
         assert cfg.kv_cache_dtype in ("auto", "fp8_e4m3") \
             and cfg.speculative in ("none", "ngram") \
-            and hf.model_type == "mistral" and getattr(hf, "sliding_window", None), \
-            ("rolling_cache 仅支持 mistral 统一窗口 + bf16/fp8 KV + 无投机或 ngram"
-             "（组合矩阵见 config.py 注释）")
-        windows = {m.window_size for m in self.model.modules()
-                   if hasattr(m, "window_size") and hasattr(m, "k_cache")}
-        assert windows and windows == {hf.sliding_window}, \
-            f"滚动缓冲要求全层统一窗口（{windows}）"
-        assert hf.sliding_window >= cfg.kvcache_block_size, \
-            "滚动缓冲要求 sliding_window ≥ 块大小"
-        for m in self.model.modules():
-            if hasattr(m, "window_size") and hasattr(m, "k_cache"):
+            and hf.model_type in ("mistral", "gemma2") \
+            and getattr(hf, "sliding_window", None), \
+            ("rolling_cache 仅支持 mistral（统一窗口）或 gemma2（交替窗口）"
+             " + bf16/fp8 KV + 无投机或 ngram（组合矩阵见 config.py 注释）")
+        W = hf.sliding_window
+        assert W >= cfg.kvcache_block_size, "滚动缓冲要求 sliding_window ≥ 块大小"
+        attns = [m for m in self.model.modules()
+                 if hasattr(m, "window_size") and hasattr(m, "k_cache")]
+        assert attns, "滚动模型缺注意力层"
+        windows = {m.window_size for m in attns}
+        if windows == {None, W}:
+            assert hf.model_type == "gemma2" and cfg.speculative == "none" \
+                and cfg.kv_cache_dtype == "auto", \
+                "split（交替窗口）模式：仅 gemma2、无投机、kv auto"
+            self._ring_split = True
+            self._ring_layers = [m for m in attns if m.window_size == W]
+            self._full_layers = [m for m in attns if m.window_size is None]
+            assert self._ring_layers and self._full_layers, \
+                "split 模式需要 local 与 global 层并存"
+            for m in self._ring_layers:
                 m.rolling = True
+                m.split_full = False
+            for m in self._full_layers:
+                m.rolling = False
+                m.split_full = True
+            if not self.enforce_eager:
+                print("[ring-split] 交替窗口滚动 decode 走 eager"
+                      "（双池 CUDA graph 捕获未实现）→ 强制 enforce_eager",
+                      flush=True)
+                self.enforce_eager = True
+            return
+        assert windows == {W}, f"滚动窗口模式未覆盖（{windows}）"
+        for m in attns:
+            m.rolling = True
 
     def allocate_kv_cache(self):
         config = self.config
@@ -611,6 +635,43 @@ class ModelRunner:
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         # 获取每个注意力头的维度，优先取head_dim，否则用隐藏层注意力维度处以注意力头数
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
+
+        # ---- split（交替窗口）模式：环池（local 层）+ full 池（global 层）----
+        if getattr(self, "_ring_split", False):
+            n_ring = len(self._ring_layers)
+            n_full = len(self._full_layers)
+            r_pb = 2 * n_ring * self.block_size * num_kv_heads * head_dim * itemsize
+            f_pb = 2 * n_full * self.block_size * num_kv_heads * head_dim * itemsize
+            budget = total * config.gpu_memory_utilization - used - peak + current
+            # 预算切分：环池稳态每序列 ≈ (W+2B)/B 页、full 池 ≈ max_model_len/B 页
+            W = hf_config.sliding_window
+            r_per = (W + 2 * self.block_size) / self.block_size
+            f_per = max(float(config.max_model_len) / self.block_size, 1.0)
+            theta = r_per / (r_per + f_per)
+            nb_r = int(budget * theta) // r_pb
+            nb_f = int(budget * (1 - theta)) // f_pb
+            assert nb_r > 0 and nb_f > 0, (
+                "split 双池块数不足（环 %d / full %d；每页 %.1f/%.1fMB，预算 %.0fMB）"
+                % (nb_r, nb_f, r_pb / 1e6, f_pb / 1e6, budget / 1e6))
+            config.num_ring_kvcache_blocks = nb_r
+            config.num_full_kvcache_blocks = nb_f
+            config.num_kvcache_blocks = nb_r + nb_f
+            kv_dtype = torch.float8_e4m3fn if use_fp8 else hf_config.dtype
+            self.kv_cache = torch.empty(2, n_ring, nb_r, self.block_size,
+                                        num_kv_heads, head_dim, dtype=kv_dtype)
+            self.kv_cache_full = torch.empty(2, n_full, nb_f, self.block_size,
+                                             num_kv_heads, head_dim,
+                                             dtype=kv_dtype)
+            for i, m in enumerate(self._ring_layers):
+                m.k_cache = self.kv_cache[0, i]
+                m.v_cache = self.kv_cache[1, i]
+                m.use_fp8 = use_fp8
+            for i, m in enumerate(self._full_layers):
+                m.k_cache = self.kv_cache_full[0, i]
+                m.v_cache = self.kv_cache_full[1, i]
+                m.use_fp8 = use_fp8
+            return
+
         # 单KV Cache块大小
         block_bytes = 2 * num_layers * self.block_size * num_kv_heads * head_dim * itemsize
         # 根据可用显存计算可分配的KV Cache块总数
@@ -629,11 +690,13 @@ class ModelRunner:
                 module.use_fp8 = use_fp8
                 layer_id += 1
 
-    def prepare_block_tables(self, seqs: list[Sequence]):
+    def prepare_block_tables(self, seqs: list[Sequence],
+                             attr: str = "block_table"):
         # 找到序列中最长的块表长度
-        max_len = max(len(seq.block_table) for seq in seqs)
+        tabs = [getattr(seq, attr) for seq in seqs]
+        max_len = max(len(t) for t in tabs)
         # 将不足最长块表长度的通过添加-1补足长度
-        block_tables = [seq.block_table + [-1] * (max_len - len(seq.block_table)) for seq in seqs]
+        block_tables = [t + [-1] * (max_len - len(t)) for t in tabs]
         # 转为int32张量，使用锁页内存加速传输，并异步拷贝到GPU
         block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         return block_tables
@@ -694,8 +757,27 @@ class ModelRunner:
                              pin_memory=True).cuda(non_blocking=True)
         return counts_t, idx_t
 
+    def _span_slots(self, table: list[int], start: int, end: int) -> list[int]:
+        """一段 [start, end) 写 span 在块表 table（表项 = 逻辑块号）上的槽位。"""
+        out = []
+        start_block = start // self.block_size
+        end_block = (end + self.block_size - 1) // self.block_size
+        for i in range(start_block, end_block):
+            slot_start = table[i] * self.block_size
+            if i == start_block:
+                slot_start += start % self.block_size
+            slot_end = (table[i] * self.block_size + self.block_size
+                        if i != end_block - 1
+                        else table[i] * self.block_size + end - i * self.block_size)
+            out.extend(range(slot_start, slot_end))
+        return out
+
     def prepare_prefill(self, seqs: list[Sequence]):
-        """纯prefill批次（含前缀缓存读取）。返回 (input_ids, positions)。"""
+        """纯prefill批次（含前缀缓存读取）。返回 (input_ids, positions)。
+
+        split（交替窗口）模式：每层写自己的池——环池槽位在 slot_mapping、
+        full 池槽位在 full_slot_mapping（行位置相同、物理页不同）。
+        """
         input_ids = [] # 所有序列本次prefill的输入token ID
         positions = [] # 对应的位置索引
         cu_seqlens_q = [0] # query的累积序列长度，用于flash attn的变长输入
@@ -704,6 +786,7 @@ class ModelRunner:
         max_seqlen_k = 0 # key最大序列长度
         slot_mapping = [] # 每个token应写入KV Cache的槽位索引
         block_tables = None # 块表，如果key长度大于query长度(使用了前缀缓存)则需要构建
+        full_slot_mapping = [] if self._ring_split else None
         for seq in seqs:
             start = seq.num_cached_tokens
             seqlen_q = seq.num_scheduled_tokens
@@ -717,24 +800,19 @@ class ModelRunner:
             max_seqlen_k = max(seqlen_k, max_seqlen_k)
             if not seq.block_table:    # warmup没有块表，跳过slot_mapping生成
                 continue
-            start_block = start // self.block_size
-            end_block = (end + self.block_size - 1) // self.block_size
-            for i in range(start_block, end_block):
-                slot_start = seq.block_table[i] * self.block_size
-                if i == start_block:
-                    slot_start += start % self.block_size
-                if i != end_block - 1:
-                    slot_end = seq.block_table[i] * self.block_size + self.block_size
-                else:
-                    slot_end = seq.block_table[i] * self.block_size + end - i * self.block_size
-                slot_mapping.extend(range(slot_start, slot_end))
+            slot_mapping.extend(self._span_slots(seq.block_table, start, end))
+            if self._ring_split:
+                full_slot_mapping.extend(self._span_slots(seq.kv_table, start, end))
         # key的总序列大于query的总序列长度，有prefix cache，query跳过了前缀，则需要准备块表供注意力内核使用
         # 在cu_seqlens_q中，加入的是当前步需要计算的token数量，不包括前缀缓存的token数量
         # 在cu_seqlens_k中，加入的是当前步计算所需的所有key数量，=缓存前缀长度+新计算的token数量
+        full_block_tables = None
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:
             # 如果用到了前缀缓存，那么cu_seqlens_k的长度一定会大于cu_seqlens_q的长度，前缀缓存的key的前一部分已经有缓存了
             # 需要将缓存的那一部分key值的物理位置索引和新计算的后缀块的物理地址按逻辑顺序拼成一张地址索引表
             block_tables = self.prepare_block_tables(seqs)
+            if self._ring_split:
+                full_block_tables = self.prepare_block_tables(seqs, attr="kv_table")
         # MLA cache-shaped 前缀行信息（DeepSeek 模型：前缀行从 fused cache 稠密化）
         if self._mla_model and cu_seqlens_k[-1] > cu_seqlens_q[-1]:
             mla_pre_starts, mla_pre_idx = self._mla_rows(
@@ -750,7 +828,11 @@ class ModelRunner:
         # 将prefill上下文设置到全局上下文，供注意力算子使用
         set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
                     slot_mapping, None, block_tables,
-                    mla_pre_starts=mla_pre_starts, mla_pre_idx=mla_pre_idx)
+                    mla_pre_starts=mla_pre_starts, mla_pre_idx=mla_pre_idx,
+                    full_block_tables=full_block_tables,
+                    full_slot_mapping=(torch.tensor(full_slot_mapping, dtype=torch.int32,
+                                                    pin_memory=True).cuda(non_blocking=True)
+                                       if full_slot_mapping is not None else None))
         return input_ids, positions
 
     def prepare_mixed(self, seqs: list[Sequence]):
@@ -775,7 +857,9 @@ class ModelRunner:
         max_seqlen_q = 0
         max_seqlen_k = 0
         slot_mapping = []
+        full_slot_mapping = [] if self._ring_split else None
         prefill_block_tables = None
+        full_prefill_block_tables = None
         for seq in seqs[:n_prefill]:
             start = seq.num_cached_tokens
             seqlen_q = seq.num_scheduled_tokens
@@ -788,18 +872,14 @@ class ModelRunner:
             max_seqlen_k = max(end, max_seqlen_k)
             if not seq.block_table:
                 continue
-            start_block = start // self.block_size
-            end_block = (end + self.block_size - 1) // self.block_size
-            for i in range(start_block, end_block):
-                slot_start = seq.block_table[i] * self.block_size
-                if i == start_block:
-                    slot_start += start % self.block_size
-                slot_end = (seq.block_table[i] * self.block_size + self.block_size
-                            if i != end_block - 1
-                            else seq.block_table[i] * self.block_size + end - i * self.block_size)
-                slot_mapping.extend(range(slot_start, slot_end))
+            slot_mapping.extend(self._span_slots(seq.block_table, start, end))
+            if self._ring_split:
+                full_slot_mapping.extend(self._span_slots(seq.kv_table, start, end))
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:
             prefill_block_tables = self.prepare_block_tables(seqs[:n_prefill])
+            if self._ring_split:
+                full_prefill_block_tables = self.prepare_block_tables(
+                    seqs[:n_prefill], attr="kv_table")
         n_prefill_tokens = cu_seqlens_q[-1]
         # MLA：prefill 组 cache-shaped 行（前缀稠密化用）+ decode 组兜底行
         mla_pre_starts = mla_pre_idx = None
@@ -815,7 +895,14 @@ class ModelRunner:
             positions.append(len(seq) - 1)
             context_lens.append(len(seq))
             slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens - 1)
+            if self._ring_split:
+                full_slot_mapping.append(seq.kv_table[-1] * self.block_size
+                                         + seq.last_block_num_tokens - 1)
         block_tables = self.prepare_block_tables(decode_seqs)
+        full_block_tables = None
+        if self._ring_split:
+            full_block_tables = self.prepare_block_tables(decode_seqs,
+                                                          attr="kv_table")
         mla_dec_starts = mla_dec_idx = None
         if self._mla_model and self._mla_dense_decode:
             mla_dec_starts, mla_dec_idx = self._mla_rows(
@@ -838,7 +925,12 @@ class ModelRunner:
                     n_prefill_tokens=n_prefill_tokens,
                     mla_pre_starts=mla_pre_starts, mla_pre_idx=mla_pre_idx,
                     mla_dec_starts=mla_dec_starts, mla_dec_idx=mla_dec_idx,
-                    chunk_starts=chunk_starts)
+                    chunk_starts=chunk_starts,
+                    full_block_tables=full_block_tables,
+                    full_slot_mapping=(torch.tensor(full_slot_mapping, dtype=torch.int32,
+                                                    pin_memory=True).cuda(non_blocking=True)
+                                       if full_slot_mapping is not None else None),
+                    full_prefill_block_tables=full_prefill_block_tables)
         return input_ids, positions
 
     def prepare_spec(self, seqs: list[Sequence]):
@@ -988,16 +1080,23 @@ class ModelRunner:
         positions = []
         slot_mapping = []
         context_lens = []
+        full_slot_mapping = [] if self._ring_split else None
         for seq in seqs:
             input_ids.append(seq.last_token)
             positions.append(len(seq) - 1)
             context_lens.append(len(seq))
             slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens  - 1)
+            if self._ring_split:
+                full_slot_mapping.append(seq.kv_table[-1] * self.block_size
+                                         + seq.last_block_num_tokens - 1)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         block_tables = self.prepare_block_tables(seqs)
+        full_block_tables = None
+        if self._ring_split:
+            full_block_tables = self.prepare_block_tables(seqs, attr="kv_table")
         # MLA 稠密兜底 decode 行信息（整段缓存 [0, len) 稠密化；内核路径不需要）
         mla_dec_starts = mla_dec_idx = None
         if self._mla_model and self._mla_dense_decode:
@@ -1012,7 +1111,11 @@ class ModelRunner:
         set_context(False, slot_mapping=slot_mapping, context_lens=context_lens,
                     block_tables=block_tables,
                     mla_dec_starts=mla_dec_starts, mla_dec_idx=mla_dec_idx,
-                    chunk_starts=chunk_starts)
+                    chunk_starts=chunk_starts,
+                    full_block_tables=full_block_tables,
+                    full_slot_mapping=(torch.tensor(full_slot_mapping, dtype=torch.int32,
+                                                    pin_memory=True).cuda(non_blocking=True)
+                                       if full_slot_mapping is not None else None))
         return input_ids, positions
 
     def prepare_sample(self, seqs: list[Sequence]):
