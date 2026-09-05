@@ -16,7 +16,25 @@ class Scheduler:
         self.max_num_batched_tokens = config.max_num_batched_tokens
         self.eos = config.eos
         self.block_size = config.kvcache_block_size
-        self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
+        # ---- SWA 滚动缓冲（阶段 2b）----
+        # 前置：全层统一滑动窗口的 bf16 MHA 模型（当前支持 mistral 系列）；
+        # 环驱逐需要"未来回读余量"（spec verify 会回读 γ）→ 组合未实现；
+        # fp8 KV 无环内核 → 组合未实现（runner 侧再校验一次）。
+        self.rolling = config.rolling_cache
+        ring_window = None
+        if self.rolling:
+            hf = config.hf_config
+            assert config.speculative == "none", \
+                "rolling_cache + 投机解码未实现（verify 行窗口回读的环余量语义）"
+            assert config.kv_cache_dtype == "auto", \
+                "rolling_cache 需要 bf16 KV（fp8 无环内核）"
+            assert hf.model_type == "mistral", \
+                f"rolling_cache 仅支持全层统一滑动窗口模型（mistral）；model_type={hf.model_type!r}"
+            ring_window = getattr(hf, "sliding_window", None)
+            assert ring_window, "mistral 模型缺 sliding_window"
+        self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size,
+                                          rolling_window=ring_window,
+                                          ring_slack=config.max_draft_len + 2)
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
         self.swapped: deque[Sequence] = deque()  # KV swap 抢占：KV 已换出到 CPU 的序列

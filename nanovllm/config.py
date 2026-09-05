@@ -20,6 +20,7 @@ class Config:
     kv_cache_dtype: str = "auto" # KV缓存数据类型："auto"（模型dtype，默认）或 "fp8_e4m3"（FP8 E4M3量化，容量翻倍，decode用自研Triton内核）
     kv_swap: bool = True # KV swap 抢占：KV块不足时把序列的KV拷到CPU内存并释放GPU块，恢复时直接换回（bit-exact，免重新prefill）。仅TP=1且非fp8 KV时生效（fp8的float8_e4m3是CUDA-only，无法分配CPU缓冲）
     kv_swap_space_gb: float = 2.0 # KV swap 的 CPU 缓冲空间上限（GB，vLLM swap_space 同款）。换出缓冲累计超限时回落 recompute 抢占，防止 CPU RAM 耗尽（本机 WSL 仅 7GB，0.6B 单 KV 块 28MB）
+    rolling_cache: bool = False # SWA 滚动缓冲（阶段 2b）：解码期每序列 KV 只保留窗口内容（块数 ≤ 窗口/块大小 + 2），旧块到期自动释放——长生成序列的 KV 内存有界。仅支持全层统一滑动窗口的 bf16 模型（mistral），需自研 bf16 paged 内核（flash-attn 无法表达环表位置偏移，vLLM 传统实现也只掩码不滚动）；滚动模型不参与前缀缓存发布/消费（窗口内容过期，见 block_manager.py 头注）。fp8 KV / 投机解码组合不支持（断言）
     quantization: str = "none" # 权重量化："none" | "w8a8"（per-channel int8权重+per-token int8激活，Triton int8 GEMM）| "int4"（per-group int4权重，Triton反量化GEMM）| "awq"（int4 + AWQ激活感知缩放）| "sparse24"（2:4结构化剪枝+cuSPARSELt半结构化matmul）| "fp8"（e4m3全量化：per-column权重+per-token激活；decode走Triton内核、prefill走硬件FP8 MMA _scaled_mm）
     awq_scales_path: str = "" # AWQ激活感知缩放文件（.pt，benchmarks/awq_calibrate.py真实文本校准产出）；为空时用随机token内联校准
     quantize_lm_head: bool = False # 是否量化LM head（默认不量化——与w8a8一致：logits由lm_head点积直接决定，量化它精度损失最大，见BENCHMARKS.md §10）

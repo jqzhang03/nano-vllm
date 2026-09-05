@@ -31,6 +31,10 @@ class Sequence:
         self.block_table = []
         self.draft_tokens: list[int] | None = None  # 投机解码：本步n-gram草稿（None=非verify行；[]=verify行无草稿）
         self.swapped = False  # KV swap 抢占：KV 已换出到 CPU（在 swapped 队列，恢复时换入直接decode）
+        # 滚动缓冲（SWA 环）：块表只保留窗口内容，表内第 i 项 = 第 kv_j0+i 个
+        # 逻辑块（chunk 序号从 0 起）；key 位置 = (kv_j0+i)*block_size + 槽内偏移
+        # （自研内核按行首块序号还原位置，见 attention.py 的 chunk_starts）
+        self.kv_j0 = 0
 
         # ---- 基准计时（仅driver侧使用，不随__getstate__跨进程传输） ----
         self.t_submitted: float | None = None      # 请求加入调度队列的时间（秒）
@@ -90,11 +94,12 @@ class Sequence:
     # 跨进程同步通信
     def __getstate__(self):
         last_state = self.last_token if not self.is_prefill else self.token_ids
-        return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.block_table, last_state, self.draft_tokens)
+        return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.block_table, last_state, self.draft_tokens, self.kv_j0)
 
     def __setstate__(self, state):
         (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens,
-         self.block_table, last_state, self.draft_tokens) = state
+         self.block_table, last_state, self.draft_tokens) = state[:7]
+        self.kv_j0 = state[7] if len(state) > 7 else 0
         if isinstance(last_state, list): # 如果是prefill阶段传来的
             self.token_ids = last_state
             self.last_token = self.token_ids[-1]

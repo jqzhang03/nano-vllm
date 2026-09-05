@@ -42,7 +42,8 @@ def store_kvcache(key: torch.Tensor, value: torch.Tensor, k_cache: torch.Tensor,
 
 @triton.jit
 def paged_decode_attention_fp8_kernel(
-    q_ptr, k_cache_ptr, v_cache_ptr, block_table_ptr, cache_seqlens_ptr, o_ptr,
+    q_ptr, k_cache_ptr, v_cache_ptr, block_table_ptr, cache_seqlens_ptr,
+    chunk_starts_ptr, o_ptr,
     k_scale, v_scale, softmax_scale,
     max_blocks, num_heads, kv_heads,
     head_dim: tl.constexpr, num_groups: tl.constexpr, QPAD: tl.constexpr,
@@ -61,11 +62,18 @@ def paged_decode_attention_fp8_kernel(
       （w>=2 时跨warp归约顺序变化使误差放大到 1e-2）；
     - 实测（RTX 5060 Ti）：vs v4(LUT,BT32,w1) 全面 0.71-0.74x；vs v5(直接load)
       再快 ~25%。BLOCK_T∈{64,128} 反而更慢（寄存器压力）。
+
+    阶段2b 扩展（滚动缓冲/SWA 环）：chunk_starts[r] = 行首现存逻辑块序号 j0
+    （非滚动行为 j0=0，与原语义一致）。滚动行的块表只含窗口内容，第 b 项 =
+    逻辑块 j0+b：key_pos = (j0+b)·B + 块内偏移；读块数 = ceil(seqlen/B) − j0。
+    fp8 缓存不变（fp8+环 未实现，见 runner 断言）——本内核同时服务 bf16 环
+    decode（scale=1 + bf16 cache，见 paged_decode_attention_bf16）。
     """
     pid = tl.program_id(0)
     seq_id = pid // kv_heads
     kv_head = pid % kv_heads
     seqlen = tl.load(cache_seqlens_ptr + seq_id)
+    j0 = tl.load(chunk_starts_ptr + seq_id)
     offs_d = tl.arange(0, head_dim)
     offs_g = tl.arange(0, QPAD)
     g_valid = offs_g[None, :] < num_groups
@@ -81,14 +89,14 @@ def paged_decode_attention_fp8_kernel(
     m = tl.full([1, QPAD], float("-inf") if WINDOW == 0 else 0.0, dtype=tl.float32)
     l = tl.zeros([1, QPAD], dtype=tl.float32)
 
-    num_blocks = (seqlen + BLOCK_SIZE - 1) // BLOCK_SIZE
+    num_blocks = (seqlen + BLOCK_SIZE - 1) // BLOCK_SIZE - j0
     block_stride = BLOCK_SIZE * kv_heads * head_dim
     for b in range(num_blocks):
         block_id = tl.load(block_table_ptr + seq_id * max_blocks + b)
         base = block_id * block_stride + kv_head * head_dim
         for t in range(0, BLOCK_SIZE, BLOCK_T):
             offs_t = t + tl.arange(0, BLOCK_T)
-            key_pos = b * BLOCK_SIZE + offs_t
+            key_pos = (j0 + b) * BLOCK_SIZE + offs_t
             # SWA 窗口掩码：与 flash window_size=(W-1, 0) 语义一致（见 Attention.__init__
             # 的 _flash_window 注释；WINDOW=滑动窗口大小，含自己）——WINDOW=0 时恒真
             tok_mask = key_pos < seqlen
@@ -112,19 +120,26 @@ def paged_decode_attention_fp8_kernel(
              o.to(q_ptr.dtype.element_ty), mask=g_valid)
 
 
+def _zeros_chunk(bs: int, device) -> torch.Tensor:
+    return torch.zeros(bs, dtype=torch.int32, device=device)
+
+
 def paged_decode_attention_fp8(q: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor,
                                block_table: torch.Tensor, cache_seqlens: torch.Tensor,
                                k_scale: float, v_scale: float, softmax_scale: float,
-                               window: int = 0) -> torch.Tensor:
+                               window: int = 0,
+                               chunk_starts: torch.Tensor | None = None) -> torch.Tensor:
     bs, num_heads, head_dim = q.shape
     kv_heads = k_cache.shape[2]
     max_blocks = block_table.shape[1]
     num_groups = num_heads // kv_heads
     qpad = max(16, num_groups)
     o = torch.empty_like(q)
+    if chunk_starts is None:
+        chunk_starts = _zeros_chunk(bs, q.device)
     grid = (bs * kv_heads,)
     paged_decode_attention_fp8_kernel[grid](
-        q, k_cache, v_cache, block_table, cache_seqlens, o,
+        q, k_cache, v_cache, block_table, cache_seqlens, chunk_starts, o,
         k_scale, v_scale, softmax_scale,
         max_blocks, num_heads, kv_heads,
         head_dim=head_dim, num_groups=num_groups, QPAD=qpad,
@@ -133,6 +148,26 @@ def paged_decode_attention_fp8(q: torch.Tensor, k_cache: torch.Tensor, v_cache: 
         num_warps=1,
     )
     return o
+
+
+def paged_decode_attention_bf16(q: torch.Tensor, k_cache: torch.Tensor,
+                                v_cache: torch.Tensor,
+                                block_table: torch.Tensor,
+                                cache_seqlens: torch.Tensor,
+                                softmax_scale: float,
+                                window: int = 0,
+                                chunk_starts: torch.Tensor | None = None
+                                ) -> torch.Tensor:
+    """bf16 paged decode（滚动缓冲/SWA 环用，阶段 2b）。
+
+    bf16 缓存走 fp8 内核源码（scale=1 恒等）：bf16 → fp32 → fp16 无精度损失
+    （bf16 8 位尾数 ⊂ fp16），dot 与 flash-attn 的 fp16 内部路径同精度族。
+    flash-attn 无法表达"表项 ≠ 逻辑块号"的环布局（它从表下标推 key 位置），
+    滚动行的 decode 必须用自研内核 + 每行首块序号（chunk_starts）。
+    """
+    return paged_decode_attention_fp8(
+        q, k_cache, v_cache, block_table, cache_seqlens,
+        1.0, 1.0, softmax_scale, window=window, chunk_starts=chunk_starts)
 
 
 @triton.jit
@@ -255,6 +290,10 @@ class Attention(nn.Module):
         self._flash_window = (window_size - 1, 0) if window_size else (-1, -1)
         self._flash_softcap = logit_softcapping or 0.0
         self.k_cache = self.v_cache = torch.tensor([])
+        # ---- SWA 滚动缓冲（阶段 2b）：ModelRunner 校验后置 True ----
+        # 该层 decode 行走自研 bf16 paged 内核（块表 = 窗口内容，行首块序号
+        # 在 Context.chunk_starts）；flash-attn 无法表达环布局（表下标≠逻辑块号）
+        self.rolling = False
         # ---- FP8 KV cache 状态（由ModelRunner在allocate_kv_cache/校准时设置） ----
         self.use_fp8 = False                 # 是否启用fp8(E4M3) KV存储
         self.k_scale = 1.0                   # 本层K的固定反量化scale（warmup校准）
@@ -328,18 +367,7 @@ class Attention(nn.Module):
                                            window_size=self._flash_window, softcap=self._flash_softcap,
                                            block_table=context.prefill_block_tables)
             q_dec = q[n_pre:]
-            if self.use_fp8:
-                o_dec = paged_decode_attention_fp8(q_dec, k_cache, v_cache,
-                                                   context.block_tables, context.context_lens,
-                                                   self.k_scale, self.v_scale, self.scale,
-                                                   window=self.window_size or 0)
-            else:
-                o_dec = flash_attn_with_kvcache(q_dec.unsqueeze(1), k_cache, v_cache,
-                                                cache_seqlens=context.context_lens,
-                                                block_table=context.block_tables,
-                                                softmax_scale=self.scale, causal=True,
-                                                window_size=self._flash_window,
-                                                softcap=self._flash_softcap).squeeze(1)
+            o_dec = self._decode_rows(q_dec, context)
             return torch.cat([o_pre, o_dec], dim=0)
         if context.is_prefill:
             if context.block_tables is not None:    # prefix cache：KV来自缓存
@@ -366,16 +394,35 @@ class Attention(nn.Module):
                                        softmax_scale=self.scale, causal=True, block_table=context.block_tables,
                                        window_size=self._flash_window, softcap=self._flash_softcap)
         else:    # decode
-            if self.use_fp8:
-                # 读路径：自研Triton内核直接读fp8缓存，寄存器内反量化
-                o = paged_decode_attention_fp8(q, k_cache, v_cache,
-                                               context.block_tables, context.context_lens,
-                                               self.k_scale, self.v_scale, self.scale,
-                                               window=self.window_size or 0)
-            else:
-                o = flash_attn_with_kvcache(q.unsqueeze(1), k_cache, v_cache,
-                                            cache_seqlens=context.context_lens, block_table=context.block_tables, 
-                                            softmax_scale=self.scale, causal=True,
-                                            window_size=self._flash_window,
-                                            softcap=self._flash_softcap)
+            o = self._decode_rows(q, context)
         return o
+
+    def _decode_rows(self, q: torch.Tensor, context) -> torch.Tensor:
+        """decode 组（纯 decode / 混合批次 decode 行）。
+
+        - fp8 KV：自研内核直接读 fp8 缓存（寄存器内反量化）；
+        - bf16 + 滚动缓冲（self.rolling）：自研 bf16 paged 内核 + 每行首块
+          序号（Context.chunk_starts）——flash-attn 从表下标推 key 位置，
+          环表（表项≠逻辑块号）会错位，必须自研内核；
+        - bf16 非滚动：flash-attn kvcache（沿用）。
+        """
+        k_cache, v_cache = self.k_cache, self.v_cache
+        if self.use_fp8:
+            return paged_decode_attention_fp8(q, k_cache, v_cache,
+                                              context.block_tables,
+                                              context.context_lens,
+                                              self.k_scale, self.v_scale,
+                                              self.scale,
+                                              window=self.window_size or 0)
+        if self.rolling and context.chunk_starts is not None:
+            return paged_decode_attention_bf16(
+                q, k_cache, v_cache, context.block_tables,
+                context.context_lens, self.scale,
+                window=self.window_size or 0,
+                chunk_starts=context.chunk_starts)
+        return flash_attn_with_kvcache(q.unsqueeze(1), k_cache, v_cache,
+                                       cache_seqlens=context.context_lens,
+                                       block_table=context.block_tables,
+                                       softmax_scale=self.scale, causal=True,
+                                       window_size=self._flash_window,
+                                       softcap=self._flash_softcap).squeeze(1)

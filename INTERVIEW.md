@@ -460,8 +460,17 @@ top-1 100%（mean 0.003-0.03）。上游怪癖实证：5.15 DeepseekV2 无缓存
 优势消失）；spec-varlen MLA 走 eager 组装；fp8 KV + MLA 断言关；MoE 动态路由不能
 入 CUDA graph（与 Qwen3-MoE 同款边界）。账本修正：论文共享 rope key → 576 元素
 **7.11×**（路线图旧口径 1536/2.7× 是"每头 rope key"的 naive 假设）。
-**2b（SWA 滚动缓冲）**：per-seq 物理环 + refcount 守卫 + bf16 decode/varlen 内核
-的窗口位置偏移（进行中）。
+**2b（SWA 滚动缓冲，✅）**：`rolling_cache=True`（mistral 全层统一窗口 + bf16 +
+无投机）：块表 = 窗口内容清单（`Sequence.kv_j0` 行首逻辑块序号），驱逐
+`(front+1)·B ≤ N−W−slack` 先释放再分配（净零 free 消耗）；refcount 守卫显式
+断言（环模型不发布/不消费前缀缓存 → 块恒私有）；fp8 内核泛化 chunk_starts（
+key_pos=(j0+b)·B+t，flash 从表下标推位置会错位 → 自研 bf16 paged decode 内核，
+CUDA graph 同步支持）。验证：BM CPU 属性（3000 token 驻留覆盖 + 表长 ≤
+(W+slack−1)//B+2 + 极小池不失败）pytest 4 项；引擎 e2e（mistral toy W=512
+跨窗多轮）vs 稠密掩码参考 84 采样步 top-1 全一致。稳态内存 = 窗口 + B 余量/
+序列（decode 不随生成长度增长——vLLM 掩码式 SWA 做不到）。边界：fp8/投机/
+非统一窗口（Gemma-2）断言关；前缀缓存对滚动模型停用（重复 prompt 代价）；
+真实 7B 长解码验证未跑（时间成本）。
 
 ### 阶段 3：调度系统深读（vLLM V1 源码对照 + SLO + multi-step decode）——**第三**
 **为什么第三**：调度是 vLLM 面试核心话题；我们的实现是"V1-style 简化版"，逐行读 vLLM

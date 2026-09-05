@@ -25,12 +25,54 @@ class Block:
 
 class BlockManager:
 
-    def __init__(self, num_blocks: int, block_size: int):
+    def __init__(self, num_blocks: int, block_size: int,
+                 rolling_window: int | None = None, ring_slack: int = 0):
+        """滚动缓冲（SWA 环，rolling_window 非 None 时启用）：
+
+        每序列块表 = **窗口内容的物理清单**（按逻辑块序号升序，第 i 项是第
+        kv_j0+i 个块；旧块在解码越过窗口后立即释放，表长 ≈ 窗口/块大小 + 2）。
+        key 位置 = (kv_j0+i)·B + 槽内偏移——flash-attn 从表下标推位置会错位，
+        必须走自研内核（Context.chunk_starts 传每行 kv_j0，见 attention.py）。
+
+        环的代价（诚实标注）：①滚动序列的块**永不共享**（哈希发布/命中全关），
+        前缀缓存对这个模型失效——refcount 守卫因此恒为 1，环回收无需拉伸；
+        ②环语义需要知道"未来回读深度"：spec verify 行会回读窗口前 γ 个 key →
+        驱逐阈值留 ring_slack（= max_draft_len + 2）的余量；
+        ③纯 decode 稳态：追加块时先释放已死的前块（净零 free 消耗），
+        解码内存有界；prompt 本身的 KV 在首次越过窗口前线性增长（同 vLLM
+        掩码式 SWA），解码后逐步收敛到窗口。
+        """
         self.block_size = block_size # 块大小
         self.blocks: list[Block] = [Block(i) for i in range(num_blocks)] # 所有可用块的编号
         self.hash_to_block_id: dict[int, int] = dict() # 哈希值到块id的映射，用于前缀缓存
         self.free_block_ids: deque[int] = deque(range(num_blocks)) # 空闲块队列
         self.used_block_ids: set[int] = set() # 已使用块集合
+        self.rolling = rolling_window is not None
+        self._win = rolling_window or 0
+        self._slack = ring_slack if self.rolling else 0
+
+    # 环容量上界（= 最多在表的块数；窗口 W 内含未对齐边界 → +2 块）
+    @property
+    def ring_cap(self):
+        return (self._win + self._slack - 1) // self.block_size + 2
+
+    def _front_dead(self, seq: Sequence, n_tokens: int) -> bool:
+        """前块整块落在驱逐阈值外：块内最大 token 位置 (front+1)·B − 1
+        < n_tokens − win − slack ⇔ (front+1)·B ≤ n_tokens − win − slack。"""
+        if not seq.block_table or not self.rolling:
+            return False
+        return (seq.kv_j0 + 1) * self.block_size <= n_tokens - self._win - self._slack
+
+    def _evict_front(self, seq: Sequence):
+        """释放表头块（窗口外内容）。滚动块私有（无共享/无哈希）→ refcount 守卫：
+        理论恒 1，这里显式断言——若未来放开共享，这里就是"守卫"的落点。"""
+        assert seq.block_table
+        block = self.blocks[seq.block_table.pop(0)]
+        assert block.ref_count == 1 and block.hash == -1, \
+            "滚动块被共享/已发布哈希——环回收不安全（refcount 守卫）"
+        block.ref_count -= 1
+        self._deallocate_block(block.block_id)
+        seq.kv_j0 += 1
 
     # 修饰为类方法，不需要实例化BlockManager即可调用，第一个参数必须是cls
     @classmethod
@@ -60,6 +102,11 @@ class BlockManager:
         self.free_block_ids.append(block_id)
 
     def can_allocate(self, seq: Sequence) -> int:
+        # 滚动缓冲：前缀缓存停用（窗口内容会过期、块不共享）→ 一律全新分配
+        if self.rolling:
+            if len(self.free_block_ids) < seq.num_blocks:
+                return -1
+            return 0
         h = -1
         # 可复用块的个数
         num_cached_blocks = 0
@@ -91,6 +138,13 @@ class BlockManager:
 
     def allocate(self, seq: Sequence, num_cached_blocks: int):
         assert not seq.block_table
+        seq.kv_j0 = 0
+        if self.rolling:
+            # 全新私有块（滚动模型 can_allocate 恒返回 0）
+            for _ in range(seq.num_blocks):
+                seq.block_table.append(self._allocate_block())
+            seq.num_cached_tokens = 0
+            return
         h = -1
         for i in range(num_cached_blocks):
             token_ids = seq.block(i)
@@ -120,9 +174,15 @@ class BlockManager:
         的块由 may_append 在 decode 时正常分配，避免双重分配（num_blocks 含待写块，
         与正常 decode 路径的块表语义不一致 → swap_in 后 may_append 又加一块）。
         恢复后的 decode 步由 postprocess 的 hash_blocks 重新发布哈希。
+        滚动缓冲：decode 序列逻辑长度含已驱逐 token，块数 = **表内现存窗口块**
+        （ceil(num_cached_tokens/B) − kv_j0），kv_j0 保留（表头仍是原 chunk 序号）。
         """
         assert not seq.block_table
-        n = (seq.num_cached_tokens + self.block_size - 1) // self.block_size
+        if self.rolling:
+            n = max(1, (seq.num_cached_tokens + self.block_size - 1)
+                    // self.block_size - seq.kv_j0)
+        else:
+            n = (seq.num_cached_tokens + self.block_size - 1) // self.block_size
         for _ in range(n):
             seq.block_table.append(self._allocate_block())
 
@@ -142,6 +202,7 @@ class BlockManager:
                 self._deallocate_block(block_id)
         seq.num_cached_tokens = 0
         seq.block_table.clear()
+        seq.kv_j0 = 0
 
     def can_append(self, seq: Sequence) -> bool:
         # 需要多少个空闲块：
@@ -150,6 +211,9 @@ class BlockManager:
         need = 0
         if len(seq) % self.block_size == 1:
             need += 1
+            # 滚动缓冲：新块可以"驱逐已死前块"腾出（净零 free 消耗）
+            if self.rolling and self._front_dead(seq, len(seq) + 1):
+                need -= 1
         if (len(seq) % self.block_size != 1 and seq.block_table
                 and self.blocks[seq.block_table[-1]].ref_count > 1):
             need += 1
@@ -170,6 +234,16 @@ class BlockManager:
         for i in range(first_blk, min(last_blk, have_last) + 1):
             if self.blocks[seq.block_table[i]].ref_count > 1:
                 need += 1
+        if self.rolling and need > 0:
+            # 环驱逐可抵新块：表头在写完后窗口外的块数（纯计算，不改状态）
+            n_evict = 0
+            front = seq.kv_j0
+            while (n_evict < len(seq.block_table)
+                   and (front + 1) * self.block_size
+                   <= len(seq) + n - self._win - self._slack):
+                n_evict += 1
+                front += 1
+            need = max(0, need - n_evict)
         return len(self.free_block_ids) >= need
 
     def may_append_spec(self, seq: Sequence, n: int):
@@ -177,6 +251,14 @@ class BlockManager:
         start = len(seq) - 1
         end = start + n
         last_blk = (end - 1) // self.block_size
+        if self.rolling:
+            n_end = len(seq) + n
+            while len(seq.block_table) <= last_blk:
+                # 追加前驱逐窗口外前块（释放块回池，再取新块）
+                while self._front_dead(seq, n_end):
+                    self._evict_front(seq)
+                seq.block_table.append(self._allocate_block())
+            return
         while len(seq.block_table) <= last_blk:
             seq.block_table.append(self._allocate_block())
 
@@ -204,9 +286,18 @@ class BlockManager:
     def may_append(self, seq: Sequence):
         # 如果需要追加一个新块，则调用_allocate_block()分配一个新块，并将其加入seq.block_table中
         if len(seq) % self.block_size == 1:
+            if self.rolling:
+                # 滚动缓冲：先释放已死前块（窗口外），再取新块
+                n_end = len(seq) + 1
+                while self._front_dead(seq, n_end):
+                    self._evict_front(seq)
             seq.block_table.append(self._allocate_block())
 
     def hash_blocks(self, seq: Sequence, is_prefill: bool = True, start: int | None = None, end: int | None = None):
+        # 滚动缓冲：整模型不发布/不消费前缀缓存（窗口内容过期、表头会整块释放；
+        # decode 追加的哈希链起点在已驱逐块上也无法维护）→ 直接跳过。
+        if self.rolling:
+            return
         # 本次写入覆盖的范围：
         #   prefill: [num_cached_tokens, num_cached_tokens + num_scheduled_tokens)
         #   decode:  [num_tokens - 1, num_tokens)

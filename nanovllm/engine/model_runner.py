@@ -86,6 +86,7 @@ class ModelRunner:
                 self.quantize_fp8_weights()
         # 调用预热方法，执行一次模拟prefill来分配显存、初始化CUDA内核，并测量峰值显存
         self._finalize_mla_mode()   # MLA 模型模式收尾（decode 内核 vs 稠密兜底）
+        self._finalize_rolling()    # SWA 滚动缓冲（mistral 校验 + 层标记）
         self.warmup_model()
         # 分配KV Cache的显存空间，并根据模型层数将KV Cache引用绑定到各注意力层
         self.allocate_kv_cache()
@@ -518,6 +519,28 @@ class ModelRunner:
                   flush=True)
             self.enforce_eager = True
 
+    def _finalize_rolling(self):
+        """SWA 滚动缓冲模式收尾（阶段 2b）：校验 + 标记注意力层。
+
+        环 = 解码期窗口内容常驻、旧块到期释放（每序列块数收敛到 ~窗口/B+2）；
+        前置校验与 Scheduler 同源（mistral / bf16 KV / 无投机），并在层上置
+        rolling=True（Attention.forward 据此走自研 bf16 paged 内核）。
+        """
+        cfg = self.config
+        self._rolling = cfg.rolling_cache
+        if not self._rolling:
+            return
+        hf = cfg.hf_config
+        assert cfg.kv_cache_dtype == "auto" and cfg.speculative == "none" \
+            and hf.model_type == "mistral" and getattr(hf, "sliding_window", None)
+        windows = {m.window_size for m in self.model.modules()
+                   if hasattr(m, "window_size") and hasattr(m, "k_cache")}
+        assert windows and windows == {hf.sliding_window}, \
+            f"滚动缓冲要求全层统一窗口（{windows}）"
+        for m in self.model.modules():
+            if hasattr(m, "window_size") and hasattr(m, "k_cache"):
+                m.rolling = True
+
     def allocate_kv_cache(self):
         config = self.config
         hf_config = config.hf_config
@@ -740,6 +763,11 @@ class ModelRunner:
         if self._mla_model and self._mla_dense_decode:
             mla_dec_starts, mla_dec_idx = self._mla_rows(
                 decode_seqs, [len(seq) for seq in decode_seqs])
+        chunk_starts = None
+        if self._rolling:
+            chunk_starts = torch.tensor(
+                [seq.kv_j0 for seq in decode_seqs], dtype=torch.int32,
+                pin_memory=True).cuda(non_blocking=True)
 
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
@@ -752,7 +780,8 @@ class ModelRunner:
                     is_mixed=True, prefill_block_tables=prefill_block_tables,
                     n_prefill_tokens=n_prefill_tokens,
                     mla_pre_starts=mla_pre_starts, mla_pre_idx=mla_pre_idx,
-                    mla_dec_starts=mla_dec_starts, mla_dec_idx=mla_dec_idx)
+                    mla_dec_starts=mla_dec_starts, mla_dec_idx=mla_dec_idx,
+                    chunk_starts=chunk_starts)
         return input_ids, positions
 
     def prepare_spec(self, seqs: list[Sequence]):
@@ -898,9 +927,16 @@ class ModelRunner:
         if self._mla_model and self._mla_dense_decode:
             mla_dec_starts, mla_dec_idx = self._mla_rows(
                 seqs, [len(seq) for seq in seqs])
+        # SWA 滚动缓冲 decode 行：每行首块序号（环表 key 位置还原，见 attention.py）
+        chunk_starts = None
+        if self._rolling:
+            chunk_starts = torch.tensor(
+                [seq.kv_j0 for seq in seqs], dtype=torch.int32,
+                pin_memory=True).cuda(non_blocking=True)
         set_context(False, slot_mapping=slot_mapping, context_lens=context_lens,
                     block_tables=block_tables,
-                    mla_dec_starts=mla_dec_starts, mla_dec_idx=mla_dec_idx)
+                    mla_dec_starts=mla_dec_starts, mla_dec_idx=mla_dec_idx,
+                    chunk_starts=chunk_starts)
         return input_ids, positions
 
     def prepare_sample(self, seqs: list[Sequence]):
@@ -958,6 +994,10 @@ class ModelRunner:
             graph_vars["context_lens"].zero_()
             # 将前batch_size个context_lens赋值
             graph_vars["context_lens"][:bs] = context.context_lens
+            # SWA 环 decode：每行首块序号（滚动模型才有；其余保持捕获时全 0）
+            if context.chunk_starts is not None:
+                graph_vars["chunk_starts"].zero_()
+                graph_vars["chunk_starts"][:bs] = context.chunk_starts
             # 将block_tables拷贝至图张量相应位置
             graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
             # 重放CUDA Graph，执行模型前向
@@ -1094,6 +1134,7 @@ class ModelRunner:
         slot_mapping = torch.zeros(max_bs, dtype=torch.int32)
         context_lens = torch.zeros(max_bs, dtype=torch.int32)
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
+        chunk_starts = torch.zeros(max_bs, dtype=torch.int32)   # SWA 环 decode
         outputs = torch.zeros(max_bs, hf_config.hidden_size)
         # 定义需要捕获的batch_size列表，初始时内存池为空
         self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
@@ -1104,7 +1145,10 @@ class ModelRunner:
         for bs in reversed(self.graph_bs):
             graph = torch.cuda.CUDAGraph()
             # 设置decode阶段对应batch_size的上下文
-            set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
+            set_context(False, slot_mapping=slot_mapping[:bs],
+                        context_lens=context_lens[:bs],
+                        block_tables=block_tables[:bs],
+                        chunk_starts=chunk_starts[:bs])
             # 运行一次作为warmup，分配所需显存并初始化静态缓冲
             outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # warmup
             # CUDA Graph捕获，若已有pool则复用
@@ -1130,5 +1174,6 @@ class ModelRunner:
             slot_mapping=slot_mapping,
             context_lens=context_lens,
             block_tables=block_tables,
+            chunk_starts=chunk_starts,
             outputs=outputs,
         )
