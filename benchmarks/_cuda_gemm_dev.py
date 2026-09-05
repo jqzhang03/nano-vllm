@@ -30,6 +30,7 @@ def bench(fn, iters=20, warmup=5):
 KERNELS = {
     "v1a_fma_naive": ("gemm_fma_naive", (16, 16, 16)),
     "v2a_mma16x64": ("gemm_mma16x64", (16, 64, 32)),
+    "v2b_mma_8tile": ("gemm_v2b", (64, 128, 32)),
 }
 
 
@@ -54,7 +55,8 @@ def main():
     # 1) 正确性：多形状覆盖（小/多块路径/大 K）
     ok = True
     shapes = [(16, 16, 16), (256, 256, 128), (512, 384, 320),
-              (1024, 1024, 4096), (4096, 4096, 4096)]
+              (1024, 1024, 4096), (4096, 4096, 4096),
+              (128, 128, 64), (384, 256, 96)]
     for name, (attr, div) in KERNELS.items():
         fn = getattr(ext, attr)
         for M, N, K in shapes:

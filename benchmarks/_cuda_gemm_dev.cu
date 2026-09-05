@@ -166,7 +166,256 @@ torch::Tensor gemm_mma16x64(torch::Tensor a, torch::Tensor b) {
     return c;
 }
 
+// ---------------------------------------------------------------------------
+// v2b：多 C tile + 转置 B 片（fragment 读全变 uint32 连续）。
+// block tile = C[64 x 128]（8 warps = 2wm×4wn，warp tile 32×32 = 2×4 个 m16n8）；
+// BK=32（每步 2 个 k16 子步）。每 warp 每 k16 做 8 次独立 mma → ILP 隐藏 TC 延迟。
+// 与 v2a 差距点：每 warp 1 tile → 8 tiles；B 标量读打包 → BsT[n][k] 转置直读
+// （行距 34 = BK+2 pad，消写冲突）；加载 half4 向量化。
+// ---------------------------------------------------------------------------
+template <int BK>  // BK=32; BsT 行距 BS=BK+2（防写 bank 冲突的 pad）
+__global__ void __launch_bounds__(256) gemm_v2b_kernel(
+    const __half* __restrict__ A, const __half* __restrict__ B,
+    __half* __restrict__ C, int M, int N, int K) {
+    constexpr int BM = 64, BN = 128, BS = BK + 2;
+    __shared__ __align__(16) __half As[BM * BK];   // As[m*BK + k]，行主序
+    __shared__ __align__(16) __half BsT[BN * BS];  // BsT[n*BS + k]，转置 + pad
+    const int m0 = blockIdx.y * BM;
+    const int n0 = blockIdx.x * BN;
+    const int tid = threadIdx.x;
+    const int wm = tid >> 7;          // 0..1 → m 片（32 行）【warp>>2：8 warps = 2wm×4wn】
+    const int wn = (tid >> 5) & 3;    // 0..3 → n 片（32 列）【warp&3】
+    const int lane = tid & 31;
+
+    float acc[2][4][4];  // [A tile][B tile][frag reg]
+#pragma unroll
+    for (int at = 0; at < 2; ++at)
+#pragma unroll
+        for (int bt = 0; bt < 4; ++bt)
+#pragma unroll
+            for (int i = 0; i < 4; ++i) acc[at][bt][i] = 0.f;
+
+    for (int k0 = 0; k0 < K; k0 += BK) {
+        // --- 加载 A 片（BM×BK half；half2 向量化，8 half/线程×1 段）---
+        // BM*BK/8 = 256 段（BK=32 → 每行 4 段），恰好每线程一段
+#pragma unroll
+        for (int i = tid; i < BM * BK / 8; i += 256) {
+            int r = i / (BK / 8), c8 = i % (BK / 8);
+            const __half2* src =
+                reinterpret_cast<const __half2*>(&A[(m0 + r) * K + k0 + c8 * 8]);
+            __half2* dst = reinterpret_cast<__half2*>(&As[r * BK + c8 * 8]);
+#pragma unroll
+            for (int j = 0; j < 4; ++j) dst[j] = src[j];
+        }
+        // --- 加载 B 片并转置：读 B[k0+k][n0+n] 行主序（8 half/段），散写 BsT[n][k] ---
+        // BK×(BN/8) = 512 段 → 每线程 2 段
+        for (int i = tid; i < BK * (BN / 8); i += 256) {
+            int k = i / (BN / 8), n8 = i % (BN / 8);
+            const __half2* src =
+                reinterpret_cast<const __half2*>(&B[(k0 + k) * N + n0 + n8 * 8]);
+            __half2 v[4];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) v[j] = src[j];
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                int nn = n8 * 8 + j;
+                BsT[nn * BS + k] = (j & 1) ? __high2half(v[j >> 1])
+                                           : __low2half(v[j >> 1]);
+            }
+        }
+        __syncthreads();
+#pragma unroll
+        for (int kh = 0; kh < BK; kh += 16) {
+            // A fragment：warp 的 32 行 = 2 个 16×16 tile（at），每 tile 4 uint32
+            uint32_t a_reg[2][4];
+#pragma unroll
+            for (int at = 0; at < 2; ++at)
+#pragma unroll
+                for (int p = 0; p < 4; ++p) {
+                    int r = wm * 32 + at * 16 + (lane >> 2) + 8 * (p & 1);
+                    int cc = 2 * (lane & 3) + 8 * (p >> 1);
+                    a_reg[at][p] =
+                        *reinterpret_cast<const uint32_t*>(&As[r * BK + kh + cc]);
+                }
+            // B fragment：warp 的 32 列 = 4 个 16×8 tile（bt），每 tile 2 uint32；
+            // BsT 行内 k 连续 → (k, k+1) 对直读。k 对 = kh + 2ti + 8*q（q=0,1）
+            uint32_t b_reg[4][2];
+#pragma unroll
+            for (int bt = 0; bt < 4; ++bt) {
+                int row = wn * 32 + bt * 8 + (lane >> 2);
+                const __half* brow = &BsT[row * BS + kh + 2 * (lane & 3)];
+                b_reg[bt][0] = *reinterpret_cast<const uint32_t*>(brow);
+                b_reg[bt][1] = *reinterpret_cast<const uint32_t*>(brow + 8);
+            }
+#pragma unroll
+            for (int at = 0; at < 2; ++at)
+#pragma unroll
+                for (int bt = 0; bt < 4; ++bt)
+                    asm volatile(
+                        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+                        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                        : "+f"(acc[at][bt][0]), "+f"(acc[at][bt][1]),
+                          "+f"(acc[at][bt][2]), "+f"(acc[at][bt][3])
+                        : "r"(a_reg[at][0]), "r"(a_reg[at][1]), "r"(a_reg[at][2]),
+                          "r"(a_reg[at][3]), "r"(b_reg[bt][0]), "r"(b_reg[bt][1]));
+        }
+        __syncthreads();
+    }
+    // C 写回：warp C 区 = 行 wm*32..+32 × 列 wn*32..+32；8 个 half2 store
+    const int cb = 2 * (lane & 3);
+#pragma unroll
+    for (int at = 0; at < 2; ++at)
+#pragma unroll
+        for (int bt = 0; bt < 4; ++bt) {
+            int r = m0 + wm * 32 + at * 16 + (lane >> 2);
+            int ccol = n0 + wn * 32 + bt * 8 + cb;
+            __half* p = &C[r * N + ccol];
+            *reinterpret_cast<half2*>(p) =
+                make_half2(__float2half(acc[at][bt][0]), __float2half(acc[at][bt][1]));
+            p += 8 * N;  // C fragment l=2,3 在 +8 行（同 v2a 的写回模式）
+            *reinterpret_cast<half2*>(p) =
+                make_half2(__float2half(acc[at][bt][2]), __float2half(acc[at][bt][3]));
+        }
+}
+
+torch::Tensor gemm_v2b(torch::Tensor a, torch::Tensor b) {
+    const int M = (int)a.size(0), K = (int)a.size(1), N = (int)b.size(1);
+    TORCH_CHECK(M % 64 == 0 && N % 128 == 0 && K % 32 == 0,
+                "M%64/N%128/K%32 must be 0 for gemm_v2b");
+    auto c = torch::empty({M, N}, a.options());
+    dim3 grid(N / 128, M / 64);
+    gemm_v2b_kernel<32><<<grid, 256>>>(
+        reinterpret_cast<const __half*>(a.data_ptr<torch::Half>()),
+        reinterpret_cast<const __half*>(b.data_ptr<torch::Half>()),
+        reinterpret_cast<__half*>(c.data_ptr<torch::Half>()), M, N, K);
+    return c;
+}
+
+// ---------------------------------------------------------------------------
+// debug 探针 1：store 布局验证——(at,bt) tile 写固定值 (at*10+bt)，不跑 mma。
+// 读回后应看到：行区 wm*32+at*16、列区 wn*32+bt*8 处 = at*10+bt（fp16 可表示）。
+// ---------------------------------------------------------------------------
+__global__ void __launch_bounds__(256) store_probe_kernel(__half* C, int M, int N) {
+    constexpr int BM = 64, BN = 128;
+    const int tid = threadIdx.x;
+    const int wm = tid >> 7, wn = (tid >> 5) & 3, lane = tid & 31;
+    const int m0 = blockIdx.y * BM, n0 = blockIdx.x * BN;
+    const int cb = 2 * (lane & 3);
+#pragma unroll
+    for (int at = 0; at < 2; ++at)
+#pragma unroll
+        for (int bt = 0; bt < 4; ++bt) {
+            int r = m0 + wm * 32 + at * 16 + (lane >> 2);
+            int ccol = n0 + wn * 32 + bt * 8 + cb;
+            __half* p = &C[r * N + ccol];
+            float val = (float)(at * 10 + bt);
+            *reinterpret_cast<half2*>(p) =
+                make_half2(__float2half(val), __float2half(val));
+            p += 8 * N;
+            *reinterpret_cast<half2*>(p) =
+                make_half2(__float2half(val), __float2half(val));
+        }
+}
+
+// ---------------------------------------------------------------------------
+// debug 探针 2：只算 (at=0,bt=0) tile（复用 v2b 的加载与 frag 读路径）
+// ---------------------------------------------------------------------------
+template <int BK>
+__global__ void __launch_bounds__(256) probe_tile00_kernel(
+    const __half* __restrict__ A, const __half* __restrict__ B,
+    __half* __restrict__ C, int M, int N, int K) {
+    constexpr int BM = 64, BN = 128, BS = BK + 2;
+    __shared__ __align__(16) __half As[BM * BK];
+    __shared__ __align__(16) __half BsT[BN * BS];
+    const int m0 = blockIdx.y * BM;
+    const int n0 = blockIdx.x * BN;
+    const int tid = threadIdx.x;
+    const int wm = tid >> 7, wn = (tid >> 5) & 3, lane = tid & 31;
+    float acc[4] = {0.f, 0.f, 0.f, 0.f};
+    for (int k0 = 0; k0 < K; k0 += BK) {
+#pragma unroll
+        for (int i = tid; i < BM * BK / 8; i += 256) {
+            int r = i / (BK / 8), c8 = i % (BK / 8);
+            const __half2* src =
+                reinterpret_cast<const __half2*>(&A[(m0 + r) * K + k0 + c8 * 8]);
+            __half2* dst = reinterpret_cast<__half2*>(&As[r * BK + c8 * 8]);
+#pragma unroll
+            for (int j = 0; j < 4; ++j) dst[j] = src[j];
+        }
+        for (int i = tid; i < BK * (BN / 8); i += 256) {
+            int k = i / (BN / 8), n8 = i % (BN / 8);
+            const __half2* src =
+                reinterpret_cast<const __half2*>(&B[(k0 + k) * N + n0 + n8 * 8]);
+            __half2 v[4];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) v[j] = src[j];
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                int nn = n8 * 8 + j;
+                BsT[nn * BS + k] = (j & 1) ? __high2half(v[j >> 1])
+                                           : __low2half(v[j >> 1]);
+            }
+        }
+        __syncthreads();
+#pragma unroll
+        for (int kh = 0; kh < BK; kh += 16) {
+            uint32_t a_reg[4];
+#pragma unroll
+            for (int p = 0; p < 4; ++p) {
+                int r = wm * 32 + (lane >> 2) + 8 * (p & 1);
+                int cc = 2 * (lane & 3) + 8 * (p >> 1);
+                a_reg[p] = *reinterpret_cast<const uint32_t*>(&As[r * BK + kh + cc]);
+            }
+            uint32_t b_reg[2];
+            {
+                int row = wn * 32 + (lane >> 2);
+                const __half* brow = &BsT[row * BS + kh + 2 * (lane & 3)];
+                b_reg[0] = *reinterpret_cast<const uint32_t*>(brow);
+                b_reg[1] = *reinterpret_cast<const uint32_t*>(brow + 8);
+            }
+            asm volatile(
+                "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+                "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                : "+f"(acc[0]), "+f"(acc[1]), "+f"(acc[2]), "+f"(acc[3])
+                : "r"(a_reg[0]), "r"(a_reg[1]), "r"(a_reg[2]), "r"(a_reg[3]),
+                  "r"(b_reg[0]), "r"(b_reg[1]));
+        }
+        __syncthreads();
+    }
+    // 只存 (at=0, bt=0) tile 到 wm/wn 各自区域
+    int r = m0 + wm * 32 + (lane >> 2);
+    int ccol = n0 + wn * 32 + 2 * (lane & 3);
+    __half* p = &C[r * N + ccol];
+    *reinterpret_cast<half2*>(p) =
+        make_half2(__float2half(acc[0]), __float2half(acc[1]));
+    p += 8 * N;
+    *reinterpret_cast<half2*>(p) =
+        make_half2(__float2half(acc[2]), __float2half(acc[3]));
+}
+
+torch::Tensor store_probe(torch::Tensor c) {
+    const int M = (int)c.size(0), N = (int)c.size(1);
+    dim3 grid(N / 128, M / 64);
+    store_probe_kernel<<<grid, 256>>>(
+        reinterpret_cast<__half*>(c.data_ptr<torch::Half>()), M, N);
+    return c;
+}
+
+torch::Tensor probe_tile00(torch::Tensor a, torch::Tensor b) {
+    const int M = (int)a.size(0), K = (int)a.size(1), N = (int)b.size(1);
+    auto c = torch::zeros({M, N}, a.options());
+    dim3 grid(N / 128, M / 64);
+    probe_tile00_kernel<32><<<grid, 256>>>(
+        reinterpret_cast<const __half*>(a.data_ptr<torch::Half>()),
+        reinterpret_cast<const __half*>(b.data_ptr<torch::Half>()),
+        reinterpret_cast<__half*>(c.data_ptr<torch::Half>()), M, N, K);
+    return c;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("gemm_fma_naive", &gemm_fma_naive);
     m.def("gemm_mma16x64", &gemm_mma16x64);
+    m.def("gemm_v2b", &gemm_v2b);
+    m.def("store_probe", &store_probe);
+    m.def("probe_tile00", &probe_tile00);
 }
