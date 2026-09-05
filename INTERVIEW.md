@@ -13,7 +13,8 @@
 > 我从零实现了一个 vLLM 风格的推理引擎（约 1200 行 Python + Triton，不依赖任何推理框架）：
 > 连续批处理调度（混合 prefill/decode）、paged KV cache + 前缀缓存 + COW、CUDA graph、
 > 五条量化路径（w8a8/int4/AWQ/fp8/2:4 稀疏）、三种投机解码（n-gram/Medusa/EAGLE）、
-> KV swap 抢占、按层流式加载，并移植了 Qwen/Llama/Mistral/Gemma-2 五个模型家族。
+> KV swap 抢占、按层流式加载、Qwen3-MoE 混合专家，并移植了 Qwen/Llama/Mistral/
+> Gemma-2 五个模型家族。
 > 每个功能都与 HF 参考逐 token 对齐、与真实 vLLM 同 workload 对比过，并诚实记录了
 > 哪些场景是亏的。
 
@@ -74,10 +75,11 @@
 | 12 | KV swap 抢占 | decode 序列 KV 换 CPU，恢复 bit-exact 免重算 | bitexact 0 误差；699 次换出；**本机比重算慢（27.8 vs 11.8s）** | 机制正确 + 条件诚实的样板 |
 | 13 | Mistral（SWA）+ Gemma-2（soft-cap） | 两个新机制家族：滑动窗口 + logit soft-cap | parity top-1 100%（0.014/0.022）；Mistral 311 tok/s、Gemma2 1095 tok/s | Gemma-2 三个隐藏架构细节的定位方法论 |
 | 14 | 工程素养：脚本 argv 化 + 验证工具箱 | 22+ 脚本模型路径全部参数化；pytest 41 例 + parity/内核对照/ppl 的回归矩阵 | 新模型复用全部基准零改动 | "测量与回归"是可信度的基础设施 |
+| 15 | MoE 支持（阶段 1.5） | router top-k + 循环专家 + 量化专家 + Qwen3-MoE 端口 | **引擎 parity top-1 100%（mean diff 0.003）**；decode int4/fp8 ≈2×（专家权重带宽受限） | DeepSeek-V3 主线铺垫；两个反直觉实测（负载不均偏好集中 / toy 顶层贴边假警报） |
 
 ---
 
-## 2. 六大模块深水区（每个：机制 1 段 + 必问必答 + 数字 + 诚实结论 + 追问应对）
+## 2. 七大模块深水区（每个：机制 1 段 + 必问必答 + 数字 + 诚实结论 + 追问应对）
 
 ### 2.1 调度与批处理
 
@@ -257,6 +259,43 @@ free 文本全部 ~1.5-2×（α 0.19-0.23）；0.6B top-1 可预测性 35%。
 parity：qwen2.5-0.5B top-1 100%（mean 0.096）、mistral 100%（0.014）、gemma2 100%（0.022）。
 **诚实结论**：PP/DP/EP 未实现；TP 未实测；CacheBlend、PD 分离只在文档里设计过。
 
+### 2.7 MoE（混合专家：router + 循环专家 + 量化专家）——阶段 1.5
+
+**机制**：MoE 只替换 FFN——`mlp.gate`（router，fp32 softmax → top-k，可选
+norm_topk_prob）+ `mlp.experts.{i}.gate_proj/up_proj/down_proj`（2D per-expert，
+参数名与 HF checkpoint 直配 → loader 零改动、量化路径自动继承）；前向 = 逐专家
+循环（串行、e 升序、x dtype 累加，与 transformers eager 同语义）；router 永不量化
+（gate 精度决定路由）。权重布局决策被事实修正过：transformers 5.15 内存 3D、**存盘
+2D**（`use_experts_implementation`）。loader 的 packed 匹配改"点分段相等"（dense 的
+`up_proj` key 是 MoE `gate_up_proj` 子串，旧任意子串 replace 会毁名）。
+
+**必问必答**：
+- **Q：MoE 影响引擎哪些部分？** A：只 FFN。调度/KV/注意力/CUDA graph 结构全复用；
+  但动态 gather 形状不能进 CUDA graph（capture 烘焙形状重放静默错）→ MoE 模型
+  enforce_eager，graph 化需路由 padding（未做）。
+- **Q：怎么验证 MoE 正确性？** A：三层：①数学同构参考（全行掩码 vs gather/index_add，
+  同序累加）→ 位级一致（GPU fp16 多数 0 diff）；②CPU 单测进 pytest（49 例）；
+  ③端到端：随机 toy（4 层混合 + tie）引擎 vs transformers 5.15 同权重同 dtype →
+  **top-1 100%、mean diff 0.003**。
+- **Q：负载不均怎么办？** A：实测串行循环实现**免疫且偏好集中**（强制全 token 进一
+  专家反而快 3.6-5×；k=8 sanity ≈1）——"最慢专家"瓶颈是并行/EP 形态的问题，不是
+  串行循环的。真正的问题是固定组织税：~3.5ms/层、T 与时间无关（Python 循环 + 每
+  专家 3 次小 GEMM 启动）；去掉每专家 host sync 省一半（6.9→3.6ms）。
+- **Q：MoE 量化值不值？** A：decode 专家 GEMM 是权重带宽受限 → int4/fp8 ≈2×
+  （toy 12-seq：fp16 185-475 → int4 927-1110 tok/s，方向稳健、绝对值受 WSL 时钟
+  噪声）；层误差 fp8 6.4% / int4 12.5%（RTN 预期）。
+- **Q：transformers 的坑？** A：5.15 专家 grouped_mm 仅 sm_90+，sm_120 崩 → 回退
+  `_experts_implementation="eager"`。
+
+**数字**：parity top-1 100%（mean 0.003）；decode int4/fp8 ≈2×；量化层误差 fp8 6.4%/
+int4 12.5%（随机 toy）；顶层贴边证据：toy logits top1-top2 gap 仅 0.4-0.7σ。
+**诚实结论**：吞吐路径是 Python 循环（~3.5ms/层税、同 FLOPs 比 dense 慢 ~8×@4096）——
+生产需 fused/grouped kernel（vLLM 用 C++ 同因）；无真实模型精度数字（30B-A3B int4
+~15.5GB 超本机、V2-Lite ~8GB 可跑但 bf16 下载 ~30GB 需联网核对）。
+**追问应对**：被问"怎么快"→ grouped GEMM（按专家排序批量）、路由 padding 入图、
+shared expert（Qwen3-235B 类，transformers 5.15 已删）、EP + all-to-all 通信模型
+（§6 阶段 5 的 DeepSeek MoE 理论项）。
+
 ---
 
 ## 3. 数字速查（全部带条件：RTX 5060 Ti 16GB / WSL2 / bf16 / 单卡，除非另注）
@@ -356,27 +395,24 @@ BsT 行距 32→34 消 16-way 写冲突，实测 +86%**（bank = 行距与 32 �
 split-K 只在 block 数 < SM 数时赢（M=64 S=4 +59%），并行度够时部分和流量纯亏；
 persistent 本机全亏（0.89×，硬件 block 分发近零成本 + 动态均衡更优）。
 
-### 阶段 1.5：MoE 支持（router + 循环专家 FFN + 量化专家）——**进行中（层+模型+parity ✅）**
+### 阶段 1.5：MoE 支持（router + 循环专家 FFN + 量化专家）——**✅ 已完成**
 **为什么插入**：DeepSeek-V2-Lite（阶段 2 的目标验证模型）是 **MLA + MoE** 双机制——两个
 新东西一起排错会互相污染归因，先把 MoE 单独做干净。且 MoE 是 DeepSeek-V3 面试主线。
-**已完成**：①`layers/moe.py`（gate + `experts.{i}.gate_proj/up_proj/down_proj` 2D
-per-expert——对齐 HF checkpoint 存盘格式，loader 零改动、量化路径自动继承；router
-fp32 softmax→top-k→可选 norm_topk_prob→逐专家 gather→index_add，与全行掩码参考
-数学同构同序 → 对照位级一致，10 场景全 PASS）；②loader packed 匹配改"点分段相等"
-（防 dense 的 up_proj key 误匹配 MoE 的 gate_up_proj 命名，+3 单测）；③
-`models/qwen3_moe.py`（混合层：`(layer_idx+1)%decoder_sparse_step==0` → MoE 层，
-其余 dense；mapping 只含 qkv）+ registry；④**端到端 parity：随机 toy 模型
-（4 层混合 + tie 词表）引擎 vs transformers 5.15 同权重同 dtype → top-1 100%、
-mean diff 0.003**（顺带发现 transformers 5.15 的 grouped_mm 专家路径仅 sm_90，
-本机需 `_experts_implementation="eager"` 回退逐专家循环）。
-**待做**：量化 experts（int4/fp8）+ 吞吐/负载不均观察；真实模型边界核对。
-**具体动作**：①`layers/moe.py`：router（softmax + top-k）+ 循环专家 FFN（per-expert
-gather → 复用现有线性/量化路径 → scatter-add），与"全专家加权"参考数学同构对照
-（同求和顺序 → bit-exact）；②模型适配（DecoderLayer MLP→MoE + loader 的 per-expert
-权重 + registry）与随机小 MoE 端到端冒烟 + transformers 同构权重 parity；③quant
-experts（int4/fp8 逐 expert）与负载不均观察；④真实模型边界诚实标注（Qwen3-30B-A3B
-int4≈15.5GB 超本机；Qwen1.5-MoE-A2.7B / DeepSeek-V2-Lite ≈8GB 合适，下载前核对
-权重格式）。
+**交付（`benchmarks/_moe_report.md` + §2.7 深水区 + 主线表 row 15）**：
+①`layers/moe.py`（2D per-expert，对齐 HF checkpoint 存盘格式——transformers 5.15
+内存 3D/存盘 2D 的事实修正；loader 零改动、量化路径继承；router 永不量化）；
+②loader packed 匹配改"点分段相等"（防 dense key 子串碰撞）+ 单测；③`models/
+qwen3_moe.py` 混合层端口 + registry；④验证链：数学同构参考位级对照（10 场景）
+→ CPU 单测（pytest 49）→ **端到端 parity top-1 100%（mean 0.003）**；⑤量化专家 +
+引擎 decode **int4 ≈2-4× / fp8 ≈1.7-2.6×**（专家权重带宽受限形态）；反直觉实测：
+串行循环实现**偏好集中路由**（imbal/bal 0.2-0.28）、toy 量化 top-1 全翻是**顶层贴边**
+假警报（gap 0.4-0.7σ）；固定组织税 ~3.5ms/层（去 host sync 省一半）。
+**诚实边界**：吞吐仍是 Python 循环（同 FLOPs 比 dense 慢 ~8×@T=4096）——生产需
+fused/grouped kernel；无真实模型精度数字（30B-A3B int4≈15.5GB 超本机；V2-Lite/
+Qwen1.5-MoE-A2.7B ≈8GB 可跑，bf16 下载 ~30GB 需联网核对——脚本
+`_moe_model_probe.py` 就绪，hub 从 WSL 当前不稳）。
+**下一步**：shared expert（Qwen3-235B 类，transformers 5.15 已删该结构）；EP 理论在
+阶段 5。
 
 ### 阶段 2：MLA（DeepSeek 潜在注意力）+ SWA 滚动缓冲——**第二**
 **为什么第二**：注意力是推理的核心，DeepSeek 是当前面试必考；MLA 有真模型可验证
