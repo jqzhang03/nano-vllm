@@ -79,6 +79,30 @@ padding 浪费会占优——真段式 grouped（无 padding）是下一步候�
 （此前 loop 档 927-1110，~2.4-2.8×）；fp16/fp8 档仍在 WSL 时钟噪声带内（引擎
 绝对值不可靠，以层级基准为准）。
 
+## 4c. Triton 真段式 grouped 内核（阶段 1.5c，提交 89c210d）
+
+**内核**（`nanovllm/layers/moe_segment.py`）：offsets/counts 驱动的段式 GEMM——
+grid (e, m-tile, n-tile)，段行 = offs[e]+t·BM（掩码到 n_e），空 M-tile 提前返回，
+K 分块循环 + masked store；**无 padding**；直接复用 grouped 的 3D 堆叠转置权重
+（`_gup_t`/`_dn_t`），零额外布局拷贝；一次内核实例化服务 gate_up 与 down 两阶段。
+正确性：4 独立场景（E8/E8-big/decode-like/E128）vs 逐段 torch 参考 **rel err = 0.0
+（位级）**；`MoE(segment_backend=True)` 接入后 forward vs reference 全 PASS
+（≤3e-5）；**引擎 parity（config 字段 `moe_segment_backend`）：top-1 100%、
+mean diff 0.0031**（与 bmm 后端一致）。
+
+**实测边界**（K=512/O=1536、E∈{8,128}、sm_120；triton/bmm 时间比）：
+
+| 场景 | 比 | 解读 |
+|---|---|---|
+| 小段 decode 类（R=24-512，段 <BM） | 3.4-9.6× 慢 | BM 地板 + 空 program；bmm 的 E×max_n 更小 |
+| E=128 prefill（R=4K-32K） | 1.05-1.14× 慢 | cuBLAS 128-batch 已高效，padding 仅 1.15-1.4× |
+| **E=8 + 极长段（R=32K、段 ~4K 行）** | **0.70× 快** | batched bmm 对"少 batch 每 batch 超大"切分差；单一大 GEMM 赢 |
+
+**结论（诚实）**：真段式内核的正确性完整（位级 + 引擎 parity），但**赢的窗口很窄**
+（小 E + 极长段）；现代 MoE（E=128+）cuBLAS padded-bmm 已最优或接近。因此默认后端
+保持 padded-bmm，`segment_backend` 是显式开关（窗口内用户可用；也为无 cuBLAS
+平台/后续内核优化保留）。
+
 ## 5. 引擎吞吐（toy 12-seq × 16-token decode，多次运行取区间）
 
 | 模式 | 多运行区间（tok/s） | vs 同运行 fp16 |

@@ -289,7 +289,11 @@ norm_topk_prob）+ `mlp.experts.{i}.gate_proj/up_proj/down_proj`（2D per-expert
   （Python 循环 + 每专家启动）→ 排序分段 + **padded 批量 bmm**（gate_up 3D 融合 +
   silu·up 融合 + down）→ 0.7ms（-80%），小 T 快 4-5×、T=4096 1.9×；可组条件 =
   专家有 float 权重（未量化或 int4 dual-path 的 w_deq），纯 int4/fp8 回退循环；
-  不均衡时 padded 计算放大到 E·max_n（本尺度实测仅 +30%，大 E 需真段式内核）。
+  不均衡时 padded 计算放大到 E·max_n（本尺度实测仅 +30%）。1.5c 又写了 Triton
+  真段式内核（无 padding、位级正确、引擎 parity 100%）——实测它的赢面很窄：
+  **小 E + 极长段**才赢（E=8/R=32K 快 43%），E=128 与 cuBLAS batched 持平、
+  小段 3-10× 慢（BM 地板）→ 默认仍是 bmm，段式作显式开关。教训：内核的
+  "理论优势"要用实测边界校验，别默认换实现。
   引擎观察：int4 dual 自动走 grouped（w_deq）→ toy decode 2588 tok/s（~2.4-2.8×）。
 - **Q：transformers 的坑？** A：5.15 专家 grouped_mm 仅 sm_90+，sm_120 崩 → 回退
   `_experts_implementation="eager"`。
@@ -422,8 +426,12 @@ Qwen1.5-MoE-A2.7B ≈8GB 可跑，bf16 下载 ~30GB 需联网核对——脚本
 `_moe_model_probe.py` 就绪，hub 从 WSL 当前不稳）。
 **1.5b（fused/grouped GEMM，✅ 提交 072a1cc）**：组织税 → sort + padded 批量 bmm
 （gate_up 3D 融合）**3.8 → 0.7ms/层**（小 T 快 4-5×）；auto 后端（w_deq 可组；
-纯 int4/fp8 回退循环）；不均衡 padding 放大实测 +30%；真段式/量化 grouped 是 128+
-专家模型的下一步。
+纯 int4/fp8 回退循环）；不均衡 padding 放大实测 +30%。
+**1.5c（Triton 真段式 grouped，✅ 提交 89c210d）**：offsets/counts 驱动段式内核
+（无 padding，位级正确 + 引擎 parity top-1 100%）；实测赢的窗口 = **小 E + 极长段**
+（E=8/R=32K → 0.70× 快 43%），E=128 与 bmm 持平（1.05×）、小段 3-10× 慢 →
+默认仍 padded-bmm，segment_backend 显式开关；量化纯 int4/fp8 的段式 grouped
+（打包布局）仍未做。
 **下一步**：shared expert（Qwen3-235B 类，transformers 5.15 已删该结构）；EP 理论在
 阶段 5。
 
