@@ -374,6 +374,8 @@ class ModelRunner:
         限制：awq 内联校准需要全 fp16 模型前向（7B 装不下）→ 自动触发对
         无 awq_scales_path 的 awq 关闭；fp16（quantization=none）不自动流式
         （7B 直接 OOM，用户需显式量化 + streaming）。
+        fp16 估算用 **meta 实建** 数参数（DeepSeek 的 MoE/MLA 结构不满足通用
+        qkv/o/inter 公式——公式估算会漏掉专家权重 → 误判非流式直接建 33GB）。
         """
         cfg = self.config
         if cfg.streaming_load:
@@ -382,7 +384,11 @@ class ModelRunner:
             return False
         if cfg.quantization == "none":
             return False
-        est = self._estimate_weight_bytes()
+        from nanovllm.models.registry import get_model_class as _gmc
+        with torch.device("meta"):
+            m = _gmc(cfg.hf_config.model_type)(cfg.hf_config)
+        est = sum(p.numel() for p in m.parameters()) * cfg.hf_config.dtype.itemsize
+        del m
         free, _ = torch.cuda.mem_get_info()
         return est > free * 0.45
 
