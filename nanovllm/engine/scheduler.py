@@ -16,22 +16,25 @@ class Scheduler:
         self.max_num_batched_tokens = config.max_num_batched_tokens
         self.eos = config.eos
         self.block_size = config.kvcache_block_size
-        # ---- SWA 滚动缓冲（阶段 2b）----
+        # ---- SWA 滚动缓冲（阶段 2b/2b扩展）----
         # 前置：全层统一滑动窗口的 bf16/fp8 KV MHA 模型（当前支持 mistral）；
-        # 环驱逐需要"未来回读余量"（spec verify 会回读 γ）→ 投机组合待扩展；
-        # fp8 KV 环 decode 走自研 fp8 内核（runner 侧再校验一次）。
+        # 投机仅限 ngram（草稿只看 token 历史，verify 行环回读由 slack 余量
+        # 覆盖；medusa/eagle 的引擎侧草稿环路未在环模型上验证）；
+        # 窗口 ≥ 块大小（spec 写 span 与驱逐边界的分离性保证）。
         self.rolling = config.rolling_cache
         ring_window = None
         if self.rolling:
             hf = config.hf_config
-            assert config.speculative == "none", \
-                "rolling_cache + 投机解码未实现（verify 行窗口回读的环余量语义）"
+            assert config.speculative in ("none", "ngram"), \
+                "rolling_cache + medusa/eagle 投机未实现（verify 行窗口回读的环余量语义）"
             assert config.kv_cache_dtype in ("auto", "fp8_e4m3"), \
                 "rolling_cache 需要 bf16 或 fp8 KV"
             assert hf.model_type == "mistral", \
                 f"rolling_cache 仅支持全层统一滑动窗口模型（mistral）；model_type={hf.model_type!r}"
             ring_window = getattr(hf, "sliding_window", None)
             assert ring_window, "mistral 模型缺 sliding_window"
+            assert ring_window >= config.kvcache_block_size, \
+                "滚动缓冲要求 sliding_window ≥ 块大小（spec 写 span/驱逐分离）"
         self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size,
                                           rolling_window=ring_window,
                                           ring_slack=config.max_draft_len + 2)
@@ -218,13 +221,17 @@ class Scheduler:
                 seq.num_scheduled_tokens = n
                 seq.is_prefill = False
                 self.block_manager.may_append_spec(seq, n)
-                start = len(seq) - 1
-                first_blk = start // self.block_size
-                last_blk = (start + n - 1) // self.block_size
-                for b in range(first_blk, last_blk + 1):
-                    pair = self.block_manager.cow_block(seq, b * self.block_size)
-                    if pair is not None:
-                        self.cow_pairs.append(pair)
+                # COW 只对有共享的写块有意义；滚动块恒私有（ref=1）→ 跳过
+                # （表项下标 = 逻辑块 − kv_j0，cow_block 的 write_start//B 语义
+                # 只对非滚动表成立）
+                if not self.block_manager.rolling:
+                    start = len(seq) - 1
+                    first_blk = start // self.block_size
+                    last_blk = (start + n - 1) // self.block_size
+                    for b in range(first_blk, last_blk + 1):
+                        pair = self.block_manager.cow_block(seq, b * self.block_size)
+                        if pair is not None:
+                            self.cow_pairs.append(pair)
                 rows.append(seq)
                 used += n
         self.running.extendleft(reversed(rows))

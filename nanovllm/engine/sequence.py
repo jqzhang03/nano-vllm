@@ -35,6 +35,10 @@ class Sequence:
         # 逻辑块（chunk 序号从 0 起）；key 位置 = (kv_j0+i)*block_size + 槽内偏移
         # （自研内核按行首块序号还原位置，见 attention.py 的 chunk_starts）
         self.kv_j0 = 0
+        # 非统一窗口（Gemma-2 交替 local/global）滚动：local 层走上面的环表；
+        # global 层（全注意力）的 KV 走独立 **full 池**（普通分页、逐序列长到
+        # max_model_len，永不驱逐）——块表在 kv_table，与环表互不相干。
+        self.kv_table = []
 
         # ---- 基准计时（仅driver侧使用，不随__getstate__跨进程传输） ----
         self.t_submitted: float | None = None      # 请求加入调度队列的时间（秒）
@@ -94,12 +98,14 @@ class Sequence:
     # 跨进程同步通信
     def __getstate__(self):
         last_state = self.last_token if not self.is_prefill else self.token_ids
-        return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens, self.block_table, last_state, self.draft_tokens, self.kv_j0)
+        return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens,
+                self.block_table, last_state, self.draft_tokens, self.kv_j0, self.kv_table)
 
     def __setstate__(self, state):
         (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_scheduled_tokens,
          self.block_table, last_state, self.draft_tokens) = state[:7]
         self.kv_j0 = state[7] if len(state) > 7 else 0
+        self.kv_table = state[8] if len(state) > 8 else []
         if isinstance(last_state, list): # 如果是prefill阶段传来的
             self.token_ids = last_state
             self.last_token = self.token_ids[-1]

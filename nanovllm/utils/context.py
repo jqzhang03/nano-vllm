@@ -24,6 +24,14 @@ class Context:
     mla_pre_idx: torch.Tensor | None = None       # [Σstart] MLA前缀行槽位索引（行主序）
     mla_dec_starts: torch.Tensor | None = None    # [decode行] MLA稠密兜底行key长度（=context_lens）
     mla_dec_idx: torch.Tensor | None = None       # [Σlens] MLA decode兜底行槽位索引（行主序）
+    # ---- 阶段 2b 扩展：环 spec（投机 verify 行的环内装配，MHA 滚动模型） ----
+    # verify/prefill varlen 行的缓存段不再按 [0, start)（flash 分页语义，环表会错位），
+    # 而按"环内窗口相关行 [max(j0·B, start-W+1), start)"装配成稠密 K/V——
+    # ring_starts[r] = 该行装配的缓存行数；ring_idx = 槽位索引（行主序，Σring_starts）。
+    # 装配行段起点 = 窗口语义起点（start-W+1 截齐）→ flash varlen 的 window_size
+    # 掩码在段内下标上仍精确（装配外行本来就无资格被 attend）。
+    ring_starts: torch.Tensor | None = None
+    ring_idx: torch.Tensor | None = None
 
 _CONTEXT = Context()
 
@@ -35,14 +43,16 @@ def set_context(is_prefill, cu_seqlens_q=None, cu_seqlens_k=None, max_seqlen_q=0
                 is_mixed=False, prefill_block_tables=None, n_prefill_tokens=0,
                 is_spec=False, n_prefill_rows=0,
                 chunk_starts=None, mla_pre_starts=None, mla_pre_idx=None,
-                mla_dec_starts=None, mla_dec_idx=None):
+                mla_dec_starts=None, mla_dec_idx=None,
+                ring_starts=None, ring_idx=None):
     global _CONTEXT
     _CONTEXT = Context(is_prefill, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
                        slot_mapping, context_lens, block_tables,
                        is_mixed, prefill_block_tables, n_prefill_tokens,
                        is_spec, n_prefill_rows,
                        chunk_starts, mla_pre_starts, mla_pre_idx,
-                       mla_dec_starts, mla_dec_idx)
+                       mla_dec_starts, mla_dec_idx,
+                       ring_starts, ring_idx)
 
 def reset_context():
     global _CONTEXT

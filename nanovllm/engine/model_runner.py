@@ -96,8 +96,9 @@ class ModelRunner:
             # 投机解码：再捕获verify前向（varlen）的graph族（固定容量+空行填充）
             # MLA 模型跳过：verify 行走 cache 稠密化组装的 python 路径（动态行
             # 长度按捕获时的零值烘焙 → 重放即错）；MLA spec 步保持 eager。
+            # 滚动模型跳过：verify 行走环内装配（同样动态 python 路径）→ eager。
             if config.speculative in ("ngram", "medusa", "eagle") \
-                    and not self._mla_model:
+                    and not self._mla_model and not self._rolling:
                 self.capture_spec_graph()
 
         torch.set_default_device("cpu")
@@ -549,14 +550,16 @@ class ModelRunner:
             return
         hf = cfg.hf_config
         assert cfg.kv_cache_dtype in ("auto", "fp8_e4m3") \
-            and cfg.speculative == "none" \
+            and cfg.speculative in ("none", "ngram") \
             and hf.model_type == "mistral" and getattr(hf, "sliding_window", None), \
-            ("rolling_cache 仅支持 mistral 统一窗口 + bf16/fp8 KV + 无投机"
-             "（组合矩阵见 config.py 注释；投机+环在阶段 2b 扩展中）")
+            ("rolling_cache 仅支持 mistral 统一窗口 + bf16/fp8 KV + 无投机或 ngram"
+             "（组合矩阵见 config.py 注释）")
         windows = {m.window_size for m in self.model.modules()
                    if hasattr(m, "window_size") and hasattr(m, "k_cache")}
         assert windows and windows == {hf.sliding_window}, \
             f"滚动缓冲要求全层统一窗口（{windows}）"
+        assert hf.sliding_window >= cfg.kvcache_block_size, \
+            "滚动缓冲要求 sliding_window ≥ 块大小"
         for m in self.model.modules():
             if hasattr(m, "window_size") and hasattr(m, "k_cache"):
                 m.rolling = True
@@ -657,6 +660,39 @@ class ModelRunner:
         idx_t = torch.tensor(idx, dtype=torch.int32,
                              pin_memory=True).cuda(non_blocking=True)
         return starts_t, idx_t
+
+    # ------------------------------------------------------------------
+    # 环 spec 行信息（滚动模型 verify/混合行，阶段 2b 扩展）：
+    # 行 key 集 = **环内现存行** [kv_j0·B, end_r)（end = 该行写 span 的终点
+    # = start + n，含本步刚写入的行——装配从缓存读回，与掩码路径的"缓存行
+    # 即 key"语义同源；flash 分页语义把表项当下标，环表会错位 → 装配稠密行
+    # 喂 varlen）。段窗口掩码仍由 flash window_size 完成：段内相对下标 → 绝对
+    # 位置只差常数 j0·B，窗口左界语义不变；驱逐保证 j0·B ≤ end − W − n？
+    # 只需 j0·B ≤ start−W ≤ end−W−1（block_manager 头注），装配行数
+    # = end − j0·B ≤ W + n + ~1 块，与行数无关（环的收益点）。
+    # ------------------------------------------------------------------
+    def _ring_rows(self, seqs: list[Sequence],
+                   ends: list[int]) -> tuple[torch.Tensor | None,
+                                             torch.Tensor | None]:
+        counts = []
+        idx = []
+        for seq, end in zip(seqs, ends):
+            lo = seq.kv_j0 * self.block_size
+            n = max(0, end - lo)
+            counts.append(n)
+            if n <= 0:
+                continue
+            bt = seq.block_table
+            for p in range(lo, end):
+                idx.append(bt[p // self.block_size - seq.kv_j0] * self.block_size
+                           + p % self.block_size)
+        counts_t = torch.tensor(counts, dtype=torch.int32,
+                                pin_memory=True).cuda(non_blocking=True)
+        if not idx:
+            return counts_t, None
+        idx_t = torch.tensor(idx, dtype=torch.int32,
+                             pin_memory=True).cuda(non_blocking=True)
+        return counts_t, idx_t
 
     def prepare_prefill(self, seqs: list[Sequence]):
         """纯prefill批次（含前缀缓存读取）。返回 (input_ids, positions)。"""
@@ -811,7 +847,10 @@ class ModelRunner:
         KV恒来自缓存（cache形状 + block_tables），logits保留全部行供验收。
 
         logits语义：位置 len-1+i 的logit预测位置 len+i → 样本s_i验证草稿d_i，
-        最后一行（位置 len+γ-1）是全接受时的bonus。"""
+        最后一行（位置 len+γ-1）是全接受时的bonus。
+        滚动缓冲（环 spec）：写 span 的块表项下标须按环偏移（表项 i = 逻辑块
+        kv_j0+i）；缓存段行信息按 _ring_rows（装配 [kv_j0·B, len-1)）提供。
+        """
         input_ids = []
         positions = []
         cu_seqlens_q = [0]
@@ -819,10 +858,12 @@ class ModelRunner:
         max_seqlen_q = 0
         max_seqlen_k = 0
         slot_mapping = []
+        ends = []
         for seq in seqs:
             start = len(seq) - 1
             n = seq.num_scheduled_tokens
             end = start + n
+            ends.append(end)
             assert n == len(seq.draft_tokens) + 1
             input_ids.extend([seq.last_token] + list(seq.draft_tokens))
             positions.extend(range(start, end))
@@ -831,15 +872,16 @@ class ModelRunner:
             max_seqlen_q = max(n, max_seqlen_q)
             max_seqlen_k = max(end, max_seqlen_k)
             assert seq.block_table
+            j0 = seq.kv_j0 if self._rolling else 0
             start_block = start // self.block_size
             end_block = (end + self.block_size - 1) // self.block_size
             for i in range(start_block, end_block):
-                slot_start = seq.block_table[i] * self.block_size
+                slot_start = seq.block_table[i - j0] * self.block_size
                 if i == start_block:
                     slot_start += start % self.block_size
-                slot_end = (seq.block_table[i] * self.block_size + self.block_size
+                slot_end = (seq.block_table[i - j0] * self.block_size + self.block_size
                             if i != end_block - 1
-                            else seq.block_table[i] * self.block_size + end - i * self.block_size)
+                            else seq.block_table[i - j0] * self.block_size + end - i * self.block_size)
                 slot_mapping.extend(range(slot_start, slot_end))
         block_tables = self.prepare_block_tables(seqs)
         # MLA verify 行：缓存区 [0, len-1)（本步 fresh = query 自身，不入前缀行）
@@ -847,6 +889,10 @@ class ModelRunner:
         if self._mla_model:
             mla_pre_starts, mla_pre_idx = self._mla_rows(
                 seqs, [len(seq) - 1 for seq in seqs])
+        # 环 spec 行：装配 [kv_j0·B, end)（MHA 滚动模型专用，见 _ring_rows）
+        ring_starts = ring_idx = None
+        if self._rolling:
+            ring_starts, ring_idx = self._ring_rows(seqs, ends)
 
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
@@ -856,7 +902,8 @@ class ModelRunner:
         set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
                     slot_mapping, None, block_tables,
                     is_spec=True,
-                    mla_pre_starts=mla_pre_starts, mla_pre_idx=mla_pre_idx)
+                    mla_pre_starts=mla_pre_starts, mla_pre_idx=mla_pre_idx,
+                    ring_starts=ring_starts, ring_idx=ring_idx)
         return input_ids, positions
 
     def _prepare_mixed_spec(self, seqs: list[Sequence]):
@@ -874,6 +921,7 @@ class ModelRunner:
         max_seqlen_q = 0
         max_seqlen_k = 0
         slot_mapping = []
+        ends = []
         for seq in seqs:
             if seq.is_prefill:
                 start = seq.num_cached_tokens
@@ -885,6 +933,7 @@ class ModelRunner:
                 assert n == len(seq.draft_tokens) + 1
                 tokens = [seq.last_token] + list(seq.draft_tokens)
             end = start + n
+            ends.append(end)
             input_ids.extend(tokens)
             positions.extend(range(start, end))
             cu_seqlens_q.append(cu_seqlens_q[-1] + n)
@@ -892,15 +941,16 @@ class ModelRunner:
             max_seqlen_q = max(n, max_seqlen_q)
             max_seqlen_k = max(end, max_seqlen_k)
             assert seq.block_table
+            j0 = seq.kv_j0 if self._rolling else 0
             start_block = start // self.block_size
             end_block = (end + self.block_size - 1) // self.block_size
             for i in range(start_block, end_block):
-                slot_start = seq.block_table[i] * self.block_size
+                slot_start = seq.block_table[i - j0] * self.block_size
                 if i == start_block:
                     slot_start += start % self.block_size
-                slot_end = (seq.block_table[i] * self.block_size + self.block_size
+                slot_end = (seq.block_table[i - j0] * self.block_size + self.block_size
                             if i != end_block - 1
-                            else seq.block_table[i] * self.block_size + end - i * self.block_size)
+                            else seq.block_table[i - j0] * self.block_size + end - i * self.block_size)
                 slot_mapping.extend(range(slot_start, slot_end))
         block_tables = self.prepare_block_tables(seqs)
         n_prefill_tokens = cu_seqlens_q[n_prefill_rows]
@@ -914,6 +964,10 @@ class ModelRunner:
                 else:
                     starts.append(len(seq) - 1)
             mla_pre_starts, mla_pre_idx = self._mla_rows(seqs, starts)
+        # 环 spec（滚动模型）：全批次行统一按 _ring_rows 装配（ends 逐行收集）
+        ring_starts = ring_idx = None
+        if self._rolling:
+            ring_starts, ring_idx = self._ring_rows(seqs, ends)
 
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
@@ -925,7 +979,8 @@ class ModelRunner:
                     is_mixed=True, prefill_block_tables=block_tables,
                     n_prefill_tokens=n_prefill_tokens, is_spec=True,
                     n_prefill_rows=n_prefill_rows,
-                    mla_pre_starts=mla_pre_starts, mla_pre_idx=mla_pre_idx)
+                    mla_pre_starts=mla_pre_starts, mla_pre_idx=mla_pre_idx,
+                    ring_starts=ring_starts, ring_idx=ring_idx)
         return input_ids, positions
 
     def prepare_decode(self, seqs: list[Sequence]):

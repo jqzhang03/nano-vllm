@@ -26,7 +26,8 @@ class Block:
 class BlockManager:
 
     def __init__(self, num_blocks: int, block_size: int,
-                 rolling_window: int | None = None, ring_slack: int = 0):
+                 rolling_window: int | None = None, ring_slack: int = 0,
+                 no_share: bool = False):
         """滚动缓冲（SWA 环，rolling_window 非 None 时启用）：
 
         每序列块表 = **窗口内容的物理清单**（按逻辑块序号升序，第 i 项是第
@@ -41,6 +42,10 @@ class BlockManager:
         ③纯 decode 稳态：追加块时先释放已死的前块（净零 free 消耗），
         解码内存有界；prompt 本身的 KV 在首次越过窗口前线性增长（同 vLLM
         掩码式 SWA），解码后逐步收敛到窗口。
+
+        no_share（非统一窗口环的 full 池）：普通分页 + 永不驱逐，但同样
+        不发布/不消费前缀缓存（块恒私有、无 COW）——与环表共享同一套
+        "每序列私有分页"记账，只是少了驱逐。
         """
         self.block_size = block_size # 块大小
         self.blocks: list[Block] = [Block(i) for i in range(num_blocks)] # 所有可用块的编号
@@ -48,6 +53,7 @@ class BlockManager:
         self.free_block_ids: deque[int] = deque(range(num_blocks)) # 空闲块队列
         self.used_block_ids: set[int] = set() # 已使用块集合
         self.rolling = rolling_window is not None
+        self.no_share = no_share
         self._win = rolling_window or 0
         self._slack = ring_slack if self.rolling else 0
 
@@ -102,8 +108,8 @@ class BlockManager:
         self.free_block_ids.append(block_id)
 
     def can_allocate(self, seq: Sequence) -> int:
-        # 滚动缓冲：前缀缓存停用（窗口内容会过期、块不共享）→ 一律全新分配
-        if self.rolling:
+        # 滚动缓冲 / no_share：前缀缓存停用（窗口内容会过期、块不共享）→ 一律全新分配
+        if self.rolling or self.no_share:
             if len(self.free_block_ids) < seq.num_blocks:
                 return -1
             return 0
@@ -139,8 +145,8 @@ class BlockManager:
     def allocate(self, seq: Sequence, num_cached_blocks: int):
         assert not seq.block_table
         seq.kv_j0 = 0
-        if self.rolling:
-            # 全新私有块（滚动模型 can_allocate 恒返回 0）
+        if self.rolling or self.no_share:
+            # 全新私有块（滚动/no_share 模型 can_allocate 恒返回 0）
             for _ in range(seq.num_blocks):
                 seq.block_table.append(self._allocate_block())
             seq.num_cached_tokens = 0
@@ -224,15 +230,22 @@ class BlockManager:
 
         需要：span 覆盖到的新块数 + span 内被共享块（ref_count>1）的COW副本数。
         n 可以跨块（γ+1 个 token 越过块边界），与 can_append 的 1-token 特例不同。
+        滚动缓冲：表项 i = 逻辑块 kv_j0+i → "已有末块"须按逻辑块号比较
+        （kv_j0 + 表长 − 1），驱逐可抵新块（纯计算，不改状态）。
         """
         start = len(seq) - 1
         end = start + n
         first_blk = start // self.block_size
         last_blk = (end - 1) // self.block_size
-        have_last = len(seq.block_table) - 1
+        if self.rolling:
+            have_last = seq.kv_j0 + len(seq.block_table) - 1
+        else:
+            have_last = len(seq.block_table) - 1
         need = max(0, last_blk - have_last)
         for i in range(first_blk, min(last_blk, have_last) + 1):
-            if self.blocks[seq.block_table[i]].ref_count > 1:
+            # 环表项 i 的物理块在表内下标 i - kv_j0（环块恒私有 ref=1，防御性）
+            ti = i - (seq.kv_j0 if self.rolling else 0)
+            if self.blocks[seq.block_table[ti]].ref_count > 1:
                 need += 1
         if self.rolling and need > 0:
             # 环驱逐可抵新块：表头在写完后窗口外的块数（纯计算，不改状态）
@@ -247,13 +260,17 @@ class BlockManager:
         return len(self.free_block_ids) >= need
 
     def may_append_spec(self, seq: Sequence, n: int):
-        """为写span [len-1, len-1+n) 分配可能需要的额外块。"""
+        """为写span [len-1, len-1+n) 分配可能需要的额外块。
+
+        滚动缓冲：表长须覆盖到逻辑块 last_blk → 追加到
+        表长 > last_blk − kv_j0；追加前先驱逐窗口外前块（净零 free 消耗）。
+        """
         start = len(seq) - 1
         end = start + n
         last_blk = (end - 1) // self.block_size
         if self.rolling:
             n_end = len(seq) + n
-            while len(seq.block_table) <= last_blk:
+            while len(seq.block_table) <= last_blk - seq.kv_j0:
                 # 追加前驱逐窗口外前块（释放块回池，再取新块）
                 while self._front_dead(seq, n_end):
                     self._evict_front(seq)
@@ -294,8 +311,8 @@ class BlockManager:
             seq.block_table.append(self._allocate_block())
 
     def hash_blocks(self, seq: Sequence, is_prefill: bool = True, start: int | None = None, end: int | None = None):
-        # 滚动缓冲：整模型不发布/不消费前缀缓存（窗口内容过期、表头会整块释放；
-        # decode 追加的哈希链起点在已驱逐块上也无法维护）→ 直接跳过。
+        # 滚动缓冲 / no_share：整模型不发布/不消费前缀缓存（窗口内容过期、表头会整块
+        # 释放；decode 追加的哈希链起点在已驱逐块上也无法维护）→ 直接跳过。
         if self.rolling:
             return
         # 本次写入覆盖的范围：

@@ -120,6 +120,59 @@ def paged_decode_attention_fp8_kernel(
              o.to(q_ptr.dtype.element_ty), mask=g_valid)
 
 
+def _tl_dtype(dt: torch.dtype):
+    return {torch.float16: tl.float16, torch.bfloat16: tl.bfloat16,
+            torch.float32: tl.float32}[dt]
+
+
+# ---------------------------------------------------------------------------
+# KV 行 gather（环 spec/verify 行装配）：按槽位索引拷贝行并（fp8 KV）按层
+# scale 反量化。torch index_select 不支持 float8 → fp8 缓存走自研内核；
+# bf16 缓存直接 index_select（无算术，位级不变）。
+# ---------------------------------------------------------------------------
+@triton.jit
+def kv_rows_dequant_gather_kernel(
+    k_ptr, v_ptr, idx_ptr, k_out_ptr, v_out_ptr,
+    k_scale, v_scale,
+    HD: tl.constexpr, BLOCK: tl.constexpr, DT: tl.constexpr,
+):
+    r = tl.program_id(0)
+    slot = tl.load(idx_ptr + r)
+    base = slot * HD
+    offs = tl.arange(0, BLOCK)
+    m = offs < HD
+    k = tl.load(k_ptr + base + offs, mask=m, other=0.0)
+    v = tl.load(v_ptr + base + offs, mask=m, other=0.0)
+    tl.store(k_out_ptr + r * HD + offs,
+             (k.to(tl.float32) * k_scale).to(DT), mask=m)
+    tl.store(v_out_ptr + r * HD + offs,
+             (v.to(tl.float32) * v_scale).to(DT), mask=m)
+
+
+def kv_rows_gather(k_cache: torch.Tensor, v_cache: torch.Tensor,
+                   idx: torch.Tensor, k_scale: float, v_scale: float,
+                   out_dtype: torch.dtype) -> tuple[torch.Tensor, torch.Tensor]:
+    """按行槽位索引 gather K/V 行（行序 = idx 序；fp8 缓存带反量化）。"""
+    n = idx.numel()
+    kvh, hd = k_cache.shape[2], k_cache.shape[3]
+    if n == 0:
+        return (k_cache.new_empty(0, kvh, hd),
+                v_cache.new_empty(0, kvh, hd))
+    if k_cache.dtype == torch.float8_e4m3fn:
+        k_out = torch.empty(n, kvh, hd, device=k_cache.device, dtype=out_dtype)
+        v_out = torch.empty(n, kvh, hd, device=k_cache.device, dtype=out_dtype)
+        hd_all = kvh * hd
+        kv_rows_dequant_gather_kernel[(n,)](
+            k_cache, v_cache, idx, k_out, v_out, k_scale, v_scale,
+            HD=hd_all, BLOCK=triton.next_power_of_2(hd_all),
+            DT=_tl_dtype(out_dtype))
+        return k_out, v_out
+    flat_k = k_cache.reshape(-1, kvh, hd)
+    flat_v = v_cache.reshape(-1, kvh, hd)
+    return (flat_k.index_select(0, idx.long()),
+            flat_v.index_select(0, idx.long()))
+
+
 def _zeros_chunk(bs: int, device) -> torch.Tensor:
     return torch.zeros(bs, dtype=torch.int32, device=device)
 
@@ -328,6 +381,11 @@ class Attention(nn.Module):
             else:
                 kq, vq = k, v
             store_kvcache(kq, vq, k_cache, v_cache, context.slot_mapping)
+        # 环 spec/verify 行（滚动 MHA 模型 + 投机）：行 key 集 = 环内现存行
+        # [kv_j0·B, end)（含本步刚写行）装配成稠密 K/V 喂 varlen——flash 分页
+        # 无法表达环表（表项≠逻辑块号），见 _ring_varlen。
+        if context.ring_starts is not None:
+            return self._ring_varlen(q)
         if context.is_mixed:
             # 混合批次（vLLM V1同款调度）：prefill行在前、decode行在后。
             # 写路径已在上方覆盖全批次（slot_mapping含两组槽位）。
@@ -396,6 +454,34 @@ class Attention(nn.Module):
         else:    # decode
             o = self._decode_rows(q, context)
         return o
+
+    def _ring_varlen(self, q: torch.Tensor) -> torch.Tensor:
+        """环 spec/verify 行：行 key 集 = 环内现存行 [kv_j0·B, end)（含本步刚
+        写行——store 已先行，缓存即 key，与掩码路径同源）。装配 = 按槽位索引
+        gather 连续行（每行一段、行主序），cu_k 差分 = 各行 key 行数。
+
+        flash 的 window_size（left=W-1）在**段内相对下标**上掩码：段起点 j0·B
+        是常数 → 相对窗口左界精确等价于绝对位置窗口（key ≥ pos−W+1），无需
+        逐行位置偏移参数（这正是环 decode 无法用 flash 而 verify 装配后可以
+        的原因——装配把环内行还原成"位置连续段"）。
+        """
+        context = get_context()
+        cu_q = context.cu_seqlens_q
+        counts = context.ring_starts.long()
+        cu_k = torch.cat(
+            [torch.zeros(1, dtype=torch.int32, device=q.device),
+             torch.cumsum(counts, 0)]).to(torch.int32)
+        kk, vv = kv_rows_gather(self.k_cache, self.v_cache,
+                                context.ring_idx,
+                                self.k_scale, self.v_scale, q.dtype)
+        max_q = int((cu_q[1:] - cu_q[:-1]).max().item())
+        max_k = int(counts.max().item())
+        return flash_attn_varlen_func(
+            q, kk, vv,
+            max_seqlen_q=max_q, cu_seqlens_q=cu_q,
+            max_seqlen_k=max_k, cu_seqlens_k=cu_k,
+            softmax_scale=self.scale, causal=True,
+            window_size=self._flash_window, softcap=self._flash_softcap)
 
     def _decode_rows(self, q: torch.Tensor, context) -> torch.Tensor:
         """decode 组（纯 decode / 混合批次 decode 行）。
