@@ -11,17 +11,19 @@ from typing import Type
 from torch import nn
 
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
+from nanovllm.models.qwen3_moe import Qwen3MoeForCausalLM
 from nanovllm.models.qwen2 import Qwen2ForCausalLM
 from nanovllm.models.llama3 import Llama3ForCausalLM
 from nanovllm.models.mistral import MistralForCausalLM
 from nanovllm.models.gemma2 import Gemma2ForCausalLM
 
 # model_type（HF config.model_type）→ 模型类。
-# 已支持：qwen3 / qwen2（Qwen2.5 系列同属 qwen2）/ llama（Llama-3.x）/
-# mistral（Mistral-7B-v0.x，滑动窗口注意力 SWA）/ gemma2（Gemma-2，交替
-# local/global 注意力 + attn logit soft-cap + final logit soft-cap）。
+# 已支持：qwen3 / qwen3_moe（MoE，阶段 1.5）/ qwen2（Qwen2.5 系列同属 qwen2）/
+# llama（Llama-3.x）/ mistral（Mistral-7B-v0.x，滑动窗口注意力 SWA）/
+# gemma2（Gemma-2，交替 local/global 注意力 + attn logit soft-cap + final logit soft-cap）。
 _MODEL_REGISTRY: dict[str, Type[nn.Module]] = {
     "qwen3": Qwen3ForCausalLM,
+    "qwen3_moe": Qwen3MoeForCausalLM,
     "qwen2": Qwen2ForCausalLM,
     "llama": Llama3ForCausalLM,
     "mistral": MistralForCausalLM,

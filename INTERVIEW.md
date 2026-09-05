@@ -356,9 +356,20 @@ BsT 行距 32→34 消 16-way 写冲突，实测 +86%**（bank = 行距与 32 �
 split-K 只在 block 数 < SM 数时赢（M=64 S=4 +59%），并行度够时部分和流量纯亏；
 persistent 本机全亏（0.89×，硬件 block 分发近零成本 + 动态均衡更优）。
 
-### 阶段 1.5：MoE 支持（router + 循环专家 FFN + 量化专家）——**进行中**
+### 阶段 1.5：MoE 支持（router + 循环专家 FFN + 量化专家）——**进行中（层+模型+parity ✅）**
 **为什么插入**：DeepSeek-V2-Lite（阶段 2 的目标验证模型）是 **MLA + MoE** 双机制——两个
 新东西一起排错会互相污染归因，先把 MoE 单独做干净。且 MoE 是 DeepSeek-V3 面试主线。
+**已完成**：①`layers/moe.py`（gate + `experts.{i}.gate_proj/up_proj/down_proj` 2D
+per-expert——对齐 HF checkpoint 存盘格式，loader 零改动、量化路径自动继承；router
+fp32 softmax→top-k→可选 norm_topk_prob→逐专家 gather→index_add，与全行掩码参考
+数学同构同序 → 对照位级一致，10 场景全 PASS）；②loader packed 匹配改"点分段相等"
+（防 dense 的 up_proj key 误匹配 MoE 的 gate_up_proj 命名，+3 单测）；③
+`models/qwen3_moe.py`（混合层：`(layer_idx+1)%decoder_sparse_step==0` → MoE 层，
+其余 dense；mapping 只含 qkv）+ registry；④**端到端 parity：随机 toy 模型
+（4 层混合 + tie 词表）引擎 vs transformers 5.15 同权重同 dtype → top-1 100%、
+mean diff 0.003**（顺带发现 transformers 5.15 的 grouped_mm 专家路径仅 sm_90，
+本机需 `_experts_implementation="eager"` 回退逐专家循环）。
+**待做**：量化 experts（int4/fp8）+ 吞吐/负载不均观察；真实模型边界核对。
 **具体动作**：①`layers/moe.py`：router（softmax + top-k）+ 循环专家 FFN（per-expert
 gather → 复用现有线性/量化路径 → scatter-add），与"全专家加权"参考数学同构对照
 （同求和顺序 → bit-exact）；②模型适配（DecoderLayer MLP→MoE + loader 的 per-expert

@@ -10,11 +10,21 @@ def default_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor):
 
 
 def _resolve_tensor(model: nn.Module, packed_modules_mapping: dict, weight_name: str):
-    """把 HF 张量名解析为 (param_name, shard_id)，与 eager 加载同一套 packed 映射。"""
-    for k in packed_modules_mapping:
-        if k in weight_name:
-            v, shard_id = packed_modules_mapping[k]
-            return weight_name.replace(k, v), shard_id
+    """把 HF 张量名解析为 (param_name, shard_id)，与 eager 加载同一套 packed 映射。
+
+    匹配规则：packed key 必须等于权重名的**最后一个点分段**（如 "...mlp.gate_proj.weight"
+    的段 "gate_proj"）。不能是任意子串——否则 dense 的 "up_proj" key 会误匹配 MoE 的
+    3D 权重 "experts.gate_up_proj"（含 "up_proj" 子串）。段匹配对既有 5 个模型家族
+    等价（它们的 key 都落在末段），并让 3D 专家权重名（末段 gate_up_proj/down_proj）
+    直通。
+    """
+    parts = weight_name.split(".")
+    if len(parts) >= 2 and parts[-1] in ("weight", "bias"):
+        seg = parts[-2]
+        if seg in packed_modules_mapping:
+            v, shard_id = packed_modules_mapping[seg]
+            parts[-2] = v
+            return ".".join(parts), shard_id
     return weight_name, None
 
 
