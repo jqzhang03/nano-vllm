@@ -63,6 +63,8 @@ class MoE(nn.Module):
                  num_experts: int, top_k: int, norm_topk_prob: bool = False):
         super().__init__()
         assert num_experts > 0 and 1 <= top_k <= num_experts
+        self.hidden_size = hidden_size
+        self.moe_intermediate_size = moe_intermediate_size
         self.num_experts = num_experts
         self.top_k = top_k
         self.norm_topk_prob = norm_topk_prob
@@ -71,6 +73,10 @@ class MoE(nn.Module):
         self.experts = nn.ModuleList(
             [ExpertFFN(hidden_size, moe_intermediate_size)
              for _ in range(num_experts)])
+        # grouped 后端状态（首次 forward 惰性判定；见 _ensure_grouped_weights）
+        self._gup_t = None    # [E, H, 2I] 3D 堆叠转置（gate/up 融合）
+        self._dn_t = None     # [E, I, H] 3D 堆叠转置
+        self._grouped_ok = None  # None=未判定；True/False=可用/回退 loop
 
     def _route(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """fp32 路由：返回 (topk 概率 [T,k]（x dtype，可能已归一）, 专家号 [T,k])。"""
@@ -81,7 +87,47 @@ class MoE(nn.Module):
             top_vals = top_vals / top_vals.sum(dim=-1, keepdim=True)
         return top_vals.to(x.dtype), top_idx
 
+    # ------------------------------------------------------------------
+    # 权重可组性：所有专家的三类线性都有 float 权重（未量化，或 int4
+    # dual-path 的 w_deq bf16 副本）→ 可堆叠 3D 走 grouped 批量 GEMM。
+    # 纯 int4 / fp8 / w8a8 / sparse24（权重是打包/定点格式，无 float 视图）
+    # → 回退逐专家循环（每专家走各自的量化内核）。
+    # ------------------------------------------------------------------
+    def _float_weight(self, lin: nn.Module) -> torch.Tensor | None:
+        w = getattr(lin, "w_deq", None)
+        if w is not None:
+            return w
+        if not (lin.int4 or lin.fp8 or lin.w8a8 or lin.sparse24):
+            return lin.weight
+        return None
+
+    def _ensure_grouped_weights(self) -> bool:
+        if self._grouped_ok is not None:
+            return self._grouped_ok
+        w_g = [self._float_weight(e.gate_proj) for e in self.experts]
+        w_u = [self._float_weight(e.up_proj) for e in self.experts]
+        w_d = [self._float_weight(e.down_proj) for e in self.experts]
+        ok = all(w is not None for w in w_g + w_u + w_d)
+        if ok:
+            dtype = w_g[0].dtype
+            dev = w_g[0].device
+            # [E, 2I, H] → 转置 [E, H, 2I]（bmm 用：dst @ Wt）
+            gup = torch.stack([torch.cat([w_g[e], w_u[e]], dim=0)
+                               for e in range(self.num_experts)])
+            dn = torch.stack([w_d[e] for e in range(self.num_experts)])
+            self._gup_t = gup.transpose(1, 2).contiguous().to(dtype).to(dev)
+            self._dn_t = dn.transpose(1, 2).contiguous().to(dtype).to(dev)
+        self._grouped_ok = ok
+        return ok
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """自动后端：float 权重可组 → grouped 批量 GEMM；否则逐专家循环。"""
+        if self._ensure_grouped_weights():
+            return self._forward_grouped(x)
+        return self._forward_loop(x)
+
+    def _forward_loop(self, x: torch.Tensor) -> torch.Tensor:
+        """逐专家循环后端（量化专家回退路径；与 reference 同序对照源）。"""
         T = x.size(0)
         top_vals, top_idx = self._route(x)                   # [T,k]
         idx_flat = top_idx.reshape(-1)                       # [T*k]
@@ -92,11 +138,60 @@ class MoE(nn.Module):
         for e in range(self.num_experts):
             m = idx_flat == e                                # 谁路由给了 e
             # 无条件执行（不做 bool(m.any()) host sync）：空专家 → 空 gather/FFN/add
-            # = GPU 侧无操作，但省掉每专家一次 device→host 同步（~ms 级固定税，
-            # 见 benchmarks/_moe_imbalance.py 的 T 扫描：时间与 T 无关）
+            # = GPU 侧无操作，但省掉每专家一次 device→host 同步
             xs = x.index_select(0, tgt[m])                   # [n_e, H] gather
             ys = self.experts[e](xs)                         # 复用量化路径
             out.index_add_(0, tgt[m], ys * w_flat[m][:, None])
+        return out
+
+    # ------------------------------------------------------------------
+    # grouped 批量后端（消除逐专家 Python 循环/启动）：
+    #   top-k 路由 → 按专家稳定排序（段连续）→ 排序行 gather →
+    #   padded [E, max_n, H]（排序拼接前缀即各段；空段占 0 行）→
+    #   单次批量 bmm × 3D gate_up（gate/up 融合）→ silu(g)·u →
+    #   单次批量 bmm × 3D down → 反排 → 加权 index_add（token 的 k 个 slot 合并）。
+    # 代价：padded 批量把计算放大到 E·max_n 行（均衡路由 max≈Tk/E → 近 1×；
+    # 不均衡时 = E·max/(T·k) 浪费——见 benchmarks/_moe_grouped_bench.py）。
+    # 与 loop 的差异：同一 token 的 k 个 slot 累加顺序 = slot 序（概率降序），
+    # 非 e 升序 → fp 尾差级（对照用阈值）。
+    # ------------------------------------------------------------------
+    def _forward_grouped(self, x: torch.Tensor) -> torch.Tensor:
+        T = x.size(0)
+        k = self.top_k
+        top_vals, top_idx = self._route(x)                   # [T,k]
+        idx_flat = top_idx.reshape(-1)                       # [R], R = T*k
+        w_flat = top_vals.reshape(-1)
+        tgt = (torch.arange(T, device=x.device)
+               .unsqueeze(1).expand(T, k).reshape(-1))
+        R = idx_flat.numel()
+        # 1) 按专家稳定排序 → 段连续；gather 排序后的行与概率
+        order = torch.argsort(idx_flat, stable=True)         # [R]
+        xs = x.index_select(0, tgt[order])                   # [R, H] 段连续（e 升序）
+        # 2) padded [E, max_n, H]：每段放回自己的行带（e*max_n + 段内偏移），
+        # 其余行保持 0（padding 行输入 0 → 批量 GEMM 输出精确 0）
+        counts = torch.bincount(idx_flat[order], minlength=self.num_experts)
+        max_n = int(counts.max()) if R else 0
+        if R == 0 or max_n == 0:
+            return torch.zeros_like(x)
+        E = self.num_experts
+        e_row = idx_flat[order].to(torch.long)               # [R] 每行专家（非降）
+        seg_start = torch.cumsum(counts, 0) - counts         # [E] 每段在 xs 的起始
+        pos = e_row * max_n + (torch.arange(R, device=x.device)
+                               - seg_start[e_row])           # [R] dst 平面行号
+        dst = torch.zeros(E, max_n, x.size(1), device=x.device, dtype=x.dtype)
+        dst.reshape(-1, x.size(1)).index_copy_(0, pos, xs)
+        # 3) fused gate_up 批量 GEMM + silu·up（padding 行输入 0 → 输出精确 0）
+        gup = torch.bmm(dst, self._gup_t)                    # [E, max_n, 2I]
+        g, u = gup.chunk(2, dim=-1)
+        h = torch.nn.functional.silu(g) * u                  # [E, max_n, I]
+        out3 = torch.bmm(h, self._dn_t)                      # [E, max_n, H]
+        ys = out3.reshape(-1, x.size(1))[pos]                # 按平面行号取回 → xs 序
+        # 4) 反排回 (t, slot) 序 → 加权 index_add 合并同一 token 的 slot
+        inv = torch.empty_like(order)
+        inv[order] = torch.arange(R, device=x.device)
+        y_slot = ys[inv] * w_flat[:, None]
+        out = torch.zeros_like(x)
+        out.index_add_(0, tgt, y_slot)
         return out
 
     @torch.no_grad()
