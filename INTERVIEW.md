@@ -455,22 +455,47 @@ top-1 100%（mean 0.003-0.03）。上游怪癖实证：5.15 DeepseekV2 无缓存
 无 .weight）；flash varlen 要求 v head dim == k → v 零填充到 192 再截断。
 **顺带修复真实 bug**：RMSNorm fp32 下 x.float() 别名输入 → mul_ 原位归一化残差流
 中间张量（bf16 引擎无感、CPU fp32 参考错——逐层对照定位）。
-**诚实边界**：真实 V2-Lite checkpoint 未验证（hub 超时，bf16≈30GB，脚本待命）；
-纯 int4/fp8 无 float 视图 → decode 走稠密兜底（逐层整段稠密化，自动 eager，带宽
-优势消失）；spec-varlen MLA 走 eager 组装；fp8 KV + MLA 断言关；MoE 动态路由不能
-入 CUDA graph（与 Qwen3-MoE 同款边界）。账本修正：论文共享 rope key → 576 元素
-**7.11×**（路线图旧口径 1536/2.7× 是"每头 rope key"的 naive 假设）。
+**诚实边界（2a 时代，已逐一消除，见 2b-ext）**：真实 V2-Lite checkpoint 未验证
+（hub 超时，bf16≈30GB，脚本待命）；纯 int4/fp8 无 float 视图 → decode 走稠密兜底
+（自动 eager，带宽优势消失）；fp8 KV + MLA 断言关。MoE 动态路由不能入 CUDA graph
+（与 Qwen3-MoE 同款边界）。账本修正：论文共享 rope key → 576 元素 **7.11×**
+（路线图旧口径 1536/2.7× 是"每头 rope key"的 naive 假设）。
 **2b（SWA 滚动缓冲，✅）**：`rolling_cache=True`（mistral 全层统一窗口 + bf16 +
 无投机）：块表 = 窗口内容清单（`Sequence.kv_j0` 行首逻辑块序号），驱逐
 `(front+1)·B ≤ N−W−slack` 先释放再分配（净零 free 消耗）；refcount 守卫显式
 断言（环模型不发布/不消费前缀缓存 → 块恒私有）；fp8 内核泛化 chunk_starts（
 key_pos=(j0+b)·B+t，flash 从表下标推位置会错位 → 自研 bf16 paged decode 内核，
-CUDA graph 同步支持）。验证：BM CPU 属性（3000 token 驻留覆盖 + 表长 ≤
-(W+slack−1)//B+2 + 极小池不失败）pytest 4 项；引擎 e2e（mistral toy W=512
-跨窗多轮）vs 稠密掩码参考 84 采样步 top-1 全一致。稳态内存 = 窗口 + B 余量/
-序列（decode 不随生成长度增长——vLLM 掩码式 SWA 做不到）。边界：fp8/投机/
-非统一窗口（Gemma-2）断言关；前缀缓存对滚动模型停用（重复 prompt 代价）；
-真实 7B 长解码验证未跑（时间成本）。
+CUDA graph 同步支持）。验证：BM CPU 属性 pytest 4 项；引擎 e2e（mistral toy
+W=512 跨窗多轮）vs 稠密掩码参考 84 采样步 top-1 全一致。稳态内存 = 窗口 + B
+余量/序列（decode 不随生成长度增长——vLLM 掩码式 SWA 做不到）。
+**2b-ext（组合解锁 + 真实模型验证，✅ 报告 `benchmarks/_stage2b_ext_report.md`）**：
+① fp8 KV+环（decode 传 chunk_starts）与 fp8 KV+MLA（fused 行两段独立 scale，
+写量化/读反量化贯通内核与稠密装配）；② 投机(ngram)+环：修 BlockManager 环 spec
+账本（表项=逻辑块 j0+i）、verify 行 key 集 [j0·B, end) 稠密装配喂 flash（段内
+相对下标 ⇒ 窗口掩码精确），slack=γ+2；③ 非统一窗口（gemma2 交替 local/global）
+**split 双池**：环池（local，驱逐到 cap）+ full 池（global，普通分页永不驱逐）
+双 BM/双 GPU cache/Context full_* 侧 + 自研内核 softcap（cap·tanh，flash 同语义）；
+④ 纯 int4/fp8 MLA decode：kv_b 保留反量化副本（占参 ~1%，V2-Lite 实测 113MB）→
+稠密兜底/强制 eager 消除（w8a8/sparse24 兜底仍留）；⑤ int4 组大小可配
+（`int4_group_size`，V2-Lite dense 中间维 10944=64×171 非 128 倍数）+ 内核尾 K
+掩码与组粒度静态展开（128 路径逐位不变）。验证摘要：
+真实 **Mistral-7B** int4 流式 5050-token（>W=4096）环 vs 掩码 fp8 KV **全程
+逐位一致**；真实 **gemma-2-2b-it** 26 层 split 4800-token：环池表长到 ring_cap
+(18) 封顶而 full/掩码继续线性增长，30 稀疏步（含窗口越界后）vs 手工 fp16 稠密
+参考 top-1 失配 0；真实 **DeepSeek-V2-Lite**（hub 恢复，31.4GB bf16 下载）：
+4 层真权重切片 fp16 引擎 vs 稠密参考 0 失配、int4(group64) 23/24，全量 27 层
+流式 int4 启动 55s、权重常驻 ~5GB（int4+113MB kv_b w_deq）、decode ~2.8 tok/s
+（3 并发、MoE eager、纯 int4）且中英文生成连贯。顺带修复：MLA decode 内核真实
+尺寸共享内存超限（BLOCK_T 32→16/warps 8）；int4 内核 K 尾块漏算（10944 丢 64
+列 → 引擎 logits 漂移+NaN，掩码修复）；streaming 判定改用 meta 实建数参数
+（MoE/MLA 不在通用 qkv 公式内 → 曾把 33GB 当小模型直接建而 OOM）。
+**诚实边界（现行）**：gemma2 split 仅 bf16/无投机/eager decode（softcap 层禁
+fp8 KV；双池 CUDA graph 未实现）；ring+medusa/eagle 断言关；滚动模型停用前缀
+缓存（重复 prompt 代价，refcount 守卫落点）；KV swap×ring/split 未验证；
+fp8 KV×MLA 只在 toy 验证（真实模型未跑）；真实模型对照的采样步一致性受
+"内核 vs flash/手工数值差在近并列处翻转"限制（fp8 环与掩码同内核位级、bf16
+异内核 top-1 噪声带内）；transformers 5.15 MoE `torch._grouped_mm` 仅 sm_90，
+本机无法 HF-GPU 直连做真权重对照（记录在案）。
 
 ### 阶段 3：调度系统深读（vLLM V1 源码对照 + SLO + multi-step decode）——**第三**
 **为什么第三**：调度是 vLLM 面试核心话题；我们的实现是"V1-style 简化版"，逐行读 vLLM
