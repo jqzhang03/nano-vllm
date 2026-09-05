@@ -33,10 +33,13 @@ class Scheduler:
         self._swap_bytes = 0  # 当前换出缓冲累计字节（超预算回落 recompute）
         if self.kv_swap:
             hf = config.hf_config
+            self._swap_mla = hasattr(hf, "kv_lora_rank")   # MLA fused cache
             self._swap_layers = hf.num_hidden_layers
             self._swap_kv_heads = hf.num_key_value_heads // config.tensor_parallel_size
             self._swap_head_dim = (getattr(hf, "head_dim", None)
                                    or hf.hidden_size // hf.num_attention_heads)
+            self._swap_mla_d = (hf.kv_lora_rank + hf.qk_rope_head_dim
+                                if self._swap_mla else 0)
             self._swap_dtype = hf.dtype
         # ---- 投机解码（n-gram / Medusa） ----
         self.spec_decode = config.speculative in ("ngram", "medusa", "eagle")
@@ -377,9 +380,14 @@ class Scheduler:
         # CPU 缓冲（不用 pin_memory：WSL2 下 GPU→pinned CPU 的大块 D2H 拷贝实测会
         # 崩 VM（cudaHostAlloc 支持有限）；普通 CPU 内存的 D2H/H2D 拷贝正确且稳定，
         # 只是 H2D 略慢——swap 频率低，可接受）
-        buf = torch.empty(2, self._swap_layers, n_blocks, self.block_size,
-                          self._swap_kv_heads, self._swap_head_dim,
-                          dtype=self._swap_dtype)
+        # 布局与 kv_cache 一致：MHA [2, L, n, B, kvh, hd]；MLA fused [L, n, B, D]
+        if self._swap_mla:
+            buf = torch.empty(self._swap_layers, n_blocks, self.block_size,
+                              self._swap_mla_d, dtype=self._swap_dtype)
+        else:
+            buf = torch.empty(2, self._swap_layers, n_blocks, self.block_size,
+                              self._swap_kv_heads, self._swap_head_dim,
+                              dtype=self._swap_dtype)
         gpu_block_ids = list(seq.block_table)
         self._swap_bytes += buf.numel() * buf.element_size()
         self._swap_buffers[seq.seq_id] = buf

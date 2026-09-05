@@ -20,13 +20,26 @@ class RMSNorm(nn.Module):
         self.weight_offset = weight_offset
         self.weight = nn.Parameter(torch.zeros(hidden_size))
 
+    @staticmethod
+    def _float_copy(x: torch.Tensor) -> torch.Tensor:
+        """fp32 计算副本：**不别名输入**。
+
+        x.float() 只在非 fp32 时拷贝；fp32 输入下 .float() 返回同一张量，
+        后续 mul_ 会原位修改调用方的输入——bf16 引擎无感，但 CPU fp32
+        （单测/无引擎参考）下会把"残差流"的中间张量原地归一化掉，破坏
+        norm(x, residual) 语义（解码层逐层对照定位，见 _mla_check.py）。
+        """
+        if x.dtype == torch.float32:
+            return x.detach().clone()
+        return x.float()
+
     @torch.compile
     def rms_forward(
         self,
         x: torch.Tensor,
     ) -> torch.Tensor:
         orig_dtype = x.dtype
-        x = x.float()
+        x = self._float_copy(x)
         var = x.pow(2).mean(dim=-1, keepdim=True)
         x.mul_(torch.rsqrt(var + self.eps))
         w = self.weight + (1.0 if self.weight_offset else 0.0)
@@ -40,8 +53,12 @@ class RMSNorm(nn.Module):
         residual: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         orig_dtype = x.dtype
-        x = x.float().add_(residual.float())
-        residual = x.to(orig_dtype)
+        x = self._float_copy(x)
+        r = self._float_copy(residual)
+        x = x.add_(r)
+        # 残差 = 未归一化的和；fp32 下 to() 别名 x（随后 mul_ 会污染）→ 拷贝
+        residual = (x.clone() if orig_dtype == torch.float32
+                    else x.to(orig_dtype))
         var = x.pow(2).mean(dim=-1, keepdim=True)
         x.mul_(torch.rsqrt(var + self.eps))
         w = self.weight + (1.0 if self.weight_offset else 0.0)

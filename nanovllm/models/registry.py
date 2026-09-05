@@ -16,11 +16,13 @@ from nanovllm.models.qwen2 import Qwen2ForCausalLM
 from nanovllm.models.llama3 import Llama3ForCausalLM
 from nanovllm.models.mistral import MistralForCausalLM
 from nanovllm.models.gemma2 import Gemma2ForCausalLM
+from nanovllm.models.deepseek_v2 import DeepseekV2ForCausalLM
 
 # model_type（HF config.model_type）→ 模型类。
 # 已支持：qwen3 / qwen3_moe（MoE，阶段 1.5）/ qwen2（Qwen2.5 系列同属 qwen2）/
 # llama（Llama-3.x）/ mistral（Mistral-7B-v0.x，滑动窗口注意力 SWA）/
-# gemma2（Gemma-2，交替 local/global 注意力 + attn logit soft-cap + final logit soft-cap）。
+# gemma2（Gemma-2，交替 local/global 注意力 + attn logit soft-cap + final logit soft-cap）/
+# deepseek_v2（DeepSeek-V2，MLA + MoE(shared experts)，阶段 2）。
 _MODEL_REGISTRY: dict[str, Type[nn.Module]] = {
     "qwen3": Qwen3ForCausalLM,
     "qwen3_moe": Qwen3MoeForCausalLM,
@@ -28,6 +30,7 @@ _MODEL_REGISTRY: dict[str, Type[nn.Module]] = {
     "llama": Llama3ForCausalLM,
     "mistral": MistralForCausalLM,
     "gemma2": Gemma2ForCausalLM,
+    "deepseek_v2": DeepseekV2ForCausalLM,
 }
 
 # 规划中的模型：model_type → 未实现的具体卡点（见 LEARNING.md 阶段7 卡点清单）。

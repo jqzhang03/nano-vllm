@@ -61,7 +61,8 @@ class MoE(nn.Module):
 
     def __init__(self, hidden_size: int, moe_intermediate_size: int,
                  num_experts: int, top_k: int, norm_topk_prob: bool = False,
-                 segment_backend: bool = False):
+                 segment_backend: bool = False,
+                 routed_scaling_factor: float = 1.0):
         super().__init__()
         assert num_experts > 0 and 1 <= top_k <= num_experts
         self.hidden_size = hidden_size
@@ -69,6 +70,9 @@ class MoE(nn.Module):
         self.num_experts = num_experts
         self.top_k = top_k
         self.norm_topk_prob = norm_topk_prob
+        # DeepSeek 路由：top-k 概率 × routed_scaling_factor（V2/V3 默认 1.0；
+        # Qwen3-MoE 无此因子 → 默认 1.0 恒等，行为不变）
+        self.routed_scaling_factor = routed_scaling_factor
         # grouped 的批量实现：False = padded bmm（cuBLAS batched，默认——实测
         # 全尺寸最优或接近）；True = Triton 真段式内核（无 padding；实测仅在
         # 小 E + 极长段赢 43%，见 nanovllm/layers/moe_segment.py 头部边界表）
@@ -84,12 +88,14 @@ class MoE(nn.Module):
         self._grouped_ok = None  # None=未判定；True/False=可用/回退 loop
 
     def _route(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """fp32 路由：返回 (topk 概率 [T,k]（x dtype，可能已归一）, 专家号 [T,k])。"""
+        """fp32 路由：返回 (topk 概率 [T,k]（x dtype，含 routed_scaling_factor）, 专家号 [T,k])。"""
         logits = self.gate(x).float()
         probs = logits.softmax(dim=-1)
         top_vals, top_idx = probs.topk(self.top_k, dim=-1)
         if self.norm_topk_prob:
             top_vals = top_vals / top_vals.sum(dim=-1, keepdim=True)
+        if self.routed_scaling_factor != 1.0:
+            top_vals = top_vals * self.routed_scaling_factor
         return top_vals.to(x.dtype), top_idx
 
     # ------------------------------------------------------------------

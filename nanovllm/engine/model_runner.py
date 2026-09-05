@@ -85,6 +85,7 @@ class ModelRunner:
             elif config.quantization == "fp8":
                 self.quantize_fp8_weights()
         # 调用预热方法，执行一次模拟prefill来分配显存、初始化CUDA内核，并测量峰值显存
+        self._finalize_mla_mode()   # MLA 模型模式收尾（decode 内核 vs 稠密兜底）
         self.warmup_model()
         # 分配KV Cache的显存空间，并根据模型层数将KV Cache引用绑定到各注意力层
         self.allocate_kv_cache()
@@ -92,7 +93,10 @@ class ModelRunner:
         if not self.enforce_eager:
             self.capture_cudagraph()
             # 投机解码：再捕获verify前向（varlen）的graph族（固定容量+空行填充）
-            if config.speculative in ("ngram", "medusa", "eagle"):
+            # MLA 模型跳过：verify 行走 cache 稠密化组装的 python 路径（动态行
+            # 长度按捕获时的零值烘焙 → 重放即错）；MLA spec 步保持 eager。
+            if config.speculative in ("ngram", "medusa", "eagle") \
+                    and not self._mla_model:
                 self.capture_spec_graph()
 
         torch.set_default_device("cpu")
@@ -171,19 +175,26 @@ class ModelRunner:
     def cow_block(self, old_block_id: int, new_block_id: int):
         """COW：把旧块的KV内容复制到新块。
 
-        kv_cache布局为 [2(K/V), num_layers, num_blocks, block_size, num_kv_heads, head_dim]，
-        按块下标切片即一次全层K/V复制（设备到设备，无需自定义内核）。
+        MHA 布局 [2(K/V), num_layers, num_blocks, block_size, num_kv_heads,
+        head_dim]；MLA 布局 [num_layers, num_blocks, block_size, kv_lora+rope]。
+        按块下标切片即一次全层复制（设备到设备，无需自定义内核）。
         TP>1时每个rank复制自己的KV分片，块表与COW对全rank一致，天然对齐。
         """
-        self.kv_cache[:, :, new_block_id] = self.kv_cache[:, :, old_block_id]
+        if self._kv_mla:
+            self.kv_cache[:, new_block_id] = self.kv_cache[:, old_block_id]
+        else:
+            self.kv_cache[:, :, new_block_id] = self.kv_cache[:, :, old_block_id]
 
     def swap_out(self, block_ids: list[int], cpu_buffer: torch.Tensor):
         """KV swap 换出：seq 的 GPU KV 块内容拷到 CPU pinned 缓冲（bit-exact）。
 
-        cpu_buffer 形状 [2, layers, n_blocks, block_size, kv_heads, head_dim]；
-        TP=1（swap 仅 TP=1 启用），kv_cache 分片即全局。
+        cpu_buffer 与 self.kv_cache 同布局（MHA [2, layers, n, B, kvh, hd] /
+        MLA [layers, n, B, kv_lora+rope]）；TP=1（swap 仅 TP=1 启用）。
         """
-        gpu = self.kv_cache[:, :, block_ids]
+        if self._kv_mla:
+            gpu = self.kv_cache[:, block_ids]          # [L, n, B, D]
+        else:
+            gpu = self.kv_cache[:, :, block_ids]       # [2, L, n, B, kvh, hd]
         cpu_buffer.copy_(gpu)
         torch.cuda.synchronize()  # 确保换出完成（缓冲在 CPU 侧后续由调度器管理）
 
@@ -192,12 +203,18 @@ class ModelRunner:
 
         缓冲只含换出时已分配的块（decode 序列最后 token 的块换出时未分配，
         本步 decode 正常写入）；拷贝前 n_buf 块。
-        **必须用 index_copy_ 原位写**：kv_cache[:, :, block_ids] 是高级索引
-        （list）→ 返回临时副本，copy_ 只写副本不写回缓存（静默产生垃圾 KV）。
+        **必须用 index_copy_ 原位写**：高级索引（list）返回临时副本，copy_ 只写
+        副本不写回缓存（静默产生垃圾 KV）。
         """
-        n = cpu_buffer.shape[2]
-        ids = torch.tensor(block_ids[:n], device=self.kv_cache.device)
-        self.kv_cache.index_copy_(2, ids, cpu_buffer.to(self.kv_cache.device))
+        if self._kv_mla:
+            n = cpu_buffer.shape[1]
+            ids = torch.tensor(block_ids[:n], device=self.kv_cache.device)
+            self.kv_cache.index_copy_(1, ids,
+                                      cpu_buffer.to(self.kv_cache.device))
+        else:
+            n = cpu_buffer.shape[2]
+            ids = torch.tensor(block_ids[:n], device=self.kv_cache.device)
+            self.kv_cache.index_copy_(2, ids, cpu_buffer.to(self.kv_cache.device))
 
     def warmup_model(self):
         torch.cuda.empty_cache()
@@ -475,6 +492,32 @@ class ModelRunner:
             m.inv_k_scale = 1.0 / m.k_scale
             m.inv_v_scale = 1.0 / m.v_scale
 
+    def _finalize_mla_mode(self):
+        """MLA 模型（DeepSeek-V2 类）模式收尾：缓存类型识别 + decode 路径选择。
+
+        - 缓存：fused [c_kv | k̃_pe]（cache_kind="mla"，见 allocate_kv_cache）；
+        - decode 快路径（吸收式内核）要求 kv_b 有 float 视图（未量化 / int4
+          dual-path 的 w_deq）；纯 int4/fp8（streaming 强制）→ 稠密兜底解码
+          （逐层整段缓存稠密化，正确性等价、带宽优势消失）→ 动态形状必须
+          eager（CUDA graph 会烘焙兜底路径的零长度形状，重放即错）。
+        """
+        hf = self.config.hf_config
+        self._mla_model = hasattr(hf, "kv_lora_rank")
+        if not self._mla_model:
+            self._mla_modules = []
+            self._mla_dense_decode = False
+            return
+        self._mla_modules = [m for m in self.model.modules()
+                             if getattr(m, "cache_kind", None) == "mla"]
+        assert self._mla_modules, "kv_lora_rank 配置但找不到 MLA 注意力层"
+        self._mla_dense_decode = any(
+            not m.has_float_views() for m in self._mla_modules)
+        if self._mla_dense_decode and not self.enforce_eager:
+            print("[mla] kv_b 无 float 视图（纯 int4/fp8 等）→ decode 走稠密兜底 "
+                  "（逐层缓存稠密化）；动态形状必须 eager → 强制 enforce_eager",
+                  flush=True)
+            self.enforce_eager = True
+
     def allocate_kv_cache(self):
         config = self.config
         hf_config = config.hf_config
@@ -485,21 +528,50 @@ class ModelRunner:
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
         # 获取当前Pytorch已分配的显存
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
+        use_fp8 = config.kv_cache_dtype == "fp8_e4m3"
+        itemsize = 1 if use_fp8 else hf_config.dtype.itemsize
+        num_layers = hf_config.num_hidden_layers
+
+        # ---- 缓存类型：MHA（k_cache/v_cache 双张量）或 MLA（fused 单张量）----
+        if self._mla_model:
+            # MLA fused cache：[层, 块, block_size, kv_lora+qk_rope]（K/V 合一，
+            # 只存压缩潜在 + 旋转 rope key——账本 576 vs 4096 元素的来源）
+            mla_mods = self._mla_modules
+            assert not use_fp8, (
+                "MLA cache 不支持 fp8 KV（fused [c|k̃] 无量化内核）；"
+                "DeepSeek 请用 kv_cache_dtype=auto")
+            assert len(mla_mods) == num_layers, \
+                f"MLA 层数 {len(mla_mods)} != num_hidden_layers {num_layers}"
+            self._kv_mla = True
+            kv_d = hf_config.kv_lora_rank + hf_config.qk_rope_head_dim
+            per_token = kv_d * itemsize
+            block_bytes = num_layers * self.block_size * per_token
+            config.num_kvcache_blocks = int(
+                total * config.gpu_memory_utilization - used - peak
+                + current) // block_bytes
+            assert config.num_kvcache_blocks > 0, \
+                f"MLA cache 块数 <=0（每块 {block_bytes/1e6:.1f}MB，预算不足）"
+            self.kv_cache = torch.empty(num_layers, config.num_kvcache_blocks,
+                                        self.block_size, kv_d,
+                                        dtype=hf_config.dtype)
+            for i, module in enumerate(mla_mods):
+                module.mla_cache = self.kv_cache[i]
+                module.mla_fp8 = False
+            return
+
+        self._kv_mla = False
         # 张量并行后每个GPU上的KV头数
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         # 获取每个注意力头的维度，优先取head_dim，否则用隐藏层注意力维度处以注意力头数
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
-        # FP8 KV缓存：E4M3每元素1字节，块大小减半 → 同样显存下块数翻倍
-        use_fp8 = config.kv_cache_dtype == "fp8_e4m3"
-        itemsize = 1 if use_fp8 else hf_config.dtype.itemsize
         # 单KV Cache块大小
-        block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * itemsize
+        block_bytes = 2 * num_layers * self.block_size * num_kv_heads * head_dim * itemsize
         # 根据可用显存计算可分配的KV Cache块总数
         # 总显存x利用率-已使用显存-预热峰值+当前已分配了的显存 除以 单块大小
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
         assert config.num_kvcache_blocks > 0
         kv_dtype = torch.float8_e4m3fn if use_fp8 else hf_config.dtype
-        self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks,
+        self.kv_cache = torch.empty(2, num_layers, config.num_kvcache_blocks,
                                     self.block_size, num_kv_heads, head_dim, dtype=kv_dtype)
         layer_id = 0
         for module in self.model.modules():
@@ -518,6 +590,29 @@ class ModelRunner:
         # 转为int32张量，使用锁页内存加速传输，并异步拷贝到GPU
         block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         return block_tables
+
+    # ------------------------------------------------------------------
+    # MLA cache-shaped 行信息：行缓存区 = [0, start_r)（槽位扁平索引，行主序）。
+    # starts 恒建（与行对齐）；索引只在 Σstart>0 时非 None。
+    # ------------------------------------------------------------------
+    def _mla_rows(self, seqs: list[Sequence],
+                  starts: list[int]) -> tuple[torch.Tensor | None,
+                                              torch.Tensor | None]:
+        idx = []
+        for seq, start in zip(seqs, starts):
+            if start <= 0:
+                continue
+            bt = seq.block_table
+            for p in range(start):
+                idx.append(bt[p // self.block_size] * self.block_size
+                           + p % self.block_size)
+        starts_t = torch.tensor(starts, dtype=torch.int32,
+                                pin_memory=True).cuda(non_blocking=True)
+        if not idx:
+            return starts_t, None
+        idx_t = torch.tensor(idx, dtype=torch.int32,
+                             pin_memory=True).cuda(non_blocking=True)
+        return starts_t, idx_t
 
     def prepare_prefill(self, seqs: list[Sequence]):
         """纯prefill批次（含前缀缓存读取）。返回 (input_ids, positions)。"""
@@ -560,6 +655,12 @@ class ModelRunner:
             # 如果用到了前缀缓存，那么cu_seqlens_k的长度一定会大于cu_seqlens_q的长度，前缀缓存的key的前一部分已经有缓存了
             # 需要将缓存的那一部分key值的物理位置索引和新计算的后缀块的物理地址按逻辑顺序拼成一张地址索引表
             block_tables = self.prepare_block_tables(seqs)
+        # MLA cache-shaped 前缀行信息（DeepSeek 模型：前缀行从 fused cache 稠密化）
+        if self._mla_model and cu_seqlens_k[-1] > cu_seqlens_q[-1]:
+            mla_pre_starts, mla_pre_idx = self._mla_rows(
+                seqs, [seq.num_cached_tokens for seq in seqs])
+        else:
+            mla_pre_starts = mla_pre_idx = None
         # 将数据转成int64张量，锁页传输并异步拷贝到GPU
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
@@ -567,7 +668,9 @@ class ModelRunner:
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         # 将prefill上下文设置到全局上下文，供注意力算子使用
-        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
+        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
+                    slot_mapping, None, block_tables,
+                    mla_pre_starts=mla_pre_starts, mla_pre_idx=mla_pre_idx)
         return input_ids, positions
 
     def prepare_mixed(self, seqs: list[Sequence]):
@@ -618,6 +721,12 @@ class ModelRunner:
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:
             prefill_block_tables = self.prepare_block_tables(seqs[:n_prefill])
         n_prefill_tokens = cu_seqlens_q[-1]
+        # MLA：prefill 组 cache-shaped 行（前缀稠密化用）+ decode 组兜底行
+        mla_pre_starts = mla_pre_idx = None
+        if self._mla_model and prefill_block_tables is not None:
+            mla_pre_starts, mla_pre_idx = self._mla_rows(
+                seqs[:n_prefill], [seq.num_cached_tokens
+                                   for seq in seqs[:n_prefill]])
         # --- decode 部分（后 len-n_prefill 个seq） ---
         decode_seqs = seqs[n_prefill:]
         context_lens = []
@@ -627,6 +736,10 @@ class ModelRunner:
             context_lens.append(len(seq))
             slot_mapping.append(seq.block_table[-1] * self.block_size + seq.last_block_num_tokens - 1)
         block_tables = self.prepare_block_tables(decode_seqs)
+        mla_dec_starts = mla_dec_idx = None
+        if self._mla_model and self._mla_dense_decode:
+            mla_dec_starts, mla_dec_idx = self._mla_rows(
+                decode_seqs, [len(seq) for seq in decode_seqs])
 
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
@@ -637,7 +750,9 @@ class ModelRunner:
         set_context(False, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
                     slot_mapping, context_lens, block_tables,
                     is_mixed=True, prefill_block_tables=prefill_block_tables,
-                    n_prefill_tokens=n_prefill_tokens)
+                    n_prefill_tokens=n_prefill_tokens,
+                    mla_pre_starts=mla_pre_starts, mla_pre_idx=mla_pre_idx,
+                    mla_dec_starts=mla_dec_starts, mla_dec_idx=mla_dec_idx)
         return input_ids, positions
 
     def prepare_spec(self, seqs: list[Sequence]):
@@ -677,6 +792,11 @@ class ModelRunner:
                             else seq.block_table[i] * self.block_size + end - i * self.block_size)
                 slot_mapping.extend(range(slot_start, slot_end))
         block_tables = self.prepare_block_tables(seqs)
+        # MLA verify 行：缓存区 [0, len-1)（本步 fresh = query 自身，不入前缀行）
+        mla_pre_starts = mla_pre_idx = None
+        if self._mla_model:
+            mla_pre_starts, mla_pre_idx = self._mla_rows(
+                seqs, [len(seq) - 1 for seq in seqs])
 
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
@@ -685,7 +805,8 @@ class ModelRunner:
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
                     slot_mapping, None, block_tables,
-                    is_spec=True)
+                    is_spec=True,
+                    mla_pre_starts=mla_pre_starts, mla_pre_idx=mla_pre_idx)
         return input_ids, positions
 
     def _prepare_mixed_spec(self, seqs: list[Sequence]):
@@ -733,6 +854,16 @@ class ModelRunner:
                 slot_mapping.extend(range(slot_start, slot_end))
         block_tables = self.prepare_block_tables(seqs)
         n_prefill_tokens = cu_seqlens_q[n_prefill_rows]
+        # MLA 全批次 cache-shaped 行（prefill 行 start=num_cached；verify 行 len-1）
+        mla_pre_starts = mla_pre_idx = None
+        if self._mla_model:
+            starts = []
+            for seq in seqs:
+                if seq.is_prefill:
+                    starts.append(seq.num_cached_tokens)
+                else:
+                    starts.append(len(seq) - 1)
+            mla_pre_starts, mla_pre_idx = self._mla_rows(seqs, starts)
 
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
@@ -742,7 +873,9 @@ class ModelRunner:
         set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k,
                     slot_mapping, None, block_tables,
                     is_mixed=True, prefill_block_tables=block_tables,
-                    n_prefill_tokens=n_prefill_tokens, is_spec=True, n_prefill_rows=n_prefill_rows)
+                    n_prefill_tokens=n_prefill_tokens, is_spec=True,
+                    n_prefill_rows=n_prefill_rows,
+                    mla_pre_starts=mla_pre_starts, mla_pre_idx=mla_pre_idx)
         return input_ids, positions
 
     def prepare_decode(self, seqs: list[Sequence]):
@@ -760,7 +893,14 @@ class ModelRunner:
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         block_tables = self.prepare_block_tables(seqs)
-        set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
+        # MLA 稠密兜底 decode 行信息（整段缓存 [0, len) 稠密化；内核路径不需要）
+        mla_dec_starts = mla_dec_idx = None
+        if self._mla_model and self._mla_dense_decode:
+            mla_dec_starts, mla_dec_idx = self._mla_rows(
+                seqs, [len(seq) for seq in seqs])
+        set_context(False, slot_mapping=slot_mapping, context_lens=context_lens,
+                    block_tables=block_tables,
+                    mla_dec_starts=mla_dec_starts, mla_dec_idx=mla_dec_idx)
         return input_ids, positions
 
     def prepare_sample(self, seqs: list[Sequence]):

@@ -444,6 +444,25 @@ Qwen1.5-MoE-A2.7B ≈8GB 可跑，bf16 下载 ~30GB 需联网核对——脚本
 token 每层 512+64×16 vs 等效 GQA 4096 ≈ 2.7×；V3 官方口径 576 的推导）；④滚动缓冲：
 per-seq 物理环 + refcount 守卫 + bf16 decode/varlen 内核的窗口位置偏移。
 
+**2a（MLA，✅ 提交见下）**：`models/deepseek_v2.py` 全模型端口（MLA + dense/MoE 混合 +
+shared experts + routed scaling）+ `layers/attention_mla.py`（fused cache [c_kv|k̃_pe]
+576 元素/token/层 + 吸收式 decode Triton 内核：W_UK→q、W_UV→输出，每 token 只读
+576 元素）+ KV 布局泛化（MHA 双张量 vs MLA fused；COW/swap 同步泛化）+ 引擎集成。
+验证链：decode 内核 vs 稠密参考 **位级 0 误差**（3 场景跨块）→ CPU 全模型 vs
+transformers 5.15 同权重 **top-1 100%（max 1e-6）** → 引擎 prefill/decode parity
+top-1 100%（mean 0.003-0.03）。上游怪癖实证：5.15 DeepseekV2 无缓存前向不传因果
+掩码（对照只能取末行/逐层显式掩码）；experts 内存 3D 直挂 Parameter（state_dict 键
+无 .weight）；flash varlen 要求 v head dim == k → v 零填充到 192 再截断。
+**顺带修复真实 bug**：RMSNorm fp32 下 x.float() 别名输入 → mul_ 原位归一化残差流
+中间张量（bf16 引擎无感、CPU fp32 参考错——逐层对照定位）。
+**诚实边界**：真实 V2-Lite checkpoint 未验证（hub 超时，bf16≈30GB，脚本待命）；
+纯 int4/fp8 无 float 视图 → decode 走稠密兜底（逐层整段稠密化，自动 eager，带宽
+优势消失）；spec-varlen MLA 走 eager 组装；fp8 KV + MLA 断言关；MoE 动态路由不能
+入 CUDA graph（与 Qwen3-MoE 同款边界）。账本修正：论文共享 rope key → 576 元素
+**7.11×**（路线图旧口径 1536/2.7× 是"每头 rope key"的 naive 假设）。
+**2b（SWA 滚动缓冲）**：per-seq 物理环 + refcount 守卫 + bf16 decode/varlen 内核
+的窗口位置偏移（进行中）。
+
 ### 阶段 3：调度系统深读（vLLM V1 源码对照 + SLO + multi-step decode）——**第三**
 **为什么第三**：调度是 vLLM 面试核心话题；我们的实现是"V1-style 简化版"，逐行读 vLLM
 找差距 = 把概念钉死（不需要 GPU）。**具体动作**：①读 vLLM V1 scheduler/block_manager/
