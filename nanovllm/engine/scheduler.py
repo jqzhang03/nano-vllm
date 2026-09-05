@@ -467,6 +467,8 @@ class Scheduler:
                 self.block_manager.hash_blocks(seq, seq.is_prefill)
                 seq.num_cached_tokens += seq.num_scheduled_tokens
                 seq.num_scheduled_tokens = 0
+                # 如果在prefill阶段，缓存的token数量小于总逻辑长度，说明序列的prefill阶段还没有结束
+                # 走到这步说明序列被分块处理了
                 if seq.is_prefill and seq.num_cached_tokens < seq.num_tokens:
                     continue
                 if seq.t_first_token is None and seq.num_completion_tokens == 0:

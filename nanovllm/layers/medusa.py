@@ -8,9 +8,9 @@ LM head 之前的 h_t），head_k(h_t) 预测位置 t+k 的 token。draft 阶段
   - 训练标签：head_k 的标签 = token_{t+k}（自蒸馏：模型自己生成的数据）。
   - 推理：验收后新 t_last 在位置 L'-1。
       * 非全接受（n_acc ≤ γ）：t_last 的 hidden = 当前 verify 输入的第 n_acc 行
-        （输入行 i 在位置 len-1+i）→ head_1..head_γ 预测位置 L'..L'+γ-1 ✓
+        （输入行 i 在位置 len-1+i）→ head_1..head_γ 预测位置 L'..L'+γ-1 
       * 全接受（n_acc = γ+1）：bonus 是采样产物、无 hidden → 用第 γ 行（位置
-        len+γ-1）+ head_2..head_{γ+1}（预测位置 len+γ+1..，正好是 L'..）✓
+        len+γ-1）+ head_2..head_{γ+1}（预测位置 len+γ+1..，正好是 L'..）
     因此头数 = max_draft_len + 1，全接受时 head_1 的输出丢弃（预测的是已采样的
     bonus 位置，无损失——头很小）。
 
@@ -37,7 +37,9 @@ class MedusaHead(nn.Module):
 
 
 class MedusaHeads(nn.Module):
-    """γ+1 个头（全接受偏移用）；draft 取 head[shift:shift+γ] 的 argmax。"""
+    """
+    γ+1 个头（全接受偏移用）；draft 取 head[shift:shift+γ] 的 argmax。
+    """
 
     def __init__(self, n_heads: int, hidden: int, medusa_hidden: int, vocab: int):
         super().__init__()

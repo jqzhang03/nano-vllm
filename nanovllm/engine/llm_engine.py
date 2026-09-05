@@ -66,7 +66,8 @@ class LLMEngine:
         最后一行是全接受时的bonus）。接受语义见 nanovllm/engine/ngram.verify_drafts。
 
         返回 (token_lists, n_decode, n_draft, n_draft_acc, n_verify, n_acc_list)：
-        n_decode = 本步产出token总数（= Σ接受数）；n_draft = 草稿总数；
+        n_decode = 本步产出token总数（= Σ接受数）；
+        n_draft = 草稿总数；
         n_draft_acc = 被接受草稿数（α = n_draft_acc / n_draft）；
         n_verify = verify forward处理的token数（Σ γ_i+1，含末token重算）；
         n_acc_list = 每seq的接受数（与seqs对齐，Medusa draft选行用）。
