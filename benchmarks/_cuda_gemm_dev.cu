@@ -170,14 +170,14 @@ torch::Tensor gemm_mma16x64(torch::Tensor a, torch::Tensor b) {
 // v2b：多 C tile + 转置 B 片（fragment 读全变 uint32 连续）。
 // block tile = C[64 x 128]（8 warps = 2wm×4wn，warp tile 32×32 = 2×4 个 m16n8）；
 // BK=32（每步 2 个 k16 子步）。每 warp 每 k16 做 8 次独立 mma → ILP 隐藏 TC 延迟。
-// 与 v2a 差距点：每 warp 1 tile → 8 tiles；B 标量读打包 → BsT[n][k] 转置直读
-// （行距 34 = BK+2 pad，消写冲突）；加载 half4 向量化。
+// 与 v2a 差距点：每 warp 1 tile → 8 tiles；B 标量读打包 → BsT[n][k] 转置直读；
+// BS（BsT 行距）是模板参数：34 = BK+2 pad（消写 bank 冲突），32 = 无 pad（对照组）。
 // ---------------------------------------------------------------------------
-template <int BK>  // BK=32; BsT 行距 BS=BK+2（防写 bank 冲突的 pad）
+template <int BK, int BS>  // BK=32; BS=34(pad) 或 32(无 pad)
 __global__ void __launch_bounds__(256) gemm_v2b_kernel(
     const __half* __restrict__ A, const __half* __restrict__ B,
     __half* __restrict__ C, int M, int N, int K) {
-    constexpr int BM = 64, BN = 128, BS = BK + 2;
+    constexpr int BM = 64, BN = 128;
     __shared__ __align__(16) __half As[BM * BK];   // As[m*BK + k]，行主序
     __shared__ __align__(16) __half BsT[BN * BS];  // BsT[n*BS + k]，转置 + pad
     const int m0 = blockIdx.y * BM;
@@ -278,17 +278,33 @@ __global__ void __launch_bounds__(256) gemm_v2b_kernel(
         }
 }
 
-torch::Tensor gemm_v2b(torch::Tensor a, torch::Tensor b) {
+torch::Tensor gemm_v2b_impl(torch::Tensor a, torch::Tensor b, int pad) {
     const int M = (int)a.size(0), K = (int)a.size(1), N = (int)b.size(1);
     TORCH_CHECK(M % 64 == 0 && N % 128 == 0 && K % 32 == 0,
                 "M%64/N%128/K%32 must be 0 for gemm_v2b");
     auto c = torch::empty({M, N}, a.options());
     dim3 grid(N / 128, M / 64);
-    gemm_v2b_kernel<32><<<grid, 256>>>(
-        reinterpret_cast<const __half*>(a.data_ptr<torch::Half>()),
-        reinterpret_cast<const __half*>(b.data_ptr<torch::Half>()),
-        reinterpret_cast<__half*>(c.data_ptr<torch::Half>()), M, N, K);
+    auto aptr = reinterpret_cast<const __half*>(a.data_ptr<torch::Half>());
+    auto bptr = reinterpret_cast<const __half*>(b.data_ptr<torch::Half>());
+    auto cptr = reinterpret_cast<__half*>(c.data_ptr<torch::Half>());
+    if (pad) {
+        gemm_v2b_kernel<32, 34><<<grid, 256>>>(aptr, bptr, cptr, M, N, K);
+    } else {
+        gemm_v2b_kernel<32, 32><<<grid, 256>>>(aptr, bptr, cptr, M, N, K);
+    }
     return c;
+}
+
+torch::Tensor gemm_v2b(torch::Tensor a, torch::Tensor b) {
+    return gemm_v2b_impl(a, b, 1);  // 默认 pad 版
+}
+
+torch::Tensor gemm_v2b_pad(torch::Tensor a, torch::Tensor b) {
+    return gemm_v2b_impl(a, b, 1);
+}
+
+torch::Tensor gemm_v2b_nopad(torch::Tensor a, torch::Tensor b) {
+    return gemm_v2b_impl(a, b, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -416,6 +432,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("gemm_fma_naive", &gemm_fma_naive);
     m.def("gemm_mma16x64", &gemm_mma16x64);
     m.def("gemm_v2b", &gemm_v2b);
+    m.def("gemm_v2b_pad", &gemm_v2b_pad);
+    m.def("gemm_v2b_nopad", &gemm_v2b_nopad);
     m.def("store_probe", &store_probe);
     m.def("probe_tile00", &probe_tile00);
 }
