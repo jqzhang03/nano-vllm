@@ -175,10 +175,14 @@ fp8 M=8 4.17×、M=256 1.98×（scaled_mm）；fp8 大 M Triton **81% TC**；**i
 +19% → 纯 int4 大 batch 3916.5 tok/s（0.82× fp16，原 0.64×）**；fp8 decode 内核逐层
 1.9→1.15ms；verify 启动税 ~10ms/步被 graph 消除。
 **诚实结论**：已做 roofline 归因 + 系统性 tile 搜索（`benchmarks/_kernel_roofline.md`）；
-未做 SMEM 显式编程（Triton 自动管理）与 SASS 级指令优化；fp8 大 M Triton +8.6% 未落地
-（引擎走硬件 scaled_mm）；搜索方法论教训：**快速搜索的 "+144%" 异常值被高迭代复测推翻**。
-**追问应对**：被问"还能怎么快"→ 持久内核（Marlin 式）、split-K、SMEM 显式 tile（CUDA C
-对照内核）、KV 块排序提 L2 命中、把 w_deq 降精度存储（fp8 引入 dequant 流量不划算）。
+**CUDA C 补课已落地**（`benchmarks/_cuda_gemm_report.md`：nvcc 12.8 工具链 + 手写 fp16 GEMM
+到 cuBLAS 53% + bank-conflict 消融 + split-K/persistent 边界，全部 SASS 实证）；fp8 大 M
+Triton +8.6% 未落地（引擎走硬件 scaled_mm）；搜索方法论教训：**快速搜索的 "+144%" 异常值
+被高迭代复测推翻**。
+**追问应对**：被问"还能怎么快"→ cp.async/TMA 双缓冲流水（v2b 之后的主差距）、ldmatrix
+canonical 布局、KV 块排序提 L2 命中、把 w_deq 降精度存储（fp8 引入 dequant 流量不划算）；
+persistent/split-K 已实测（本机 persistent 亏、split-K 仅小 M 赢——被追问时给条件不给
+背书）。
 
 ### 2.4 量化（五条路径的取舍 + 精度方法论）
 
@@ -336,14 +340,21 @@ parity：qwen2.5-0.5B top-1 100%（mean 0.096）、mistral 100%（0.014）、gem
 > "具体动作 + 交付物 + 为什么"。穿插项：每个阶段读对应 vLLM/llama.cpp 源码做对照。
 
 ### 阶段 1：内核与性能工程（CUDA 记忆模型 + roofline 归因 + 手写 MatMul）——**✅ 已完成**
-**交付（`benchmarks/_kernel_roofline.md`）**：实测标定硬件锚点（TC 48.5 TFLOPS / 带宽
-370 GB/s / 36 SM）；GEMM 三种性能形态（算力/带宽/启动受限）归因表（fp8 大 M 81% TC、
-int4 44% TC、decode 小 M 启动受限）；手写 SMEM-tiled fp16 MatMul **101% cuBLAS** +
-GROUP_M/stages/regs/occupancy 消融（最优配置 occupancy 仅 17%——TC 吞吐型反直觉反例）；
-tile 网格搜索 → **int4 大 M 小 tile 反超 19%（regs 255→128）→ 落地后纯 int4 大 batch
-+28%（0.64×→0.82× fp16）**；方法论教训：快速搜索的 +144% 异常值被高迭代复测推翻。
-**下一步深挖**：SMEM 显式编程（CUDA C 对照内核 + bank-conflict）、SASS 级分析、
-split-K/持久内核（Marlin 式）。
+**交付（`benchmarks/_kernel_roofline.md` + `benchmarks/_cuda_gemm_report.md`）**：实测
+标定硬件锚点（TC 48.5 TFLOPS / 带宽 370 GB/s / 36 SM）；GEMM 三种性能形态（算力/带宽/
+启动受限）归因表（fp8 大 M 81% TC、int4 44% TC、decode 小 M 启动受限）；手写 SMEM-tiled
+fp16 MatMul **101% cuBLAS** + GROUP_M/stages/regs/occupancy 消融（最优配置 occupancy
+仅 17%——TC 吞吐型反直觉反例）；tile 网格搜索 → **int4 大 M 小 tile 反超 19%（regs
+255→128）→ 落地后纯 int4 大 batch +28%（0.64×→0.82× fp16）**；方法论教训：快速搜索的
++144% 异常值被高迭代复测推翻。
+**CUDA C 补课（阶段 1b，全部 SASS 实证）**：工具链四坑打通（pip nvcc wheel 拆包只剩
+ptxas → conda nvcc 12.8.93；gcc15 崩 pybind11 → conda gcc14；CUDAHOSTCXX 失效 →
+gcc symlink；cuobjdump 12.4 无法解码 SM120 → 12.8）。手写 fp16 GEMM 四步：FMA naive
+1.6 → mma 单 tile 6.1 → **8 tile/warp + BsT 转置布局 20.8 TFLOPS（cuBLAS 53%）**，
+每步 SASS 证据（NOP/mma 6.5→1.3 是 TC 延迟隐藏的可视化指标）；**bank-conflict 消融：
+BsT 行距 32→34 消 16-way 写冲突，实测 +86%**（bank = 行距与 32 的 gcd 决定冲突度）；
+split-K 只在 block 数 < SM 数时赢（M=64 S=4 +59%），并行度够时部分和流量纯亏；
+persistent 本机全亏（0.89×，硬件 block 分发近零成本 + 动态均衡更优）。
 
 ### 阶段 2：MLA（DeepSeek 潜在注意力）+ SWA 滚动缓冲——**第二**
 **为什么第二**：注意力是推理的核心，DeepSeek 是当前面试必考；MLA 有真模型可验证

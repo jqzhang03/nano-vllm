@@ -7,6 +7,8 @@
 > 一句话结论：**所有数字用实测标定，不做纸面推导**——TC 峰值 48.5、带宽 370 都是这张卡上
 > cuBLAS/copy 实测出来的；内核归因揭示三种性能形态；手写 MatMul 达 101% cuBLAS；
 > tile 搜索找到并落地了一个引擎级改进（纯 int4 大 batch +28%）。
+> **阶段 1b 补充**（SMEM 显式编程 + SASS + split-K/persistent，CUDA C 手写内核到 cuBLAS
+> 53%）：见 [`benchmarks/_cuda_gemm_report.md`](_cuda_gemm_report.md)。
 
 ---
 
