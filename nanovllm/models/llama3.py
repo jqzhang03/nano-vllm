@@ -67,7 +67,7 @@ class Llama3Attention(nn.Module):
             else:
                 raise NotImplementedError(
                     f"rope_scaling type {rope_type!r} unsupported: only 'default'/'llama3' handled "
-                    f"(yarn/linear/dynamic 未实现，见 LEARNING.md 阶段7 卡点清单)")
+                    f"(yarn/linear/dynamic 未实现，见 INTERVIEW.md §1.7 卡点清单)")
 
         # 初始化旋转位置编码模块
         self.rotary_emb = get_rope(

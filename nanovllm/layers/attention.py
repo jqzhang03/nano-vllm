@@ -252,7 +252,7 @@ def paged_varlen_attention_fp8_kernel(
     - 列 c = r*G+g（r=query行号0..Q-1，g=组内q head）→ N=Q*G≤10 ≤ QPAD=16；
     - query r 在逻辑位置 seqlen-Q+r，attend keys 0..seqlen-Q+r（逐列因果掩码）；
     - 直接 fp8 load + 硬件cvt反量化（无全缓存反量化→消除 verify 步 ~18GB/步 的
-      内存搬运，见BENCHMARKS.md §9）；BLOCK_T=32/warps=1 与v6同款；
+      内存搬运，见INTERVIEW.md §10.3.5）；BLOCK_T=32/warps=1 与v6同款；
     - key_lens = cu_seqlens_k 差分（本seq的key总数，含draft写入）。
     """
     pid = tl.program_id(0)
@@ -399,7 +399,7 @@ class Attention(nn.Module):
                 # 注意：torch的 fp32->fp8 cast 溢出不饱和而是产生NaN位模式(0x7F/0xFF)
                 # （实测 500 -> 0x7F），必须先 clamp 到 E4M3 最大值 448。
                 # 校准数据外出现更大激活（真实prompt > 校准token）时，溢出必须饱和为
-                # 448 而非 NaN——v4的LUT把NaN位模式读成0.0掩盖了此bug（见BENCHMARKS.md）。
+                # 448 而非 NaN——v4的LUT把NaN位模式读成0.0掩盖了此bug（见INTERVIEW.md §6 故事 1）。
                 kq = (k.float() * self.inv_k_scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
                 vq = (v.float() * self.inv_v_scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
             else:
@@ -416,7 +416,7 @@ class Attention(nn.Module):
             if context.is_spec:
                 # 投机混合步：verify行恒有前缀复用（num_cached=len-1）→ 全批次varlen，
                 # K/V必须为缓存形状[blocks, block_size, ...]（flash按k.shape[1]推断
-                # block size；见BENCHMARKS.md §5.3 的varlen+分块序列坑）。
+                # block size；见INTERVIEW.md §10.3.2 的varlen+分块序列坑）。
                 if self.use_fp8:
                     k_pre = k_cache.to(k.dtype) * self.k_scale
                     v_pre = v_cache.to(v.dtype) * self.v_scale
@@ -456,7 +456,7 @@ class Attention(nn.Module):
                 if self.use_fp8:
                     if context.is_spec:
                         # verify步（Q=γ+1≤5）：自研fp8 varlen内核直接读缓存，
-                        # 消除"逐层全缓存反量化"（~18GB/步，见BENCHMARKS.md §9）
+                        # 消除"逐层全缓存反量化"（~18GB/步，见INTERVIEW.md §10.3.5）
                         key_lens = context.cu_seqlens_k[1:] - context.cu_seqlens_k[:-1]
                         o = paged_varlen_attention_fp8(q, k_cache, v_cache,
                                                        context.cu_seqlens_q, key_lens,

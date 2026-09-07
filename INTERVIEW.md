@@ -1,754 +1,1185 @@
-# INTERVIEW.md — nano-vllm 面试串讲（全部功能一张纸）
+# INTERVIEW.md — nano-vllm 总档（学习路线 · 面试串讲 · 基准档案）
 
-> **定位**：面试前最后一天/一小时过一遍的"表演脚本"——给"怎么讲"，不给"全部细节"。
-> 细节在 `note.md`（工作全景/踩坑故事）、`BENCHMARKS.md`（数字来源）、`LEARNING.md`（学习顺序）。
+> **本文件是原 `BENCHMARKS.md` + `INTERVIEW.md` + `LEARNING.md` 三合一合并版**（2026-09-07）：
+> 重复内容只写一遍，数字统一到"现行结论 + 复测口径"，代码行号按当时 HEAD 实测校准。
+> 原三文件已删除；git 历史保留旧版。
+>
+> **姊妹文件**：`note.md` = 个人时间线工作梳理（截止 2026-08-24 阶段 1.12，其踩坑故事编号
+> 与本档 §6 一一对应，见 §11 映射）；`benchmarks/_stage2b_ext_report.md` = 阶段 2b-ext
+> 的完整证据表与复现命令。
+>
+> **全部数字带条件**：单卡 RTX 5060 Ti 16GB（Blackwell sm_120，36 SM）/ WSL2 Ubuntu /
+> conda `nano-vllm`（torch 2.8.0+cu128、triton 3.4.0、flash-attn 2.8.3.post1）/ bf16 /
+> Qwen3-0.6B 为主，除非另注模型。WSL 内存 11GB + 4GB swap（`C:\Users\admin\.wslconfig`）。
+>
 > **串讲三原则**：①先讲成本模型与上界，再讲实现；②主动交代"哪里亏、为什么"（比吹嘘可信）；
-> ③所有数字带条件（单卡 RTX 5060 Ti 16GB / WSL2 / bf16 / flash-attn 2.8.3 / 模型量级）。
+> ③所有结论要么有探针证据、要么明确标注"未验证"。方法学信条：**跑通 ≠ 写对**。
 
 ---
 
-## 0. 电梯陈述（30 秒 / 2 分钟 / 5 分钟）
+## 目录
 
-### 30 秒
-> 我从零实现了一个 vLLM 风格的推理引擎（约 1200 行 Python + Triton，不依赖任何推理框架）：
-> 连续批处理调度（混合 prefill/decode）、paged KV cache + 前缀缓存 + COW、CUDA graph、
-> 五条量化路径（w8a8/int4/AWQ/fp8/2:4 稀疏）、三种投机解码（n-gram/Medusa/EAGLE）、
-> KV swap 抢占、按层流式加载、Qwen3-MoE 混合专家，并移植了 Qwen/Llama/Mistral/
-> Gemma-2 五个模型家族。
-> 每个功能都与 HF 参考逐 token 对齐、与真实 vLLM 同 workload 对比过，并诚实记录了
-> 哪些场景是亏的。
-
-### 2 分钟
-> 主线：**调度 → 内存 → 内核 → 量化 → 投机 → 系统 → 多模型**，每段 2-3 句 + 一个数字。
-> - **调度**：先做"先全 prefill 再 decode"，实测发现早完成者死等 → 改成 vLLM V1 同款混合
->   批次（prefill 行在前、decode 行在后共享 token 预算），吞吐全档 +7~21%、抢占减半。
-> - **内存**：paged KV cache（块 256）+ 链式哈希前缀缓存 + COW 安全写共享块 + 分块 prefill；
->   后来加的 KV swap 抢占用 CPU 缓冲换出 decode 序列，**bit-exact 0 误差**——但诚实结论是
->   本机（0.6B+WSL2）上 swap 比重算慢，价值在 7B+ 与真实 Linux。
-> - **内核**：flash-attn 的 fp8 KV 路径在 sm_120（Blackwell 消费卡）不可用（FA3 是 Hopper-only），
->   自己写 Triton 内核（decode + verify 两套），fp8 KV 容量 1.9×、精度 KL 0.0073；这是
->   自研内核里最能打的点——"vLLM 在这张卡上跑不了的东西我能跑"。
-> - **量化**：五条路径里 **fp8 是唯一大 M 不输 cuBLAS 的**（decode 走权重-only Triton 内核、
->   prefill 走硬件 FP8 MMA），ppl 3.60 vs fp16 3.60（+0.1%）近乎无损，bs=256 吞吐 5825 tok/s
->   是全模式峰值；2:4 稀疏的结论是"内核 bit-exact 但一次性剪枝丢 35% 权重质量"——技术
->   可行性评估型交付，知道哪里亏比什么都做更有信息量。
-> - **投机**：n-gram/Medusa/EAGLE 三种都做通。核心理解是成本模型 γ·T_draft+T_verify vs
->   收益 (1+αγ)，而上界 α ≤ 模型 top-1 可预测性（实测自由文本 35%）——EAGLE γ=2 在
->   重复内容 +3.26×，free 文本只有 +0.70×，数字与理论互相印证。
-> - **系统**：16GB 卡跑 7B+ 靠按层流式加载（meta 构造 → 逐层物化 → 加载即量化，峰值
->   10.7~11.6GB）；meta 物化踩了三个坑（to_empty 丢 weight_loader、RoPE 缓存全零、tie 重绑）。
-> - **多模型**：注册表按 model_type 分发，移植 Qwen2.5/Llama-3.1/Mistral（SWA）/Gemma-2
->   （soft-cap），全部与 HF 参考 prefill logits top-1 100% 一致；Gemma-2 有"读源码才能发现"
->   的三个细节（embed ×√d、RMSNorm (1+w)、双残差四 norm），是逐层二分定位出来的。
-
-### 5 分钟
-> 2 分钟版本 + 三个"证伪"故事 + 两个诚实结论：
-> - **证伪 1（大 tile 假设）**：int4 内核最初按"大 tile 更优"直觉调优，实测小 M 大 N 的
->   权重带宽主导形态才赢（4.36×），大 M 全输——于是做**双路径路由**（每层走自己赢的形态），
->   而不是硬碰 cuBLAS。
-> - **证伪 2（分页瓶颈假设）**：假设 paged attention 的 gather 是瓶颈，实测 decode 的瓶颈
->   是权重带宽而非 KV 索引——这决定了 fp8 权重的方向（0.5× 字节）而不是继续优化索引。
-> - **证伪 3（启动税假设）**：投机 verify 步慢，先怀疑内核，逐层 hook 计时发现是 CPU 启动
->   税 ~10ms/步 → 用 CUDA graph 固定容量重放，spec 从打平变赢（bs=8 repeat +3.87×）。
-> - **诚实结论 1**：KV swap 在本机比 recompute 慢（27.8s vs 11.8s）——机制正确但不划算，
->   价值在 7B+（重算贵）+ 真实 Linux（D2H 快）。
-> - **诚实结论 2**：2:4 稀疏、纯 int4 大 batch、EAGLE γ=4 都是"内核/机制正确但整体亏"——
->   知道边界在哪，比什么都做更能体现对推理系统的理解。
+- §1 学习路线（怎么读代码） · §2 电梯陈述 · §3 主线叙事 · §4 深水区问答
+- §5 数字速查 · §6 踩坑故事 · §7 方法论 · §8 精进路线图 · §9 代码地图 · §10 基准档案 · §11 附录
 
 ---
 
-## 1. 主线叙事（按阶段，每阶段：一句话贡献 + 关键数字 + 为什么值得讲）
+## 0. 全局图景（30 分钟，先读文档）
 
-| # | 阶段 | 一句话贡献 | 关键数字 | 为什么值得讲 |
-|---|---|---|---|---|
-| 1 | vLLM 对比基准工程 | 先把"测量"做对：逐请求时间戳、同 workload 同 seed、两侧同 flash-attn | 吞吐 1.35-1.61× 领先；**decode 单步与 vLLM 持平（kernel 级可比）** | 口径诚实：离线 API 不暴露逐请求指标时用聚合直方图并声明近似 |
-| 2 | FP8 KV cache + 自研 decode 内核 | FA3 是 Hopper-only，sm_120 只能自研 | 容量 1.9×；KL 0.0073；逐层 1.9→1.15ms | **"vLLM 在这张卡跑不了，我能跑"** 的差异化点 |
-| 3 | W8A8（per-group + SmoothQuant） | int8 权重 + int8 激活 + 平滑折权重 | KL 0.0379（平滑后）；吞吐 -16% | 量化精度方法论：per-group 比 per-channel 细 8 倍 |
-| 4 | 混合调度（V1 同款） | 消除"先全 prefill 后 decode"的死等 | 吞吐 +7~21%；抢占 85→68 / 141→71 | 调度器设计的核心权衡 |
-| 5 | 投机解码框架（ngram→Medusa→EAGLE） | verify 步 = 带前缀复用的 varlen prefill + CUDA graph | verify 启动税 ~10ms/步被消除；EAGLE γ=2 repeat +3.26× | 成本模型 + α 上界 = 投机解码的完整理解 |
-| 6 | fp8 varlen 内核 | verify 步直接读 fp8 缓存（免逐层反量化） | fp8+spec 从 0.15× 变 +3.92×（bs=8 repeat） | 内核与调度配合消除显存搬运 |
-| 7 | INT4/AWQ 双路径 | 按形态路由：小 M 大 N 走 int4 内核，其余走 w_deq 稠密 | bs=8 +35%、bs=256 +3~6%；ppl 4.38→3.76（AWQ） | "带宽优化型内核在计算主导区间的天花板"的正面解法 |
-| 8 | 2:4 稀疏（可行性评估） | 内核 bit-exact；一次性剪枝是精度灾难 | KL 8.5；cuSPARSELt sm_120 每调用 0.3-0.5ms | 技术评估类交付：知道"为什么不做" |
-| 9 | 多模型：注册表 + 流式加载 + Qwen2.5/Llama | 16GB 卡跑 7B+ 的唯一路径 | Qwen2.5-7B 峰值 10.66GB；Llama-3.1-8B 11.62GB；parity top-1 100% | meta 物化三坑（to_empty/weight_loader/RoPE） |
-| 10 | FP8 权重 | 唯一大 M 不输 cuBLAS 的量化 | ppl +0.1%；bs=256 5825 tok/s（1.22×）；8B prefill TTFT 210ms vs int4 813ms | 双路径（Triton 内核 + 硬件 _scaled_mm） |
-| 11 | EAGLE-1 | 无 RoPE 草稿层 + 共享 LM head 自回归 | γ=2 repeat +3.26×（α 0.525）；γ=4 只有 +0.63× | γ 是成本模型的关键变量 |
-| 12 | KV swap 抢占 | decode 序列 KV 换 CPU，恢复 bit-exact 免重算 | bitexact 0 误差；699 次换出；**本机比重算慢（27.8 vs 11.8s）** | 机制正确 + 条件诚实的样板 |
-| 13 | Mistral（SWA）+ Gemma-2（soft-cap） | 两个新机制家族：滑动窗口 + logit soft-cap | parity top-1 100%（0.014/0.022）；Mistral 311 tok/s、Gemma2 1095 tok/s | Gemma-2 三个隐藏架构细节的定位方法论 |
-| 14 | 工程素养：脚本 argv 化 + 验证工具箱 | 22+ 脚本模型路径全部参数化；pytest 41 例 + parity/内核对照/ppl 的回归矩阵 | 新模型复用全部基准零改动 | "测量与回归"是可信度的基础设施 |
-| 15 | MoE 支持（阶段 1.5） | router top-k + 循环专家 + 量化专家 + Qwen3-MoE 端口 | **引擎 parity top-1 100%（mean diff 0.003）**；decode int4/fp8 ≈2×（专家权重带宽受限） | DeepSeek-V3 主线铺垫；两个反直觉实测（负载不均偏好集中 / toy 顶层贴边假警报） |
+| 读什么 | 要点 |
+|---|---|
+| `CLAUDE.md` | 架构总览：请求生命周期、Context 单例契约、KV cache、前缀缓存/COW、调度、投机、CUDA graph、TP |
+| 本档 §10.1 | TTFT/TPOT/E2E/p50/p99/SLO 的口径——后面所有数字都基于它 |
+| `AGENTS.md` | 模块组织、开发约定 |
+| `nanovllm/config.py` | 全部开关：quantization/speculative/kv_cache_dtype/int4_dense_path/awq_scales_path/rolling_cache……每个字段对应一个功能 |
+
+**目标**：能说出"一次 `LLM.generate` 从进队列到出 token 经过了哪几个大环节"（§9.2 链 B）。
 
 ---
 
-## 2. 七大模块深水区（每个：机制 1 段 + 必问必答 + 数字 + 诚实结论 + 追问应对）
+## 1. 学习路线（按依赖排序）
 
-### 2.1 调度与批处理
+按"先懂主线、再懂优化、最后懂投机与量化"的顺序组织。每步：**读什么（文件/类/函数）**、
+配套脚本、验证出口。建议配合 `git log` 看每个功能的提交历史（提交信息是短摘要，能还原当时的问题与解法）。
 
-**机制**：`Scheduler.schedule()` 返回 `(seqs, kind)`，kind ∈ prefill/decode/**mixed**/spec。
-三队列 WAITING/RUNNING/FINISHED；混合批次 = prefill 行在前、decode 行在后，共享
-`max_num_batched_tokens` 预算（vLLM V1 同款）；分块 prefill 只允许第一个被调度序列拆分
-（其余拆分会破坏"每个 seq 每步至多一个 chunk"的不变量）；KV 块不足时抢占（decode 序列
-优先 swap_out / 其余 recompute 回 waiting）。
+### 1.1 主链路速读（最重要，2-4 小时）：十步走通一次生成
 
-**必问必答**：
-- **Q：混合批次为什么赢？** A：早完成 prefill 的请求立即 decode，消除死等；decode 提前释放
-  KV 块、降低抢占压力。实测吞吐 +7~21%、抢占减半（512 档 141→71）。但 TPOT 改善有限——
-  它受总工作量下界约束，收益在流式延迟与资源利用率。
-- **Q：分块 prefill 为什么只拆第一个序列？** A：多序列同时分块会让每步的 token 预算碎片化
-  且块表管理复杂化；只拆第一个等价于"按到达顺序把预算给第一个长序列"，实现简单且覆盖
-  了主要场景（少数长 prompt 拖尾）。
-- **Q：抢占后怎么恢复？** A：recompute = 回 waiting + 释放块，恢复时按前缀缓存哈希命中
-  部分免算；swap = KV 拷 CPU、释放块、进独立 swapped 队列，恢复时直接 decode（免 prefill）。
-  草稿（投机）作废。
-
-**数字**：混合调度吞吐全档 +7.2%~+21.3%；抢占 384 档 31→20、512 档 141→71；256 档峰值
-5840 tok/s（fp16）。
-**诚实结论**：我们的调度是"V1-style 简化版"——没有 SLO 感知优先级、没有多步 decode 的
-调度语义、没有 PD 分离。vLLM V1 的完整调度器（token 预算 + 优先级 + 抢占策略）值得逐行深读。
-**追问应对**：被问"生产调度还缺什么"→ 答 SLO（TTFT/TPOT 目标）、优先级队列、multi-step
-decode 的调度、preemption 策略参数化（swap vs recompute 的成本模型）。
-
-### 2.2 KV cache 与内存管理（paged / 前缀缓存 / COW / 分块 prefill / KV swap）
-
-**机制**：BlockManager 管理固定块池 + `hash_to_block_id`；块哈希是链式
-（xxhash(token_ids) + 前块哈希 8 字节 LE）；**部分块也缓存**（末块按实际 token 数记账）；
-写共享块前 COW 复制（GPU 整块 K/V 拷贝，`cow_pairs` 在 run 前执行）；哈希条目删除带守卫
-（两个相同内容块可共享同一哈希）；KV swap 用独立 swapped 队列 + CPU 非 pinned 缓冲 +
-`kv_swap_space_gb` 预算。
-
-**必问必答**：
-- **Q：paged attention 与 vLLM 的差异？** A：块大小 256 vs vLLM 16（影响内部碎片与哈希
-  粒度）；我们的 COW 在调度器记账、引擎 step 里执行；vLLM 的 block manager 更细（
-  BlockAllocator 分 CPU/GPU、前缀缓存与 COW 的块级记账）。
-- **Q：COW 的安全性怎么保证？** A：写起点落在共享块（ref_count>1）时复制一块并换表；
-  复制对在 GPU 上执行；被复制块保留 refcount 直到写完成；哈希条目删除带守卫防止误删
-  他人条目。
-- **Q：KV swap 为什么 bit-exact？** A：KV 内容原样拷 CPU、换入时 `index_copy_` 原位写回
-  新分配的私有块（不查前缀缓存），恢复后采样流确定。**坑**：高级索引
-  `kv_cache[:, :, ids]` 返回副本，`.copy_` 只改副本——必须 `index_copy_`（故事 14）。
-- **Q：swap vs recompute 怎么选？** A：成本模型：swap = D2H+H2D 拷贝带宽；recompute =
-  重新 prefill 的计算量。7B+ 重算贵（几十 ms/步）→ swap 赢；0.6B 重算便宜 + WSL2 D2H 慢
-  → recompute 赢。实测 27.8s vs 11.8s（本机）。
-
-**数字**：前缀缓存跨批次 prefill 降为 0 token/0 步；FP8 KV 容量 1.9×（421→802 块）；
-KV swap bitexact 0 误差、96×512 压力 699 次换出、27.8s vs recompute 11.8s。
-**诚实结论**：滚动缓冲（SWA 真省显存）未做——flash 从块表索引推导 key 位置，滚动表需
-flash fork 或自研内核（vLLM 也是只掩码不滚动）。
-**追问应对**：被问"前缀缓存怎么失效"→ 内容哈希链式、被拒草稿永不进哈希（投机）、
-COW 副本重新发布哈希。
-
-### 2.3 CUDA 内核与性能工程（6 个 Triton 内核 + CUDA graph + roofline 归因）
-
-**机制**：自研内核按形态分两类——**计算型 GEMM**（int8/int4/fp8/sparse24，M-adaptive
-tile：小 M 用 16×128 权重带宽主导、大 M 用 16×128（int4，roofline 搜索后））与**访存型
-注意力**（fp8 KV decode/varlen 内核，GQA 融合 + MMA + 寄存器内反量化，BLOCK_T=32/warps=1
-实测最准最快）。CUDA graph：decode 按 batch 容量族捕获共享内存池；spec 步按"行容量 ×
-双 stride"捕获，真实行 + 零长度填充行重放（bit-exact）。
-
-**必问必答**：
-- **Q：你的 int4 内核为什么小 M 赢、大 M 输？** A：小 M（decode）是权重带宽主导——int4
-  权重字节 = bf16 的 1/4，带宽减半 → 实测 gate_up M=8 4.36×；大 M（prefill）是计算主导，
-  MMA 计数与稠密相同 + 反量化开销 → 之前 0.2-0.6×。**结论：软件低比特 GEMM 是带宽优化，
-  不是计算优化**——双路径路由的动机。
-- **Q：roofline 归因怎么做？** A：先用实测标定上界（cuBLAS 大 GEMM 测 TC 峰值 48.5 TFLOPS、
-  D2D copy 测带宽 370 GB/s），再按 arithmetic intensity（AI=2MNK/流量字节）分类：AI≥128
-  算力受限、AI<128 带宽受限，还有第三种"启动/并行度受限"（小 M 时两者都远低于峰值）。
-  归因结果：fp8 大 M 到 **81% TC**、int4 大 M 只有 44%（寄存器内反量化限制）、decode 小 M
-  是启动受限。
-- **Q：手写 MatMul 到什么水平？** A：SMEM-tiled fp16（Triton 控制 tile/流水/线程）达
-  **101% cuBLAS**（4096³/16384³）。消融：GROUP_M swizzle 只 +4%（大矩阵 L2 收益有限）；
-  stages=2 最优（三缓冲挤 SMEM，四缓冲 OOM）；**最优配置 occupancy 只有 17%**——大 GEMM
-  是 TC 吞吐型，occupancy 不是瓶颈（反直觉，面试反例）。
-- **Q：tile 搜索找到什么？** A：**int4 大 M 用 BM16/BN128（regs=128）反超 BM64/BN256
-  （regs=255）19%**——大 tile 的 acc 累加器把寄存器打到 255 上限、占用掉到 1 block/SM；
-  小 tile 2 blocks。低比特内核的"反量化在寄存器里做"让大 tile 的寄存器成本尤其高。
-  落地后**纯 int4 大 batch +28%**（0.64×→0.82× fp16）。
-- **Q：自研 fp8 注意力内核的关键决策？** A：①GQA 融合（一 program 处理 seq×kv_head 的整组
-  q 头，KV 只读一次）；②直接 fp8 load + 硬件 cvt 反量化（无 LUT gather）；③MMA 计算
-  （QPAD 填充到 16 满足 dot 的 N≥16，8× 计算浪费换内存效率——decode 是 memory-bound）；
-  ④num_warps=1（跨 warp 归约顺序变化放大误差）。归因：有效 KV 读带宽 517-529 GB/s
-  （超过 copy 370 的双向口径）——**带宽型内核，算力远未饱和**。
-- **Q：CUDA graph 的坑？** A：形状必须静态（按容量族）；共享内存池避免碎片；spec 图用
-  尾部重复 cu_seqlens 的空行填充（flash grid 按容量烘焙，重放只是数据）——bit-exact 用
-  probe 验证过。
-
-**数字**：硬件锚点（实测）TC 峰值 **48.5 TFLOPS**、带宽 **370 GB/s**、36 SM、SMEM 100KB/SM；
-手写 MatMul **101% cuBLAS**；int4 gate_up M=8 **4.36×**、lm_head 3.42×、down_proj 0.40×；
-fp8 M=8 4.17×、M=256 1.98×（scaled_mm）；fp8 大 M Triton **81% TC**；**int4 大 M tile 改进
-+19% → 纯 int4 大 batch 3916.5 tok/s（0.82× fp16，原 0.64×）**；fp8 decode 内核逐层
-1.9→1.15ms；verify 启动税 ~10ms/步被 graph 消除。
-**诚实结论**：已做 roofline 归因 + 系统性 tile 搜索（`benchmarks/_kernel_roofline.md`）；
-**CUDA C 补课已落地**（`benchmarks/_cuda_gemm_report.md`：nvcc 12.8 工具链 + 手写 fp16 GEMM
-到 cuBLAS 53% + bank-conflict 消融 + split-K/persistent 边界，全部 SASS 实证）；fp8 大 M
-Triton +8.6% 未落地（引擎走硬件 scaled_mm）；搜索方法论教训：**快速搜索的 "+144%" 异常值
-被高迭代复测推翻**。
-**追问应对**：被问"还能怎么快"→ cp.async/TMA 双缓冲流水（v2b 之后的主差距）、ldmatrix
-canonical 布局、KV 块排序提 L2 命中、把 w_deq 降精度存储（fp8 引入 dequant 流量不划算）；
-persistent/split-K 已实测（本机 persistent 亏、split-K 仅小 M 赢——被追问时给条件不给
-背书）。
-
-### 2.4 量化（五条路径的取舍 + 精度方法论）
-
-**机制**：w8a8（per-group 128 int8 + per-token int8 + SmoothQuant 平滑）、int4（per-group
-128 对称 + 2-dot 反量化内核 + 双路径）、AWQ（α 搜索缩放折叠进权重）、fp8（e4m3 全量化：
-per-column 权重 + per-token 激活）、sparse24（2:4 幅值剪枝）。FP8 KV cache 单独一条线。
-
-**必问必答**：
-- **Q：AWQ 为什么有效？** A：大激活通道的权重误差贡献大——把 s 折进权重（W'=W·s）让大
-  激活通道的量化相对误差变小，激活侧除 s（X'=X/s）压小误差贡献。**方向必须对**（权重乘、
-  激活除）；方向错了 α 搜索会假装"不缩放最优"。实测 ppl 4.38→3.76（把 int4 相对 fp16 的
-  差距砍半）。
-- **Q：fp8 为什么近乎无损？** A：e4m3 的 3 位尾数 + per-column scale + per-token 动态激活
-  scale；ppl 3.60 vs fp16 3.60（+0.1%）；KL 0.017、top-1 100%。
-- **Q：2:4 稀疏为什么失败？** A：内核 bit-exact，但**一次性幅值剪枝丢 ~35% 权重质量**
-  （KL 8.5）——SparseGPT 式误差补偿或剪枝感知训练是修复路线；且 sm_120 上 cuSPARSELt
-  每调用开销 0.3-0.5ms、CUTLASS 仅 sm_8x。
-- **Q：量化精度怎么测才可信？** A：8-prompt KL 被尾部单点主导（曾与 ppl 结论相反）→
-  换真实文本困惑度（3000+ token）。**指标的样本量决定结论方向**。
-
-**数字**：0.6B ppl：fp16 3.60 / fp8 3.60 / int4 4.81 / awq 4.22；KL：fp8 0.017、w8a8
-0.0379、int4 1.08；Qwen2.5-0.5B ppl fp16 5.12 / int4 7.45（0.5B 量化鲁棒性弱）。
-**诚实结论**：int4 双路径的 w_deq 副本让显存 1.73GB 比 fp16 还大——吞吐无损的定价。
-**追问应对**：被问"为什么不用 GPTQ"→ GPTQ 用 Hessian 逆做逐列误差补偿，理论上优于 RTN；
-我们没实现——这是已知差距（§6 路线 4）。
-
-### 2.5 投机解码（n-gram / Medusa / EAGLE）
-
-**机制**：verify 步 = 带前缀复用的 varlen prefill（query = [末 token, 草稿...]，位置从
-len-1 起，num_cached=len-1）；接受规则（Leviathan et al.）：草稿是点质量分布，"接受 iff
-目标采样==草稿"严格保持分布；被拒草稿永不进前缀缓存哈希；verify 步 CUDA graph 化（行容量
-族 + 双 stride）。三个草稿源：n-gram（历史窗口搜索，零成本）、Medusa（γ+1 个 MLP 头）、
-EAGLE（无 RoPE 草稿层 + 共享 LM head 自回归）。
-
-**必问必答**：
-- **Q：投机解码的成本模型？** A：期望加速 = (1+αγ)/(γ·T_draft+T_verify+1)，α = 草稿
-  接受率；**上界 α ≤ 模型 top-1 可预测性**（实测自由文本 35%）——这解释了为什么所有方案
-  在 free 文本上只有 ~1.5-2×、重复内容上 3-4×。
-- **Q：为什么 EAGLE γ=2 赢、γ=4 输？** A：γ=4 每草稿一次 LM head 前向（0.6B 上 ~0.8ms）
-  + 特征误差累积（草稿质量随深度下降）；γ=2 的 (1+αγ) 收益 > 成本。实测 γ=2 repeat
-  +3.26×（α 0.525）、γ=4 只有 +0.63×。
-- **Q：verify 步为什么用 varlen prefill 而不是 decode？** A：多草稿是"一行多个 query token"
-  ——本质是变长的小 prefill；复用分块 prefill + 前缀复用路径（缓存形状 K/V + block tables），
-  不需要新的注意力形态。
-- **Q：fp8 KV + 投机怎么结合？** A：verify 步走自研 fp8 varlen 内核直接读 fp8 缓存（免
-  逐层全缓存反量化，~18GB/步的搬运）——从 0.15× 变 +3.92×。
-
-**数字**：ngram bs=8 repeat +3.87×、bs=256 +1.43×；Medusa bs=8 +1.57×；EAGLE γ=2 +3.26×；
-free 文本全部 ~1.5-2×（α 0.19-0.23）；0.6B top-1 可预测性 35%。
-**诚实结论**：α 被模型可预测性封顶——投机在"模型太笨"时赚不到；这是理解投机解码的关键。
-
-### 2.6 系统与工程（流式加载 / 多模型 / TP / 验证方法论）
-
-**机制**：按层流式加载（meta 构造 → 逐层 to_empty 物化 → 加载即量化 → 释放 fp16）；
-注册表按 model_type 分发；TP 用 NCCL + 共享内存命令通道（weight_loader 分片 + all_reduce）；
-验证方法论 = HF 参考 logits 对照（top-1 100%）+ 内核独立对照 + 引擎级 smoke。
-
-**必问必答**：
-- **Q：meta 物化踩了什么坑？** A：①torch 2.8 禁止 meta→真实设备 `.to()`，必须 `to_empty`；
-  ②to_empty 替换 Parameter 丢 weight_loader → 按模块重挂；③RoPE 的 cos_sin_cache 是计算型
-  buffer，物化后全零 → q/k 被零旋转逐层发散 → 必须 build_cache() 重建；④tie 词表重绑。
-- **Q：16GB 卡怎么跑 7B+？** A：按层加载 + 即时量化——任一时刻显存 ≈ 累计量化权重 +
-  单个 fp16 层 + embed；7B int4 峰值 10.7-11.6GB。自动触发阈值 = fp16 估重 > 空闲显存 45%。
-- **Q：新架构端口（Gemma-2）怎么验证？** A：HF parity 逐层二分——embed → 层0 → 层1 →
-  hidden，每个中间量对比；发现三个隐藏细节（embed ×√d、RMSNorm (1+w)、双残差四 norm），
-  都是"checkpoint 里看不出来、读源码才能发现"的初始化语义。**教训：debug 脚本自身的
-  形状/口径也要先钉对，否则拿到的 diff 全是假象**。
-- **Q：TP 为什么没实测多卡？** A：单卡环境；实现完整（weight_loader 分片 + NCCL 命令通道
-  + 序列跨进程），但 multi-GPU 验证是已知空白（§6 路线 5 的理论补强）。
-
-**数字**：Qwen2.5-7B int4 峰值 10.66GB / Llama-3.1-8B 11.62GB / Mistral-7B 11.37GB；
-parity：qwen2.5-0.5B top-1 100%（mean 0.096）、mistral 100%（0.014）、gemma2 100%（0.022）。
-**诚实结论**：PP/DP/EP 未实现；TP 未实测；CacheBlend、PD 分离只在文档里设计过。
-
-### 2.7 MoE（混合专家：router + 循环专家 + 量化专家）——阶段 1.5
-
-**机制**：MoE 只替换 FFN——`mlp.gate`（router，fp32 softmax → top-k，可选
-norm_topk_prob）+ `mlp.experts.{i}.gate_proj/up_proj/down_proj`（2D per-expert，
-参数名与 HF checkpoint 直配 → loader 零改动、量化路径自动继承）；前向 = 逐专家
-循环（串行、e 升序、x dtype 累加，与 transformers eager 同语义）；router 永不量化
-（gate 精度决定路由）。权重布局决策被事实修正过：transformers 5.15 内存 3D、**存盘
-2D**（`use_experts_implementation`）。loader 的 packed 匹配改"点分段相等"（dense 的
-`up_proj` key 是 MoE `gate_up_proj` 子串，旧任意子串 replace 会毁名）。
-
-**必问必答**：
-- **Q：MoE 影响引擎哪些部分？** A：只 FFN。调度/KV/注意力/CUDA graph 结构全复用；
-  但动态 gather 形状不能进 CUDA graph（capture 烘焙形状重放静默错）→ MoE 模型
-  enforce_eager，graph 化需路由 padding（未做）。
-- **Q：怎么验证 MoE 正确性？** A：三层：①数学同构参考（全行掩码 vs gather/index_add，
-  同序累加）→ 位级一致（GPU fp16 多数 0 diff）；②CPU 单测进 pytest（49 例）；
-  ③端到端：随机 toy（4 层混合 + tie）引擎 vs transformers 5.15 同权重同 dtype →
-  **top-1 100%、mean diff 0.003**。
-- **Q：负载不均怎么办？** A：实测串行循环实现**免疫且偏好集中**（强制全 token 进一
-  专家反而快 3.6-5×；k=8 sanity ≈1）——"最慢专家"瓶颈是并行/EP 形态的问题，不是
-  串行循环的。真正的成本是固定组织税（~3.8ms/层、与 T 无关）——已被 1.5b 的
-  grouped 批量后端消除（见下）；新后端的代价在不均衡路由下 padding 放大到 E·max_n
-  （均衡路由近 1×），这是真段式内核（无 padding）的动机。
-- **Q：MoE 量化值不值？** A：decode 专家 GEMM 是权重带宽受限 → int4/fp8 ≈2×
-  （toy 12-seq：fp16 185-475 → int4 927-1110 tok/s，方向稳健、绝对值受 WSL 时钟
-  噪声）；层误差 fp8 6.4% / int4 12.5%（RTN 预期）。
-- **Q：吞吐路径怎么做快的（1.5b grouped 后端）？** A：组织税实测 3.8ms/层
-  （Python 循环 + 每专家启动）→ 排序分段 + **padded 批量 bmm**（gate_up 3D 融合 +
-  silu·up 融合 + down）→ 0.7ms（-80%），小 T 快 4-5×、T=4096 1.9×；可组条件 =
-  专家有 float 权重（未量化或 int4 dual-path 的 w_deq），纯 int4/fp8 回退循环；
-  不均衡时 padded 计算放大到 E·max_n（本尺度实测仅 +30%）。1.5c 又写了 Triton
-  真段式内核（无 padding、位级正确、引擎 parity 100%）——实测它的赢面很窄：
-  **小 E + 极长段**才赢（E=8/R=32K 快 43%），E=128 与 cuBLAS batched 持平、
-  小段 3-10× 慢（BM 地板）→ 默认仍是 bmm，段式作显式开关。教训：内核的
-  "理论优势"要用实测边界校验，别默认换实现。
-  引擎观察：int4 dual 自动走 grouped（w_deq）→ toy decode 2588 tok/s（~2.4-2.8×）。
-- **Q：transformers 的坑？** A：5.15 专家 grouped_mm 仅 sm_90+，sm_120 崩 → 回退
-  `_experts_implementation="eager"`。
-
-**数字**：parity top-1 100%（mean 0.003）；decode int4/fp8 ≈2×；量化层误差 fp8 6.4%/
-int4 12.5%（随机 toy）；顶层贴边证据：toy logits top1-top2 gap 仅 0.4-0.7σ；
-**1.5b grouped 后端**：组织税 3.8→0.7ms/层（-80%），小 T 快 4-5×、T=4096 1.9×；
-int4 dual-path 自动走 grouped（w_deq）→ toy decode 2588 tok/s（~2.4-2.8× 观察）。
-**诚实结论**：padded 批量在不均衡/大 E 时放大到 E·max_n（本尺度仅 +30%）——真段式
-grouped（Triton，无 padding）是 128+ 专家模型的下一步；量化纯 int4/fp8 无 float 视图
-仍回退循环；无真实模型精度数字（30B-A3B int4 ~15.5GB 超本机、V2-Lite ~8GB 可跑但
-bf16 下载 ~30GB 需联网核对）。
-**追问应对**：被问"怎么快"→ grouped GEMM（按专家排序批量）、路由 padding 入图、
-shared expert（Qwen3-235B 类，transformers 5.15 已删）、EP + all-to-all 通信模型
-（§6 阶段 5 的 DeepSeek MoE 理论项）。
-
----
-
-## 3. 数字速查（全部带条件：RTX 5060 Ti 16GB / WSL2 / bf16 / 单卡，除非另注）
-
-| 项 | 数字 | 条件 |
-|---|---|---|
-| 引擎吞吐峰值 | **5825 tok/s**（fp8，1.22× fp16）；fp16 基线 **4792 tok/s** | Qwen3-0.6B，bs=256，干净 workload |
-| vLLM 对比 | 吞吐 1.35-1.61× 领先；prefill ~2×；**decode 单步持平** | 同 workload 同 seed 同 flash-attn |
-| 混合调度 | 吞吐 +7~21%；抢占减半 | 全 batch 档 |
-| FP8 KV | 容量 1.9×；KL 0.0073；top-1 100% | fp8_e4m3 + 自研内核 |
-| fp8 权重 | ppl +0.1%（3.60）；bs=256 5825 tok/s；8B prefill TTFT 210 vs int4 813ms | e4m3 全量化 |
-| int4（双路径） | bs=8 +35%、bs=256 +3~6%；ppl 4.81；显存 1.73GB | w_deq 副本 |
-| int4（纯 int4 模式） | 显存 0.85GB（0.57×）；**bs=256 3916.5 tok/s（0.82× fp16，tile 搜索后从 0.64× +28%）** | 大 batch 仍慢于 fp16，显存优先选项 |
-| int4 微基准 | gate_up M=8 **4.36×**、lm_head 3.42×、qkv 1.6-2.0×；down_proj **0.40×**、M≥128 全输 0.2-0.6× | 权重带宽主导才赢 |
-| AWQ | ppl 4.38→3.76；112 层 α 搜索全赢 | 真实文本校准 |
-| W8A8 | KL 0.0379；吞吐 -16% | per-group 128 + SmoothQuant |
-| 2:4 稀疏 | 内核 bit-exact；KL 8.5；cuSPARSELt 0.02-0.17× | 一次性幅值剪枝 |
-| n-gram spec | bs=8 repeat +3.87×；bs=256 +1.43× | verify graph 后 |
-| Medusa | bs=8 repeat +1.57×；head_0 = 模型 top-1 的 87% | 自蒸馏训练 ~7min |
-| EAGLE-1 | γ=2 repeat +3.26×（α 0.525）；γ=4 +0.63× | 0.6B，重复内容 |
-| 模型可预测性 | 自由文本 top-1 35% → 投机 α 天花板 | 0.6B |
-| KV swap | bitexact 0 误差；699 次换出；**27.8s vs recompute 11.8s（亏）** | 0.6B+WSL2 |
-| 流式加载 | Qwen2.5-7B 峰值 10.66GB / 8B 11.62GB / Mistral 11.37GB | int4，16GB 卡 |
-| 端口 parity | qwen2.5 100%（0.096）/ mistral 100%（0.014）/ gemma2 100%（0.022） | prefill logits vs HF |
-| 模型吞吐 | Llama-3.1-8B 303.5 tok/s（bs=16）；Mistral-7B 311.4（bs=32）；Gemma-2-2B 1095（bs=64） | int4 |
-| SWA | window 约定 (W-1,0)；4876-token 跨窗口跑通（957 tok/s prefill） | Mistral-7B |
-| soft-cap | attn cap=50 最大改 logits 1.7%；final cap=30 必须实现 | gemma-2-2b |
-| 精度方法论 | 8-prompt KL 与 ppl 结论相反 → 用 3000+ token 困惑度 | 样本量决定结论 |
-
----
-
-## 4. 踩坑故事精选（讲"方法论"而非"事故"）
-
-1. **独立检查通过 ≠ 引擎正确**（fp8 varlen 差 1 掩码）：随机数据检查通过、真实数据 logits
-   差 9-25——self-attention 的"自己分量"放大差 1。教训：独立验证必须覆盖真实分布。
-2. **小形状通过 ≠ 内核正确**（int4 打包列缺偏移）：小 N 检查全过、大 N 全错——按 N 块打印
-   误差分布一眼定位。教训：内核测试要覆盖多块路径。
-3. **8-prompt KL 与 ppl 结论相反**：被尾部单点主导——换 3060-token 困惑度后 AWG 收益才显现。
-   教训：指标的敏感度决定结论方向。
-4. **meta 物化丢计算 buffer（RoPE 全零）**：逐层 hook 对比定位（embed 一致、layer0 首 token
-   精确、RoPE 后 q/k 差 80-130 → 锁死 RoPE）；"buffer 对比通过"是 lru_cache 共享实例的假象。
-   教训：检查脚本必须清缓存再重建。
-5. **AWQ 方向三连错**：`W·s且X·s` → 反方向 → 论文方向才收敛；方向错时 α 搜索假装"不缩放
-   最优"。教训：先独立验证恒等式再信搜索。
-6. **高级索引写回是临时副本（KV swap 静默写垃圾）**：输出全错但长度/无崩溃全过——bitexact
-   测试（读-写-读回对比）才抓到。教训："跑通"不等于"写对"，写回操作必须验证内容。
-7. **Gemma-2 三个"读源码才能发现"的架构细节**：parity top-1 0% 逼出 embed ×√d（48×）、
-   RMSNorm (1+w)（比例 9.57 与 1.1167/0.1167 精确吻合）、双残差四 norm。教训：新架构端口的
-   唯一可靠验证是逐层对照 HF，且 debug 脚本自身口径先钉对。
-8. **flash window_size 含两端（off-by-one）**：probe 同时演示 (W,0) 与 (W-1,0)——API 的
-   "窗口大小"语义不唯一，先用最小对照实验钉死。
-9. **fp8 内核窗口掩码的 m=-inf 全掩块 NaN**：掩码改变"首块有效"假设——给内核加掩码要检查
-   m/l 累加器的空块行为。
-10. **Triton JIT 编译落进计时区间（TTFT 435ms 假象）**：bench 预热必须用真实 prefill 形状。
-    教训：任何带新 Triton 内核的功能都要验证基准口径。
-11. **投机多 token 接受跳过 max_tokens（`_maybe_finish` 的 `==`）**：投机步一次接受 2+ token
-    时精确相等永不命中 → 序列一路长到 max_model_len 溢出 spec graph 容量。ngram 的草稿预算
-    恰好避免，EAGLE 没加就暴露。教训：**预存 bug 常由新路径触发**——结束条件用精确相等
-    在多 token 步进下必然漏判，改 `>=`。
-
----
-
-## 5. 方法论总结（如何证明你懂推理系统）
-
-- **先讲成本模型与上界**：投机 γ·T_draft+T_verify vs (1+αγ)、α≤模型 top-1；swap 的
-  D2H 带宽 vs 重算；int4 的带宽 vs 计算主导。
-- **讲"我证伪过什么"**：大 tile 假设、分页瓶颈假设、启动税假设——证明有实证习惯而不是背书。
-- **主动说"哪里是亏的"**：KV swap 本机亏、2:4 精度灾难、纯 int4 大 batch 慢、EAGLE γ=4 亏——
-  比吹嘘可信。
-- **数字带条件**：单卡、WSL2、0.6B/7B/2B、flash-attn 版本、dtype。
-- **口径诚实**：vLLM 离线 API 不暴露逐请求指标 → 用聚合直方图并声明近似；decode 单步
-  才是 kernel 级可比口径。
-- **亮点句**："vLLM 在这张卡上跑不了 fp8 KV（FA3 是 Hopper-only），我的自研内核是唯一可跑
-  的实现，且精度 KL 0.0073、top-1 100%。"
-
----
-
-## 6. 深度精进路线图（往深走：顺序与理由）
-
-> 原则：按 **面试追问频率 × 技能可迁移性 × 本机可验证性** 加权排序；每个阶段给出
-> "具体动作 + 交付物 + 为什么"。穿插项：每个阶段读对应 vLLM/llama.cpp 源码做对照。
-
-### 阶段 1：内核与性能工程（CUDA 记忆模型 + roofline 归因 + 手写 MatMul）——**✅ 已完成**
-**交付（`benchmarks/_kernel_roofline.md` + `benchmarks/_cuda_gemm_report.md`）**：实测
-标定硬件锚点（TC 48.5 TFLOPS / 带宽 370 GB/s / 36 SM）；GEMM 三种性能形态（算力/带宽/
-启动受限）归因表（fp8 大 M 81% TC、int4 44% TC、decode 小 M 启动受限）；手写 SMEM-tiled
-fp16 MatMul **101% cuBLAS** + GROUP_M/stages/regs/occupancy 消融（最优配置 occupancy
-仅 17%——TC 吞吐型反直觉反例）；tile 网格搜索 → **int4 大 M 小 tile 反超 19%（regs
-255→128）→ 落地后纯 int4 大 batch +28%（0.64×→0.82× fp16）**；方法论教训：快速搜索的
-+144% 异常值被高迭代复测推翻。
-**CUDA C 补课（阶段 1b，全部 SASS 实证）**：工具链四坑打通（pip nvcc wheel 拆包只剩
-ptxas → conda nvcc 12.8.93；gcc15 崩 pybind11 → conda gcc14；CUDAHOSTCXX 失效 →
-gcc symlink；cuobjdump 12.4 无法解码 SM120 → 12.8）。手写 fp16 GEMM 四步：FMA naive
-1.6 → mma 单 tile 6.1 → **8 tile/warp + BsT 转置布局 20.8 TFLOPS（cuBLAS 53%）**，
-每步 SASS 证据（NOP/mma 6.5→1.3 是 TC 延迟隐藏的可视化指标）；**bank-conflict 消融：
-BsT 行距 32→34 消 16-way 写冲突，实测 +86%**（bank = 行距与 32 的 gcd 决定冲突度）；
-split-K 只在 block 数 < SM 数时赢（M=64 S=4 +59%），并行度够时部分和流量纯亏；
-persistent 本机全亏（0.89×，硬件 block 分发近零成本 + 动态均衡更优）。
-
-### 阶段 1.5：MoE 支持（router + 循环专家 FFN + 量化专家）——**✅ 已完成**
-**为什么插入**：DeepSeek-V2-Lite（阶段 2 的目标验证模型）是 **MLA + MoE** 双机制——两个
-新东西一起排错会互相污染归因，先把 MoE 单独做干净。且 MoE 是 DeepSeek-V3 面试主线。
-**交付（`benchmarks/_moe_report.md` + §2.7 深水区 + 主线表 row 15）**：
-①`layers/moe.py`（2D per-expert，对齐 HF checkpoint 存盘格式——transformers 5.15
-内存 3D/存盘 2D 的事实修正；loader 零改动、量化路径继承；router 永不量化）；
-②loader packed 匹配改"点分段相等"（防 dense key 子串碰撞）+ 单测；③`models/
-qwen3_moe.py` 混合层端口 + registry；④验证链：数学同构参考位级对照（10 场景）
-→ CPU 单测（pytest 49）→ **端到端 parity top-1 100%（mean 0.003）**；⑤量化专家 +
-引擎 decode **int4 ≈2-4× / fp8 ≈1.7-2.6×**（专家权重带宽受限形态）；反直觉实测：
-串行循环实现**偏好集中路由**（imbal/bal 0.2-0.28）、toy 量化 top-1 全翻是**顶层贴边**
-假警报（gap 0.4-0.7σ）；固定组织税 ~3.5ms/层（去 host sync 省一半）。
-**诚实边界**：无真实模型精度数字（30B-A3B int4≈15.5GB 超本机；V2-Lite/
-Qwen1.5-MoE-A2.7B ≈8GB 可跑，bf16 下载 ~30GB 需联网核对——脚本
-`_moe_model_probe.py` 就绪，hub 从 WSL 当前不稳）。
-**1.5b（fused/grouped GEMM，✅ 提交 072a1cc）**：组织税 → sort + padded 批量 bmm
-（gate_up 3D 融合）**3.8 → 0.7ms/层**（小 T 快 4-5×）；auto 后端（w_deq 可组；
-纯 int4/fp8 回退循环）；不均衡 padding 放大实测 +30%。
-**1.5c（Triton 真段式 grouped，✅ 提交 89c210d）**：offsets/counts 驱动段式内核
-（无 padding，位级正确 + 引擎 parity top-1 100%）；实测赢的窗口 = **小 E + 极长段**
-（E=8/R=32K → 0.70× 快 43%），E=128 与 bmm 持平（1.05×）、小段 3-10× 慢 →
-默认仍 padded-bmm，segment_backend 显式开关；量化纯 int4/fp8 的段式 grouped
-（打包布局）仍未做。
-**下一步**：shared expert（Qwen3-235B 类，transformers 5.15 已删该结构）；EP 理论在
-阶段 5。
-
-### 阶段 2：MLA（DeepSeek 潜在注意力）+ SWA 滚动缓冲——**第二**
-**为什么第二**：注意力是推理的核心，DeepSeek 是当前面试必考；MLA 有真模型可验证
-（DeepSeek-V2-Lite int4≈8GB 本机可跑）；滚动缓冲把文档里的 TODO 变完成，且正好用上
-阶段 1 的内核能力（滚动表的 key 位置偏移需要自研内核）。**具体动作**：①实现 MLA 层
-（latent 压缩 c_KV、decoupled rope、权重绑定 W_UK=W_DKVᵀ）+ KV cache 布局泛化 + naive
-对照单测（0 误差）；②DeepSeek-V2-Lite 端口 + HF parity；③KV 压缩率账本（V2-Lite 每
-token 每层 512+64×16 vs 等效 GQA 4096 ≈ 2.7×；V3 官方口径 576 的推导）；④滚动缓冲：
-per-seq 物理环 + refcount 守卫 + bf16 decode/varlen 内核的窗口位置偏移。
-
-**2a（MLA，✅ 提交见下）**：`models/deepseek_v2.py` 全模型端口（MLA + dense/MoE 混合 +
-shared experts + routed scaling）+ `layers/attention_mla.py`（fused cache [c_kv|k̃_pe]
-576 元素/token/层 + 吸收式 decode Triton 内核：W_UK→q、W_UV→输出，每 token 只读
-576 元素）+ KV 布局泛化（MHA 双张量 vs MLA fused；COW/swap 同步泛化）+ 引擎集成。
-验证链：decode 内核 vs 稠密参考 **位级 0 误差**（3 场景跨块）→ CPU 全模型 vs
-transformers 5.15 同权重 **top-1 100%（max 1e-6）** → 引擎 prefill/decode parity
-top-1 100%（mean 0.003-0.03）。上游怪癖实证：5.15 DeepseekV2 无缓存前向不传因果
-掩码（对照只能取末行/逐层显式掩码）；experts 内存 3D 直挂 Parameter（state_dict 键
-无 .weight）；flash varlen 要求 v head dim == k → v 零填充到 192 再截断。
-**顺带修复真实 bug**：RMSNorm fp32 下 x.float() 别名输入 → mul_ 原位归一化残差流
-中间张量（bf16 引擎无感、CPU fp32 参考错——逐层对照定位）。
-**诚实边界（2a 时代，已逐一消除，见 2b-ext）**：真实 V2-Lite checkpoint 未验证
-（hub 超时，bf16≈30GB，脚本待命）；纯 int4/fp8 无 float 视图 → decode 走稠密兜底
-（自动 eager，带宽优势消失）；fp8 KV + MLA 断言关。MoE 动态路由不能入 CUDA graph
-（与 Qwen3-MoE 同款边界）。账本修正：论文共享 rope key → 576 元素 **7.11×**
-（路线图旧口径 1536/2.7× 是"每头 rope key"的 naive 假设）。
-**2b（SWA 滚动缓冲，✅）**：`rolling_cache=True`（mistral 全层统一窗口 + bf16 +
-无投机）：块表 = 窗口内容清单（`Sequence.kv_j0` 行首逻辑块序号），驱逐
-`(front+1)·B ≤ N−W−slack` 先释放再分配（净零 free 消耗）；refcount 守卫显式
-断言（环模型不发布/不消费前缀缓存 → 块恒私有）；fp8 内核泛化 chunk_starts（
-key_pos=(j0+b)·B+t，flash 从表下标推位置会错位 → 自研 bf16 paged decode 内核，
-CUDA graph 同步支持）。验证：BM CPU 属性 pytest 4 项；引擎 e2e（mistral toy
-W=512 跨窗多轮）vs 稠密掩码参考 84 采样步 top-1 全一致。稳态内存 = 窗口 + B
-余量/序列（decode 不随生成长度增长——vLLM 掩码式 SWA 做不到）。
-**2b-ext（组合解锁 + 真实模型验证，✅ 报告 `benchmarks/_stage2b_ext_report.md`）**：
-① fp8 KV+环（decode 传 chunk_starts）与 fp8 KV+MLA（fused 行两段独立 scale，
-写量化/读反量化贯通内核与稠密装配）；② 投机(ngram)+环：修 BlockManager 环 spec
-账本（表项=逻辑块 j0+i）、verify 行 key 集 [j0·B, end) 稠密装配喂 flash（段内
-相对下标 ⇒ 窗口掩码精确），slack=γ+2；③ 非统一窗口（gemma2 交替 local/global）
-**split 双池**：环池（local，驱逐到 cap）+ full 池（global，普通分页永不驱逐）
-双 BM/双 GPU cache/Context full_* 侧 + 自研内核 softcap（cap·tanh，flash 同语义）；
-④ 纯 int4/fp8 MLA decode：kv_b 保留反量化副本（占参 ~1%，V2-Lite 实测 113MB）→
-稠密兜底/强制 eager 消除（w8a8/sparse24 兜底仍留）；⑤ int4 组大小可配
-（`int4_group_size`，V2-Lite dense 中间维 10944=64×171 非 128 倍数）+ 内核尾 K
-掩码与组粒度静态展开（128 路径逐位不变）。验证摘要：
-真实 **Mistral-7B** int4 流式 5050-token（>W=4096）环 vs 掩码 fp8 KV **全程
-逐位一致**；真实 **gemma-2-2b-it** 26 层 split 4800-token：环池表长到 ring_cap
-(18) 封顶而 full/掩码继续线性增长，30 稀疏步（含窗口越界后）vs 手工 fp16 稠密
-参考 top-1 失配 0；真实 **DeepSeek-V2-Lite**（hub 恢复，31.4GB bf16 下载）：
-4 层真权重切片 fp16 引擎 vs 稠密参考 0 失配、int4(group64) 23/24，全量 27 层
-流式 int4 启动 55s、权重常驻 ~5GB（int4+113MB kv_b w_deq）、decode ~2.8 tok/s
-（3 并发、MoE eager、纯 int4）且中英文生成连贯。顺带修复：MLA decode 内核真实
-尺寸共享内存超限（BLOCK_T 32→16/warps 8）；int4 内核 K 尾块漏算（10944 丢 64
-列 → 引擎 logits 漂移+NaN，掩码修复）；streaming 判定改用 meta 实建数参数
-（MoE/MLA 不在通用 qkv 公式内 → 曾把 33GB 当小模型直接建而 OOM）。
-**诚实边界（现行）**：gemma2 split 仅 bf16/无投机/eager decode（softcap 层禁
-fp8 KV；双池 CUDA graph 未实现）；ring+medusa/eagle 断言关；滚动模型停用前缀
-缓存（重复 prompt 代价，refcount 守卫落点）；KV swap×ring/split 未验证；
-fp8 KV×MLA 只在 toy 验证（真实模型未跑）；真实模型对照的采样步一致性受
-"内核 vs flash/手工数值差在近并列处翻转"限制（fp8 环与掩码同内核位级、bf16
-异内核 top-1 噪声带内）；transformers 5.15 MoE `torch._grouped_mm` 仅 sm_90，
-本机无法 HF-GPU 直连做真权重对照（记录在案）。
-
-### 阶段 3：调度系统深读（vLLM V1 源码对照 + SLO + multi-step decode）——**第三**
-**为什么第三**：调度是 vLLM 面试核心话题；我们的实现是"V1-style 简化版"，逐行读 vLLM
-找差距 = 把概念钉死（不需要 GPU）。**具体动作**：①读 vLLM V1 scheduler/block_manager/
-preemption 源码，产出"vLLM vs nano"逐项差距表；②实现 SLO-aware 优先级调度（TTFT/TPOT
-目标约束 + 优先级队列）；③multi-step decode（一次调度多步 decode，减少 kernel 启动与
-CPU 空转）。
-
-### 阶段 4：量化/稀疏算法层（GPTQ 误差补偿 + 剪枝感知）——**第四**
-**为什么第四**：现有量化是应用层（RTN/AWQ/fp8 的工程实现），补算法层才能答"为什么 AWQ
-有效、2:4 怎么不丢精度、GPTQ 和 RTN 差在哪"。**具体动作**：①实现 GPTQ（Hessian 逆 +
-逐列误差补偿）在 0.6B 上与 RTN/AWQ 对比 ppl；②SparseGPT 式误差补偿稀疏（把 2:4 的
-KL 8.5 修到可用）；③精度方法论：校准集设计、离群通道分析、误差传播（逐层累积曲线）。
-
-### 阶段 5：分布式推理理论（PP/DP/EP + NCCL 集体通信）——**最后**
-**为什么最后**：单卡无法实测，性价比最低；作为理论补强。**具体动作**：PP 的 1F1B 内存
-分析（bubble 比例 = (p-1)/(m+p-1)）与切分策略、EP 的路由 + 通信量、NCCL allreduce 的
-环/树带宽模型；用 paper 推导 + 数值模拟验证（无实机）。
-
-### 穿插项（每阶段做一块）
-- vLLM：attention backends（阶段1 对照内核）、scheduler（阶段3）、quant（阶段4）；
-- llama.cpp：GGUF 量化与 kernel 设计（阶段1/4）；
-- 论文：FlashAttention（阶段1）、MLA 原论文（阶段2）、PD 分离/Mooncake（阶段3）、GPTQ/
-  AWQ/SmoothQuant（阶段4）、Megatron 1F1B/DeepSeek MoE（阶段5）。
-
----
-
-## 7. 附录：代码地图（功能 → 文件 → 函数 + 运行链）
-
-> 用途：精读源码时的定位索引（行号为当前版本真实位置，可直接跳转）。先看运行链（§7.3），
-> 再按 §6 阶段顺序逐模块读；`git log` 的 commit message 是"为什么这么写"的第一手材料
-> （本项目每个 commit 都带动机）。
-
-### 7.1 文件地图（谁是谁）
-
-| 文件 | 职责 | 核心类/函数 |
-|---|---|---|
-| `nanovllm/llm.py` | 公共 API 入口 | `LLM(LLMEngine)` L4——纯别名，没逻辑 |
-| `nanovllm/config.py` | 引擎配置解析 | `Config` L7、`__post_init__` L36（断言合法性） |
-| `nanovllm/sampling_params.py` | 采样参数 | `SamplingParams` L6 |
-| `nanovllm/engine/llm_engine.py` | **引擎主循环** | `LLMEngine` L17：`add_request` L53 / `step` L203 / `generate` L290 / `_verify` L61 / `_medusa_drafts` L99 / `_eagle_drafts` L144 / `collect_metrics` L353 |
-| `nanovllm/engine/scheduler.py` | **调度器**（批组成、抢占、swap） | `Scheduler` L12：`schedule` L54 / `_schedule_mixed` L111 / `_schedule_prefill` L258 / `_schedule_decode` L309 / `_schedule_spec` L212 / `preempt` L337 / `swap_out` L361 / `swap_in` L394 / `postprocess` L432 / `postprocess_spec` L446 |
-| `nanovllm/engine/sequence.py` | 序列状态（CPU 侧唯一真源） | `Sequence` L15、`SequenceStatus` L8 |
-| `nanovllm/engine/block_manager.py` | **KV 块池 + 前缀缓存 + COW** | `BlockManager` L26：`compute_hash` L37 / `can_allocate` L62 / `allocate` L92 / `cow_block` L183 / `hash_blocks` L209 / `can_append` L146 / `can_append_spec` L158 |
-| `nanovllm/engine/model_runner.py` | **批处理打包 + GPU 执行** | `ModelRunner` L16：`__init__` L18（启动链）/ `call` L163（TP）/ `warmup_model` L202 / 各 `quantize_*` L266-285 / `allocate_kv_cache` L477 / `prepare_prefill` L521 / `prepare_mixed` L572 / `prepare_spec` L642 / `prepare_decode` L747 / `run_model` L776 / `capture_cudagraph` L945 / `capture_spec_graph` L858 / `run` L916 |
-| `nanovllm/engine/ngram.py` | n-gram 投机（纯函数，无状态） | `find_ngram_draft` L15、`verify_drafts` L54 |
-| `nanovllm/models/registry.py` | 按 `model_type` 选模型类 | `get_model_class` L44 |
-| `nanovllm/models/qwen3.py` 等 5 个 | 模型定义（结构模板完全一致） | `*ForCausalLM`（含 `packed_modules_mapping`）/ `*Model` / `*DecoderLayer` / `*Attention` / `*MLP` / `compute_logits` |
-| `nanovllm/layers/attention.py` | **注意力：写 KV + flash/fp8 路由** | `store_kvcache` L33、`paged_decode_attention_fp8` L115、`paged_varlen_attention_fp8` L207、`Attention.forward` L268 |
-| `nanovllm/layers/linear.py` | **全部 GEMM + 权重量化** | Triton 内核：`gemm_int8_kernel` L24 / `gemm_int4_kernel` L98 / `gemm_fp8_kernel` L298 / `gemm_sparse24_kernel` L183；封装：`int4_gemm` L153 / `fp8_gemm` L346 / `w8a8_gemm` L74 / `sparse24_gemm` L248；量化：`WeightQuantMixin` L372（`quantize_int4` L386 / `quantize_fp8` L448 / `quantize_sparse24` L489）；并行层：`ColumnParallelLinear` L619 / `MergedColumnParallelLinear` L649 / `QKVParallelLinear` L669 / `RowParallelLinear` L704 |
-| `nanovllm/layers/layernorm.py` | RMSNorm（含 Gemma-2 变体） | `RMSNorm` L5：`rms_forward` L24 / `add_rms_forward` L37 |
-| `nanovllm/layers/rotary_embedding.py` | RoPE（含 Llama-3 缩放） | `RotaryEmbedding` L48、`build_cache` L73、`get_rope` L111 |
-| `nanovllm/layers/activation.py` | SwiGLU 融合激活 | `SiluAndMul` L6 |
-| `nanovllm/layers/sampler.py` | Gumbel 采样 | `Sampler` L5 |
-| `nanovllm/layers/embed_head.py` | Embedding + LM Head（TP 感知） | `VocabParallelEmbedding` L10、`ParallelLMHead` L46（继承 WeightQuantMixin） |
-| `nanovllm/layers/medusa.py` / `eagle.py` | 投机草稿头 | `MedusaHeads` L39 / `EagleLayer` L46 |
-| `nanovllm/utils/context.py` | **每步张量的全局契约** | `Context` L6、`set_context` L27、`get_context` L24、`reset_context` L37 |
-| `nanovllm/utils/loader.py` | 权重加载（eager + 流式） | `load_model` L32、`_load_eager` L54、`_load_streaming` L85、`default_weight_loader` L8 |
-
-### 7.2 功能 → 文件 → 函数（按学习主题）
-
-**① 入口与配置**：用户入口 `llm.py:4`；全部引擎参数 `config.py:7`（quantization /
-speculative / tensor_parallel_size / kv_swap_space_gb / max_num_batched_tokens）；
-采样参数校验 `sampling_params.py:6`（禁 greedy——Sampler 用 Gumbel，必须 temperature>1e-10）。
-
-**② 引擎主循环**（必读核心）：提交请求 `llm_engine.py:53 add_request`；**每步推进**
-`llm_engine.py:203 step`（调度→COW/swap→跑模型→采样→后处理→草稿）；外层循环
-`llm_engine.py:290 generate`（含逐步吞吐统计与输出 decode）；投机验收
-`llm_engine.py:61 _verify`；Medusa/EAGLE 下轮草稿 `llm_engine.py:99 _medusa_drafts` /
-`:144 _eagle_drafts`；基准指标导出 `llm_engine.py:353 collect_metrics`。
-
-**③ 调度与抢占**：决定本步 kind（prefill/decode/mixed/spec）`scheduler.py:54 schedule`
-（先 `_try_swap_in`；waiting+running 都非空 → mixed）；mixed 批组成（prefill 在前、
-decode 在后共享 token 预算）`scheduler.py:111`（vLLM V1 同款）；prefill/decode 批
-`scheduler.py:258 / :309`（只有首个序列可被 chunk 拆分）；KV 不足抢占 `scheduler.py:337
-preempt`（decode/spec 优先 swap_out）；swap 换出/换入 `scheduler.py:361 / :394 / :404`
-（换入优先，bit-exact 免重 prefill）；步后处理 `scheduler.py:432 postprocess` /
-`:446 postprocess_spec`（spec 版只提交被接受 token）。
-
-**④ KV Cache：块管理 + 前缀缓存 + COW + swap**：块哈希链（xxhash + 前块哈希）
-`block_manager.py:37 compute_hash`；能否复用缓存块 `block_manager.py:62 can_allocate`
-（检查部分块 ceiling end）；分配/共享块（refcount）`block_manager.py:92 allocate`；
-**写共享块前的复制** `block_manager.py:183 cow_block`（返回 (old,new) 对 → GPU 侧拷贝在
-`step` 里 `model_runner.call("cow_block")`）；新哈希发布 `block_manager.py:209 hash_blocks`
-（带 guard 删除，防 COW 副本撞哈希）；decode/spec 追加 `block_manager.py:146 can_append` /
-`:158 can_append_spec` / `:175 may_append_spec`（跨块写跨度）；释放 `block_manager.py:137
-deallocate`；GPU 侧拷贝/swap `model_runner.py:171 cow_block` / `:180 swap_out` /
-`:190 swap_in`（swap_in 必须 `index_copy_`——list 高级索引返回临时副本会静默写垃圾）。
-
-**⑤ 批处理打包（prepare_* + Context 契约）**：KV cache 分配+绑层 `model_runner.py:477
-allocate_kv_cache`（`[2, L, num_blocks, block_size, kv_heads, head_dim]`）；prefill 打包
-`model_runner.py:521 prepare_prefill`（含 chunked seq 的缓存形状 K/V）；mixed 打包
-`model_runner.py:572 prepare_mixed`（设 `Context.is_mixed` / `n_prefill_tokens`）；decode
-打包 `model_runner.py:747 prepare_decode`（slot_mapping + context_lens）；spec 打包
-（verify 行 = chunked prefill）`model_runner.py:642 prepare_spec` / `:690
-_prepare_mixed_spec`；张量交接 `context.py:27 set_context` / `:37 reset_context`（每步 reset）。
-
-**⑥ 模型定义**：注册表 `registry.py:44`；5 个同构模型文件 `models/qwen3.py:212` /
-`qwen2.py:209` / `llama3.py:215` / `mistral.py:192` / `gemma2.py:219`；前向链
-（embed → L 层 → norm）各 `*Model.forward`（如 `qwen3.py:199`）；层内链（attn + mlp +
-残差）各 `*DecoderLayer.forward`（如 `qwen3.py:169`）；logits 各 `compute_logits`
-（如 `qwen3.py:243`，LM Head 在图外执行）；HF 权重名→打包参数映射各 `packed_modules_mapping`
-（如 `qwen3.py:214`）。
-
-**⑦ 注意力（写 KV + 读路由）**：写 K/V 到分页缓存 `attention.py:33 store_kvcache`
-（Triton 按 `slot_mapping` 散写；fp8 写路径先 clamp 448 再 cast 防 NaN 位模式）；fp8
-decode 读内核 `attention.py:115 paged_decode_attention_fp8`（寄存器内反量化 + WINDOW 掩码）；
-fp8 varlen 读内核 `attention.py:207 paged_varlen_attention_fp8`；**路由总入口**
-`attention.py:268 Attention.forward`（先写 KV → 按 is_mixed/is_spec/use_fp8/分块与否选
-flash varlen / flash kvcache / 自研 fp8 内核）。
-
-**⑧ 量化 GEMM（`linear.py` 一条龙）**：int4 打包 `[N, K//2]` + per-group 128 scale +
-2-dot 去量化 GEMM `linear.py:98` 内核 / `:153 int4_gemm` / `:386 quantize_int4`；int4 形状
-路由（dual-path：小 M 走内核、大 M 走 `w_deq` cuBLAS）`linear.py:431 _int4_forward`
-（阶段 1 的 BM16/BN128 tile 在这条链上）；fp8 权重-only Triton（小 M）+ 硬件
-`torch._scaled_mm`（大 M）`linear.py:346 fp8_gemm` / `:448 quantize_fp8` / `:468
-_fp8_forward`；w8a8 SmoothQuant 折叠 `linear.py:24` / `:547` / `:577`；sparse24 2:4 剪枝
-`linear.py:183` / `:248` / `:489` / `:513`；引擎侧调用点 `model_runner.py:266
-quantize_int4_weights`（streaming 钩子 `:377`）。
-
-**⑨ 投机解码**：n-gram 草稿搜索 + 验收（纯函数）`ngram.py:15 find_ngram_draft` /
-`:54 verify_drafts`；每步算草稿 `scheduler.py:90 _compute_draft`；verify 行打包
-`model_runner.py:642 prepare_spec`；验收+提交 `llm_engine.py:61 _verify` +
-`scheduler.py:446 postprocess_spec`（hash 范围只含接受 token）；spec CUDA graph
-`model_runner.py:858 capture_spec_graph` / `:829 _spec_graph_hidden`；Medusa 头 / EAGLE 层
-`medusa.py:39` / `eagle.py:46`。
-
-**⑩ 张量并行 / 权重加载**：TP 命令分发（共享内存 + Event）`model_runner.py:163 call` /
-`:138 read_shm` / `:130 loop`（worker 死循环）；权重切分各并行层 `weight_loader`
-（`linear.py:630/660/687/715`、`embed_head.py:28`）；eager 加载 `loader.py:32 load_model` /
-`:54 _load_eager`；**流式加载**（meta 构造 → 逐层物化 → 立即量化）`loader.py:85
-_load_streaming` + `model_runner.py:343 _decide_streaming` / `:377 _streaming_quant_hook` /
-`:433 _finalize_streaming`（重建 RoPE 缓存）。
-
-### 7.3 运行链
-
-**链 A：进程启动（只跑一次）**
-
-```
-LLM(...) → LLMEngine.__init__ [llm_engine.py:19]
- ├─ Config 解析 + tokenizer 加载
- └─ ModelRunner.__init__ [model_runner.py:18]
-     ├─ dist.init_process_group("nccl", ...)          # 无条件，TP=1 也初始化
-     ├─ get_model_class(model_type) → 选模型类         # registry.py:44
-     ├─ _decide_streaming() → load_model(...)          # 大模型走流式（逐层物化+量化）
-     ├─ 量化：quantize_int4/fp8/w8a8/awq/sparse24      # model_runner.py:266-285
-     ├─ warmup_model()                                 # 真实形状跑一次：JIT编译+测峰值显存
-     ├─ allocate_kv_cache()                            # 大块KV + 绑到各Attention层
-     ├─ capture_cudagraph()                            # decode图族 [1,2,4,8,16..512]
-     └─ capture_spec_graph()                           # 投机：stride家族 × 行容量家族
-```
-
-**链 B：每步推理循环（`generate` 内 `while not is_finished()`）**
-
-```
-step() [llm_engine.py:203]
- ├─ scheduler.schedule() → (seqs, kind)                # scheduler.py:54
- │   ├─ _try_swap_in()                                 # 先把换出的KV换回
- │   ├─ 投机：先给 running 全算草稿 (_compute_draft)
- │   └─ 分支：waiting+running→mixed | waiting→prefill | 其余→decode/spec
- ├─ COW 拷贝：cow_pairs → call("cow_block")            # run() 之前，prepare 需要新表
- ├─ swap 拷贝：swap_pairs → call("swap_out"/"swap_in")
- ├─ model_runner.call("run", seqs, kind)               # model_runner.py:916
- │   ├─ prepare_prefill/decode/mixed/spec              # 打包 → set_context()
- │   ├─ run_model(input_ids, positions, kind)          # model_runner.py:776
- │   │   ├─ kind=spec → spec CUDA graph 重放（填零长行）
- │   │   ├─ kind=decode 且 bs≤512 且非eager → decode CUDA graph 重放
- │   │   └─ 否则 eager：model(input_ids, positions)    # 模型前向（链C）
- │   ├─ model.compute_logits(hidden)                   # LM Head（图外）
- │   └─ Sampler(logits, temperatures) → token_ids      # Gumbel采样
- │       └─ reset_context()                            # 每步清空契约
- ├─ 投机：_verify() → postprocess_spec()               # 验收+只提交接受token
- │         → _medusa_drafts/_eagle_drafts()            # 用hidden生成下轮草稿
- ├─ 否则：postprocess()                                # 追加token/EOS/rehash
- └─ 收集 finished 序列 → outputs
-```
-
-**链 C：单层前向（以 Qwen3 为例，每步每条 token 都走）**
-
-```
-Qwen3ForCausalLM.forward [qwen3.py:235]
- └─ Qwen3Model.forward [qwen3.py:199]
-     ├─ embed_tokens(input_ids) → hidden
-     ├─ for layer in layers: Qwen3DecoderLayer.forward [qwen3.py:169]
-     │   ├─ Qwen3Attention.forward [qwen3.py:80]
-     │   │   ├─ qkv_proj(x) → q,k,v                      # QKVParallelLinear
-     │   │   ├─ RotaryEmbedding(q,k)                     # 按 positions 旋转
-     │   │   ├─ Attention.forward [attention.py:268]     # 链D
-     │   │   └─ o_proj(o)
-     │   ├─ Qwen3MLP.forward [qwen3.py:132]
-     │   │   ├─ gate_up_proj(x) → SiluAndMul → down_proj
-     │   │   └─ 残差相加（layer norm 走 add_rms_forward）
-     ├─ norm(hidden, residual)                           # RMSNorm（残差融合）
-     └─ compute_logits → ParallelLMHead                  # 词表映射（TP>1 时 gather）
-```
-
-**链 D：Attention 数据流（Context 契约——本项目最核心的接口设计）**
-
-```
-prepare_* 构建 GPU 张量 ──set_context()──> Context（全局单例）
-   [cu_seqlens_q/k, max_seqlen_q/k, slot_mapping,
-    context_lens, block_tables, n_prefill_tokens, is_mixed, is_spec]
-                    │
-Attention.forward [attention.py:268]  ← get_context()
- ├─ store_kvcache(k, v, k_cache, v_cache, slot_mapping)  # 本步K/V散写入分页缓存
- └─ 读路由（按批次形态）：
-     ├─ is_spec        → 全批次 flash_attn_varlen_func（K/V=缓存形状）
-     ├─ is_mixed       → prefill组 varlen（分块序列用缓存形状K/V）
-     │                    + decode组 fp16→flash_attn_with_kvcache / fp8→自研内核
-     ├─ 纯 prefill     → flash_attn_varlen_func（连续K/V）
-     └─ 纯 decode      → fp16→flash_attn_with_kvcache / fp8→paged_decode_attention_fp8
-```
-
-**链 E：量化路由决策（以 int4 为例）**
-
-```
-模型forward里 LinearBase.forward [linear.py:590]
- └─ 已量化? → _int4_forward [linear.py:431]
-     ├─ M≤128 且 N≥2048 → Triton int4_gemm（阶段1的 BM16/BN128 tile）
-     └─ 否则            → F.linear(x, w_deq)（bf16反量化副本，cuBLAS）
-权重来源：quantize_int4 [linear.py:386] 在 warmup 前一次性打包
-        （dual-path 同时存 q/scale 和 w_deq；纯 int4 模式不存 w_deq）
-```
-
-**链 F：投机解码完整链路**
-
-```
-Scheduler._compute_draft [scheduler.py:90]  ─每步CPU─> 写 seq.draft_tokens
- → schedule() → kind="spec"（纯verify）或 "mixed"（prefill在前）
- → prepare_spec/_prepare_mixed_spec [model_runner.py:642/690]
-     verify行 = query=[last_token, 草稿...] 的 chunked prefill，num_cached=len-1
- → run_model：spec CUDA graph（stride×容量家族）或 eager varlen
- → LLMEngine._verify [llm_engine.py:61]
-     γ+1 行采样 s_i ↔ 草稿 d_i 逐个验收；末行 bonus
- → postprocess_spec [scheduler.py:446]
-     只提交接受 token；hash 范围 [num_tokens-n_acc-1, num_tokens-1)（被拒草稿不进前缀缓存）
- → medusa/eagle：_medusa_drafts/_eagle_drafts 用 hidden 生成下轮草稿（写回 draft_tokens）
-```
-
-### 7.4 推荐阅读顺序（从浅到深，每步都有可验证出口）
+**一次生成的全旅程**：`LLM.generate` → `Scheduler.schedule` → `ModelRunner.run` → 模型 forward →
+`Sampler` → `Scheduler.postprocess` → 循环。
 
 | 步 | 读什么 | 验证出口 |
 |---|---|---|
 | 1 | `example.py` + `llm.py` + `config.py` | 跑通 `python example.py` |
-| 2 | `llm_engine.py` 的 `generate`/`step` | 打断点看每步的 kind 变化 |
+| 2 | `llm_engine.py` 的 `generate`/`step`（§9.2 链 B） | 打断点看每步的 kind 变化 |
 | 3 | `scheduler.py` 的 `schedule` + 四个 `_schedule_*` | 打印每步 (seqs, kind) |
 | 4 | `model_runner.py` 的 `prepare_*` + `context.py` | 打印 `set_context` 的各张量 shape |
-| 5 | `models/qwen3.py`（一个模型吃透，其他 4 个是变体） | 对照 HF 实现看逐层等价 |
-| 6 | `layers/attention.py` 的 `forward` 路由 | 三种批次形态各跑一次 |
+| 5 | `models/qwen3.py`（一个模型吃透，其余是变体） | 对照 HF 实现看逐层等价 |
+| 6 | `layers/attention.py` 的 `forward` 路由（§9.2 链 D） | 三种批次形态各跑一次 |
 | 7 | `layers/linear.py`（量化全链） | `--quantization int4` 对比输出 |
 | 8 | `block_manager.py`（前缀缓存 + COW） | `--shared-prefix-len 512` 看命中 |
 | 9 | `model_runner.py` 的 CUDA graph 两段 | `enforce_eager` 开/关对比 |
 | 10 | 投机（`ngram.py` → `_verify` → spec graph）→ TP → 流式加载 | `benchmarks/spec_bench.py` |
 
-穿插阅读：`CLAUDE.md`/`AGENTS.md` 的 Architecture 一节是维护者视角的浓缩；§2 深水区是
-这份地图的"人话版"。
+第一轮的文件级精读（类/函数锚点见 §9.1）：
+
+| 文件（类/函数） | 学习要点 |
+|---|---|
+| `nanovllm/llm.py`、`nanovllm/sampling_params.py` | 入口与采样参数（禁 greedy——Sampler 用 Gumbel，温度必须 >1e-10；`torch.manual_seed` 不控 GPU RNG，需 `torch.cuda.manual_seed`） |
+| `nanovllm/engine/sequence.py` | `Sequence`：token 存储、`block_table`/`kv_table`、`num_cached_tokens`、`__getstate__/__setstate__`（TP 跨进程） |
+| `nanovllm/engine/llm_engine.py` | `generate`（主循环）、`step`（一次调度+前向+postprocess）、`_verify`、`collect_metrics` |
+| `nanovllm/engine/scheduler.py` | `schedule`（kind 分发）、`_schedule_*`、`postprocess`（append/EOS/哈希）、`preempt`（KV 不足抢占/swap 分流） |
+| `nanovllm/engine/model_runner.py` | `run`（入口）、`prepare_prefill`/`prepare_decode`（打包）、`run_model`（前向 + CUDA graph 选择） |
+| `nanovllm/models/qwen3.py` | 模型结构 + `packed_modules_mapping` + `compute_logits` |
+| `nanovllm/layers/attention.py` | `Attention.forward`：prefill 走 varlen、decode 走 kvcache；`store_kvcache` 写缓存 |
+| `nanovllm/layers/layernorm.py` / `rotary_embedding.py` / `activation.py` / `sampler.py` / `embed_head.py` | 各基础算子与 `@torch.compile`（与 `enforce_eager` 无关，首轮前向必有 JIT） |
+| `nanovllm/utils/context.py` | **每步张量从 runner 传给内核的契约**——`set_context/get_context/reset_context`，新字段必须追加在 dataclass 末尾 |
+| `nanovllm/utils/loader.py` | `load_model` + `weight_loader` 约定（packed 映射：q/k/v→qkv_proj） |
+
+**建议读法**：先看 `qwen3.py` + `layers/`（模型长什么样）→ 再看 `model_runner.py`（张量怎么打包）→
+`scheduler.py`（批次怎么选）→ `llm_engine.py`（循环怎么转）→ 最后 `context.py` 把所有数据流串起来。
+
+### 1.2 调度与内存管理（2-3 小时）
+
+| 功能 | 读什么 | 配套脚本/文档 | 面试要点 |
+|---|---|---|---|
+| **混合调度**（vLLM V1 同款） | `scheduler.py` `_schedule_mixed`；`model_runner.py` `prepare_mixed`；`attention.py` 混合路由；`embed_head.py` `ParallelLMHead` 的 `is_mixed` 分支 | `benchmarks/bench.py`；§10.3.2 | 为什么比"先全 prefill 后 decode"好（死等消除、抢占下降） |
+| **前缀缓存 + COW** | `block_manager.py`：`compute_hash`（链式哈希）、`can_allocate`、`allocate`、`hash_blocks`（部分块也发布哈希）、`cow_block`（写共享块前复制）、`can_append/may_append` | `tests/test_block_manager.py`；§10.3.2 | 哈希链为什么带前块哈希；部分块缓存为什么安全；COW 在 GPU 上怎么执行 |
+| **分块 prefill** | `scheduler.py` `_schedule_prefill`（只允许第一个序列切块）；`model_runner.py` `prepare_prefill`（key 超 query → 缓存形状 K/V + block_tables） | §10.3.2 | 前缀命中时 K 长于 Q 的 varlen 怎么表示 |
+| **抢占与恢复** | `scheduler.py` `preempt`（**KV swap 分流**：decode 序列换出到 CPU `swap_out`/`swap_in` + 独立 `swapped` 队列 + `kv_swap_space_gb` 预算；prefill 序列 recompute）；`block_manager.py` `allocate_private`/`release_blocks`；`model_runner.py` `swap_out`/`swap_in`（**`index_copy_` 原位写**） | `bench.py --no-swap-kv`、`_swap_smoke.py`、`_swap_bitexact.py` | swap 比 recompute 保持采样流确定（bit-exact 免重算）；**本机 0.6B+WSL2 上重算更便宜（swap 27.8s vs 11.8s）**；价值在 7B+ 与真实 Linux |
+| **滚动环**（阶段 2b，Mistral/gemma2-local） | `block_manager.py`（`ring_cap`/`_evict_front`/`_t`/`no_share`）；`scheduler.py` 滚动断言；`model_runner.py` `_finalize_rolling`；`attention.py` `_ring_varlen`/bf16 环 decode 内核 | `benchmarks/_stage2b_ext_report.md`；§8 阶段 2 | 窗口内容清单 = 块表、驱逐先释放再分配；**滚动模型停用前缀缓存**（内容过期，重复 prompt 有代价） |
+
+### 1.3 CUDA graph 与启动税（1-2 小时）
+
+| 功能 | 读什么 | 配套脚本 | 面试要点 |
+|---|---|---|---|
+| **decode CUDA graph** | `model_runner.py` `capture_cudagraph`（批量族 [1,2,4,8]+16 步进、共享内存池）、`run_model` 的图选择与静态输入拷贝 | `bench.py`（默认非 eager） | graph 捕获要求固定形状/地址；`enforce_eager` 只关图不关 torch.compile |
+| **spec verify CUDA graph** | `model_runner.py` `capture_spec_graph`（容量族 × 双 stride、零长度填充行）、`_spec_graph_hidden`、`run_model` 的 spec 重放 | `_graph_pad_probe.py`（bit-exact）、`_verify_probe.py`、`_spec_step_timing.py` | varlen 用固定容量图 + 空行填充（cu_seqlens 尾部重复末值，flash 按空行跳过）；`max_seqlen_q/k` 烘焙为标量无开销 |
+| **启动税诊断**（方法学） | `benchmarks/_verify_probe.py`、`_step_timing.py` | — | 探针分层：分页 vs 连续、形状、CPU launch 计数——**先证伪假设再修**（spec 步 38ms = GPU 25ms + CPU 启动税 ~10ms） |
+
+### 1.4 量化（3-5 小时，按依赖顺序）
+
+#### 1.4.1 FP8 KV cache（先看，注意力内核最独立）
+| 读什么 | 要点 |
+|---|---|
+| `model_runner.py` `calibrate_fp8_kv` | 随机 token 校准每层固定 scale（max/448×1.1；MLA 的 fused 行 [c_kv\|k̃_pe] 两段独立 scale） |
+| `attention.py` `store_kvcache_kernel` | 写路径：fp32→fp8 cast **不饱和产生 NaN 位模式，必须 clamp(-448,448)**（§6 故事 1） |
+| `attention.py` `paged_decode_attention_fp8_kernel`（v6） | decode 内核：直接 fp8 load + 硬件 cvt 反量化、QPAD=16 MMA、GQA 融合、BLOCK_T=32/warps=1 |
+| `attention.py` `paged_varlen_attention_fp8_kernel`（v7） | 投机 verify 的多查询扩展（逐列因果掩码必须 `<=`，§6 故事 3） |
+| 配套 | `_fp8_kernel_check.py`、`_kernel_bench.py`、`accuracy_check.py`；§10.3.3 |
+
+#### 1.4.2 W8A8（int8 GEMM + SmoothQuant）
+| 读什么 | 要点 |
+|---|---|
+| `linear.py` `gemm_int8_kernel`/`w8a8_gemm` | per-group(128) 权重 scale，BLOCK_K=128=组大小，int32 累加后乘组 scale 以 fp32 跨组累加 |
+| `linear.py` `LinearBase.quantize_w8a8`/`_w8a8_forward` | SmoothQuant 折叠：`s = x_max^0.5 / w_col^0.5`，`W'=W·s, X'=X/s` 恒等变换 |
+| `model_runner.py` `calibrate_and_quantize_w8a8` | 校准 hook 收集逐通道 amax |
+| 配套 | `_w8a8_check.py`；§10.3.4 |
+
+#### 1.4.3 INT4 + AWQ（当前主力）
+| 读什么 | 要点 |
+|---|---|
+| `linear.py` `gemm_int4_kernel`/`int4_gemm` | 2-dot 拆分：按 K 奇偶拆 a 与半字节、两个 dot；打包沿 K；tile 按 M 自适应；**尾 K 掩码 + 组粒度静态展开**（`int4_group_size`，真实模型 K=10944 非 128 倍数，§8 阶段 2b-ext） |
+| `linear.py` `WeightQuantMixin.quantize_int4`/`_int4_forward` | per-group 对称 int4；**双路径路由**：`w_deq`（bf16 反量化副本）供大 M/小 N 走 cuBLAS，`M≤128 且 N≥2048` 走 int4 内核 |
+| `model_runner.py` `quantize_int4_weights`/`quantize_awq_weights`/`_calibrate_awq_scales` | 加载后量化；AWQ 缩放文件加载或内联随机校准 |
+| `benchmarks/awq_calibrate.py` | **按层 α 搜索**：`s=(mean\|X\|/w_col)^α`，目标 = 校准批量化输出误差；方向 `W'=W·s, X'=X/s`（论文方向，反了会塌缩，§6 故事 7） |
+| `config.py` `int4_dense_path`/`quantize_lm_head`/`awq_scales_path`/`int4_group_size` | 双路径开关 / lm_head 量化（默认关）/ 校准文件 / 组大小 |
+| 配套 | `_int4_check.py`、`_quant_ppl.py`（**端到端 ppl 是决定性指标，注意 run 间波动**，§10.3.6）、`_awq_diagnose.py`；§10.3.6 |
+
+#### 1.4.4 2:4 结构化稀疏
+| 读什么 | 要点 |
+|---|---|
+| `linear.py` `gemm_sparse24_kernel`/`sparse24_gemm` | 4 路拆分：a 按 K 步长 4 加载、`idx==p` 掩码重建权重块、4 个 dot；打包 `v [N,K//2] bf16` + `idx [N,K//4] uint8` |
+| `linear.py` `WeightQuantMixin.quantize_sparse24` | 幅值剪枝（组内保留最大 2）+ 打包 |
+| 配套 | `_sparse24_check.py`、`_sparse24_probe.py`（**cuSPARSELt/CUTLASS 在 sm_120 的结论**）；§10.3.6 |
+
+### 1.5 投机解码（3-4 小时，依赖 1.3 的 graph 概念）
+
+| 功能 | 读什么 | 配套脚本 | 面试要点 |
+|---|---|---|---|
+| **n-gram 草稿** | `engine/ngram.py` `find_ngram_draft`（窗口 4→1 回退、EOS 截断、预算封顶）、`verify_drafts`（点质量验收） | `tests/test_spec_decode.py` | 验收为什么严格保持分布（输出恒等于目标采样） |
+| **verify 步 = varlen prefill** | `model_runner.py` `prepare_spec`/`_prepare_mixed_spec`；`scheduler.py` `_compute_draft`/`_spec_rows`/`_schedule_spec`/`postprocess_spec`；`llm_engine.py` `_verify` | `_spec_equiv_check.py`（三层验证） | query=[末 token+草稿]、num_cached=len-1；**KV 提交语义：被拒草稿不回滚、哈希只发布到接受长度** |
+| **Medusa 多头** | `layers/medusa.py`；`llm_engine.py` `_medusa_drafts`（行选择 + 全接受 shift）；`model_runner.py` medusa 加载 | `benchmarks/medusa_train.py`（自蒸馏）、`_medusa_debug.py`、`_medusa_integration.py` | head_k 语义（预测 t+k+1）；训练必须 exit 引擎（allocator 60× 慢）；三个集成 bug（§6 故事 2） |
+| **EAGLE-1 草稿层** | `layers/eagle.py`（无 RoPE 层，F(h_t,e(w))→h̃；**对角注意力退化为 o=v**；SDPA 需 [1,heads,n,hd] 4-D，§6 故事 13）；`llm_engine.py` `_eagle_drafts`；`benchmarks/eagle_train.py` | `_eagle_quality.py`、`spec_bench.py --speculative eagle` | **γ 是成本关键**：0.6B 上 γ=2 repeat +3.26×（α 0.525）、γ=4 只有 +0.63×（每草稿一次 LM head ~0.8ms + 特征误差累积）；自由文本被 35% 可预测性封顶 |
+| **fp8 varlen 内核** | `attention.py` `paged_varlen_attention_fp8_kernel` | `_fp8_varlen_check.py`（bit-exact） | fp8+spec 从 0.15× 变 +3.92×（bs=8 repeat）：消除"逐层全缓存反量化"（~18GB/步 搬运） |
+| **投机 × 滚动环**（2b-ext） | `block_manager.py` 环 spec 账本（表项 = 逻辑块 j0+i）、verify 行 key 集 [j0·B, end) 稠密装配 | `_ring_spec_e2e.py`；§8 阶段 2b-ext | 环上 verify = 把环内容装配成段喂 flash，段内相对下标 ⇒ 窗口掩码精确 |
+
+### 1.6 框架设施（可选，1-2 小时）
+
+| 功能 | 读什么 |
+|---|---|
+| **张量并行** | `model_runner.py` `loop/read_shm/write_shm/call`（SharedMemory + Event 命令分发）；`linear.py` 各并行层 `weight_loader`（Column/Row/Merged/QKV 分片）；`embed_head.py` 的 all_reduce/gather |
+| **torch.compile 层** | `layernorm.py`/`activation.py`/`rotary_embedding.py`/`sampler.py` 上的 `@torch.compile`（与 enforce_eager 无关） |
+| **计时与指标** | `sequence.py` 的 `t_submitted/t_first_token/t_completed`（driver 侧）；`llm_engine.py` `collect_metrics`；`benchmarks/bench.py` |
+
+### 1.7 多模型适配、流式加载与卡点清单
+
+| 功能 | 读什么 | 状态 |
+|---|---|---|
+| 模型注册表 | `models/registry.py`（`get_model_class(model_type)`） | **已支持**：qwen3 / qwen3_moe / qwen2（Qwen2.5 同属）/ llama / mistral / gemma2 / deepseek_v2 |
+| 单模型模板 | `models/qwen3.py` → 删 QK-Norm = qwen2；加 `attention_bias=False` = llama3；加 `sliding_window` = mistral；gemma2 是"读源码才能发现"的三细节家族 | 详见 §4.6/§8 各阶段 |
+| MoE（1.5） | `layers/moe.py`（`MoE`/`ExpertFFN`：2D per-expert 对齐 HF 存盘格式，router 永不量化）+ `models/qwen3_moe.py`/`deepseek_v2.py`（`DeepseekV2Moe`） | **已实现**：数学同构位级对照 + CPU 单测 + 端到端 parity top-1 100%（mean diff 0.003）；grouped 批量后端（§4.7） |
+| MLA（2a） | `layers/attention_mla.py` + `models/deepseek_v2.py`（fused [c_kv\|k̃_pe] 缓存、吸收式 decode 内核、共享 rope key） | **已实现**：decode 内核 vs 稠密参考位级 0 误差；引擎 parity top-1 100% |
+| 滚动环 / split（2b/2b-ext） | `config.py` `rolling_cache`；`block_manager.py` 环驱逐；双池（gemma2 交替窗口） | **已实现**：真实 Mistral-7B/gemma-2-2b-it/DeepSeek-V2-Lite 验证（§8 阶段 2） |
+| 按层流式加载 + 即时量化 | `loader.py` `load_model(streaming=True)`；`model_runner.py` `_decide_streaming`/`_streaming_quant_hook`/`_finalize_streaming` | **已实现**：Qwen2.5-7B 峰值 10.66GB / Llama-3.1-8B 11.62GB / Mistral-7B 11.37GB；自动触发 = fp16 估重 > 空闲显存 45% 且启用量化 |
+
+**卡点清单（未完成项，构造时报具体卡点）**：
+
+| 模型/功能 | 需要的改动 | 卡点 / 依赖 |
+|---|---|---|
+| **Mixtral 端口** | MoE 层已通（1.5），但 mixtral 具体端口（router + top-k norm_topk + aux loss 的 HF 对齐）未做 | registry 占位报错；本机无小 MoE 真模型可对照（DeepSeek-V2-Lite 已覆盖 MoE 真模型验证） |
+| **rope_scaling 其余变体** | YaRN / linear / dynamic | 已支持：无操作（default）+ llama3 变体（波长分段，单元对照 HF 0 误差）；其余构造时报错 |
+| **滚动环 × KV swap / ring × medusa/eagle** | 组合验证与记账 | 断言关（§8 阶段 2 诚实边界）；KV swap × ring/split 未验证 |
+| **split 双池 CUDA graph** | gemma2 split 模式 decode 入图 | 现为 eager（动态 python 路径烘焙即错）；softcap 层禁 fp8 KV |
+
+**流式加载的坑（阶段 7 特有，详见 §6 故事 9/10/18）**：①meta 物化必须 `to_empty`（torch 2.8 禁止 `.to()` 与 `set_data` 跨 meta）；②`to_empty` 替换 Parameter → 丢 `weight_loader`，须按模块重挂；③**计算型 buffer（RoPE `cos_sin_cache`）meta 上无数据 → `_finalize_streaming` 必须重建**；④tie 词表文件通常不含 `lm_head.weight` → 加载后重绑（先物化再 `weight.data =` 共享存储）；⑤**meta 计数构造会污染 `get_rope` 的共享实例 → 必须 `cache_clear()`**（2026-09 修复，§6 故事 18）。
+
+**裸模型诊断脚本的坑**：CPU 构造再 `.to(cuda)` 会重设每个 Parameter 的 `.data`，打破 `__init__`
+的 tie 共享 → tie 模型 checkpoint 又常不含 `lm_head.weight` → lm_head 残留空张量 → **logits 全零
+（ppl = 词表大小的 uniform）**。裸模型加载后必须按 tie 配置重绑（`_quant_ppl.py` 等已含）。
+信号：ppl 恰好等于 `math.exp(ln(V))` = 词表大小。
+
+### 1.8 验证与回归工具箱（每改完一个功能必跑）
+
+| 脚本 | 验证什么 | 何时跑 |
+|---|---|---|
+| `python -m pytest tests/ -q` | 调度/块管理/投机/注册表/layer_types 纯 Python 逻辑（**57 个用例**） | 任何引擎改动后 |
+| `benchmarks/_swa_probe.py` | SWA window/softcap 约定 + fp8 内核窗口掩码 vs torch 参考 | 动 attention.py / 内核后 |
+| `benchmarks/_parity.py <model>` | 新架构端口 vs HF 参考 logits（top-1 100% = 端口正确） | 新增/修改模型文件后 |
+| `benchmarks/_port_smoke.py <model> int4 --long` | 新模型 int4 冒烟 + 长上下文（跨 SWA 窗口） | 新增模型后 |
+| `benchmarks/_softcap_probe.py <model>` | attn soft-cap 的 tanh 近似误差（真实 logits 上） | 动 gemma2 后 |
+| `benchmarks/_fp8_kernel_check.py` | fp8 注意力内核 vs 参考 | 动 attention.py 后 |
+| `benchmarks/_fp8_varlen_check.py` | fp8 varlen（verify）内核 bit-exact | 动 varlen 内核后 |
+| `benchmarks/_int4_check.py` | int4 内核 + 双路径一致性 + 组粒度路径 | 动 linear.py 后 |
+| `benchmarks/_sparse24_check.py` | 2:4 内核 vs 剪枝参考 | 动 sparse24 后 |
+| `benchmarks/accuracy_check.py <model> <quant> <kv>` | 引擎级 logits 对齐/KL/top-1 | 任何量化/图改动后 |
+| `benchmarks/_spec_equiv_check.py --fp8` | 投机 verify 与 plain 路径对齐 | 动 spec/graph/attention 后 |
+| `benchmarks/_quant_ppl.py <model>` | 端到端困惑度（决定性精度指标；**注意 run 间波动**） | 量化校准改动后 |
+| `benchmarks/_qwen2_smoke.py <model> <quant> <streaming> <kv> [--check-hf]` | 多模型端口冒烟：生成 + 结构字段 + 显存 + 可选 HF 参考 | 新增/修改模型文件或加载器后 |
+| `benchmarks/_stream_weights_check.py <model> [--runner]` | 流式加载 vs eager 逐参数/buffer 对比 | 动 loader.py / streaming 路径后 |
+| `benchmarks/_stage2b_ext_report.md` | 阶段 2b-ext 组合（fp8 KV×MLA/环、spec×环、split 双池、纯 int4 MLA）全套证据 | 动 block_manager/attention_mla/环相关后 |
+
+> **模型路径传参约定**：benchmarks 下所有脚本已 argv 化——模型目录 = 第一个位置参数
+> （argparse 脚本用 `--model`）；缺省均为 `~/huggingface/Qwen3-0.6B/`。
+
+## 2. 电梯陈述（30 秒 / 2 分钟 / 5 分钟）
+
+### 30 秒
+> 我从零实现了一个 vLLM 风格的推理引擎（纯 PyTorch + Triton + flash-attn，不依赖任何推理框架）：
+> 连续批处理调度（混合 prefill/decode）、paged KV cache + 前缀缓存 + COW、CUDA graph、
+> 五条量化路径（w8a8/int4/AWQ/fp8/2:4 稀疏）+ fp8 KV cache、三种投机解码（n-gram/Medusa/EAGLE）、
+> KV swap 抢占、按层流式加载、MoE（Qwen3-MoE/DeepSeek-V2）、MLA + SWA 滚动环（Mistral/Gemma-2），
+> 移植 Qwen/Llama/Mistral/Gemma-2/DeepSeek-V2 七个模型族。
+> 每个功能都与 HF 参考逐 token 对齐、与真实 vLLM 同 workload 对比过，并诚实记录了哪些场景是亏的。
+
+### 2 分钟
+> 主线：**调度 → 内存 → 内核 → 量化 → 投机 → 系统 → 多模型**，每段 2-3 句 + 一个数字。
+> - **调度**：先做"先全 prefill 再 decode"，实测发现早完成者死等 → 改成 vLLM V1 同款混合批次
+>   （prefill 行在前、decode 行在后共享 token 预算），吞吐全档 +7~21%、抢占减半。
+> - **内存**：paged KV cache（块 256）+ 链式哈希前缀缓存 + COW 安全写共享块 + 分块 prefill；
+>   KV swap 抢占用 CPU 缓冲换出 decode 序列，**bit-exact 0 误差**——但诚实结论是本机
+>   （0.6B+WSL2）swap 比重算慢（27.8s vs 11.8s），价值在 7B+ 与真实 Linux。
+> - **内核**：flash-attn 的 fp8 KV 路径在 sm_120（Blackwell 消费卡）不可用（FA3 是 Hopper-only），
+>   自己写 Triton 内核（decode + varlen 两套），fp8 KV 容量 1.9×、KL 0.0073；这是自研内核里
+>   最能打的点——"vLLM 在这张卡上跑不了的东西我能跑"。
+> - **量化**：五条路径里 **fp8 权重是唯一大 M 不输 cuBLAS 的**（decode 权重-only Triton、
+>   prefill 硬件 `_scaled_mm`），ppl 与 fp16 同批误差 ~0.6%、bs=256 5825 tok/s 是全模式峰值；
+>   int4 靠**双路径路由**反超 fp16（小 batch +35%）；2:4 稀疏的结论是"内核 bit-exact 但一次性
+>   剪枝丢 35% 权重质量"——技术可行性评估型交付。
+> - **投机**：n-gram/Medusa/EAGLE 三种都做通。核心理解是成本模型 γ·T_draft+T_verify vs
+>   收益 (1+αγ)，而上界 α ≤ 模型 top-1 可预测性（实测自由文本 ~35%）——EAGLE γ=2 在重复
+>   内容 +3.26×，free 文本只有 +0.70×，数字与理论互相印证。
+> - **系统**：16GB 卡跑 7B+ 靠按层流式加载（meta 构造 → 逐层物化 → 加载即量化，峰值 10.7~11.6GB）；
+>   meta 物化踩了四个坑（to_empty 丢 weight_loader、RoPE 缓存全零、tie 重绑、meta 计数污染
+>   get_rope 共享实例）。
+> - **多模型**：注册表按 model_type 分发；Gemma-2 有"读源码才能发现"的三个细节（embed ×√d、
+>   RMSNorm (1+w)、双残差四 norm），逐层二分定位；阶段 2 打通 DeepSeek-V2 的 MLA + MoE、
+>   Mistral/gemma2-local 的滚动环与真实模型长解码。
+
+### 5 分钟
+> 2 分钟版本 + 三个"证伪"故事 + 两个诚实结论：
+> - **证伪 1（大 tile 假设）**：int4 内核最初按"大 tile 更优"直觉调优，实测小 M 大 N 的
+>   权重带宽主导形态才赢（4.36×），大 M 全输 → 做**双路径路由**而不是硬碰 cuBLAS。
+> - **证伪 2（分页瓶颈假设）**：假设 paged attention 的 gather 是瓶颈，实测 decode 瓶颈是
+>   权重带宽而非 KV 索引——这决定了 fp8 权重的方向（0.5× 字节）。
+> - **证伪 3（启动税假设）**：投机 verify 步慢，先怀疑内核，逐层 hook 计时发现是 CPU 启动
+>   税 ~10ms/步 → CUDA graph 固定容量重放，spec 从打平变赢（bs=8 repeat +3.87×）。
+> - **诚实结论 1**：KV swap 本机比 recompute 慢（27.8s vs 11.8s）——机制正确但不划算。
+> - **诚实结论 2**：2:4 稀疏、纯 int4 大 batch、EAGLE γ=4、medusa 大 batch 都是"内核/机制正确
+>   但整体亏"——知道边界在哪，比什么都做更能体现对推理系统的理解。
+
+---
+
+## 3. 主线叙事（按阶段，每阶段：一句话贡献 + 关键数字 + 为什么值得讲）
+
+| # | 阶段 | 一句话贡献 | 关键数字 | 为什么值得讲 |
+|---|---|---|---|---|
+| 1 | vLLM 对比基准工程 | 先把"测量"做对：逐请求时间戳、同 workload 同 seed、两侧同 flash-attn | 吞吐 1.35-1.61× 领先；**decode 单步与 vLLM 持平（kernel 级可比）** | 口径诚实：离线 API 不暴露逐请求指标时用聚合直方图并声明近似 |
+| 2 | FP8 KV cache + 自研 decode 内核 | FA3 是 Hopper-only，sm_120 只能自研 | 容量 1.9×；KL 0.0073；长上下文 decode 单步 32.2ms = vLLM fp16 | **"vLLM 在这张卡跑不了，我能跑"** |
+| 3 | W8A8（per-group + SmoothQuant） | int8 权重 + int8 激活 + 平滑折权重 | KL 0.0379（平滑后）；吞吐 -16% | 量化精度方法论：per-group 比 per-channel 细 8× |
+| 4 | 混合调度（V1 同款） | 消除"先全 prefill 后 decode"的死等 | 吞吐 +7~21%；抢占 85→68 / 141→71 | 调度器设计的核心权衡 |
+| 5 | 投机解码框架（ngram→Medusa→EAGLE） | verify 步 = 带前缀复用的 varlen prefill + CUDA graph | 启动税 ~10ms/步被消除；EAGLE γ=2 repeat +3.26× | 成本模型 + α 上界 = 投机解码的完整理解 |
+| 6 | fp8 varlen 内核 | verify 步直接读 fp8 缓存（免逐层反量化） | fp8+spec 从 0.15× 变 +3.92×（bs=8 repeat） | 内核与调度配合消除显存搬运 |
+| 7 | INT4/AWQ 双路径 | 按形态路由：小 M 大 N 走 int4 内核，其余走 w_deq 稠密 | bs=8 +35%、bs=256 +3~6%；awq 把 int4 ppl 差距砍半以上 | "带宽优化型内核在计算主导区间的天花板"的正面解法 |
+| 8 | 2:4 稀疏（可行性评估） | 内核 bit-exact；一次性剪枝是精度灾难 | KL 8.5；cuSPARSELt sm_120 每调用 0.3-0.5ms | 技术评估类交付：知道"为什么不做" |
+| 9 | 多模型：注册表 + 流式加载 + Qwen2.5/Llama | 16GB 卡跑 7B+ 的唯一路径 | Qwen2.5-7B 峰值 10.66GB；Llama-3.1-8B 11.62GB；parity top-1 100% | meta 物化四坑（to_empty/weight_loader/RoPE/tie） |
+| 10 | FP8 权重 | 唯一大 M 不输 cuBLAS 的量化 | ppl 与 fp16 同批 ~0.6% 差；bs=256 5825 tok/s（1.22×）；8B prefill TTFT 210ms vs int4 813ms | 双路径（Triton 内核 + 硬件 _scaled_mm） |
+| 11 | EAGLE-1 | 无 RoPE 草稿层 + 共享 LM head 自回归 | γ=2 repeat +3.26×（α 0.525）；γ=4 只有 +0.63× | γ 是成本模型的关键变量 |
+| 12 | KV swap 抢占 | decode 序列 KV 换 CPU，恢复 bit-exact 免重算 | bit-exact 0 误差；699 次换出；**本机比重算慢（27.8 vs 11.8s）** | 机制正确 + 条件诚实的样板 |
+| 13 | Mistral（SWA）+ Gemma-2（soft-cap） | 两个新机制家族：滑动窗口 + logit soft-cap | parity top-1 100%（0.014/0.022）；Mistral 311 tok/s（bs=32）、Gemma2 1095 tok/s（bs=64，均为 08-24 首测） | Gemma-2 三个隐藏架构细节的定位方法论 |
+| 14 | 工程素养：脚本 argv 化 + 验证工具箱 | 全部脚本模型路径参数化；pytest **57** 例 + parity/内核对照/ppl 回归矩阵 | 新模型复用全部基准零改动 | "测量与回归"是可信度的基础设施 |
+| 15 | MoE 支持（1.5） | router top-k + 循环专家 + 量化专家 + Qwen3-MoE/DeepSeek-V2 端口 | 引擎 parity top-1 100%（mean diff 0.003）；decode int4/fp8 ≈2×；grouped 后端组织税 3.8→0.7ms/层 | 反直觉实测（负载不均偏好集中 / toy 顶层贴边假警报 / 段式内核赢面很窄） |
+| 16 | MLA + DeepSeek-V2（2a） | latent 压缩 + decoupled rope + 吸收式 decode 内核 | fused 576 元素/token/层（**7.11×** 压缩，修正口径）；decode 内核 vs 稠密参考位级 0 误差；引擎 parity top-1 100% | DeepSeek 面试主线；真实模型验证（V2-Lite 4 层切片 + 全量流式 int4） |
+| 17 | SWA 滚动环（2b） | per-seq 物理环：驱逐到窗口 + B 余量，decode KV 有界 | 稳态 KV = 窗口+B/seq（vLLM 掩码式做不到）；toy 84 采样步 vs 掩码参考 top-1 全一致 | 文档 TODO 变完成；自研内核处理环表位置偏移 |
+| 18 | 组合解锁 + 真实模型验证（2b-ext） | fp8 KV×MLA / fp8×环 / spec×环 / gemma2 非统一窗口双池 / 纯 int4 MLA 免兜底 | 真实 Mistral-7B 5050-token 环 vs 掩码 **逐位一致**；真实 gemma-2-2b-it split 30/30 稀疏步；V2-Lite 4L parity 0 失配 | 全链路真模型证据 + int4 组 64/尾 K 掩码等真实尺寸 bug（§8 阶段 2b-ext） |
+
+## 4. 深水区问答（八大模块，每个：机制 + 必问必答 + 数字 + 诚实结论 + 追问应对）
+
+### 4.1 调度与批处理
+
+**机制**：`Scheduler.schedule()` 返回 `(seqs, kind)`，kind ∈ prefill/decode/**mixed**/spec。
+三队列 WAITING/RUNNING/FINISHED；混合批次 = prefill 行在前、decode 行在后，共享
+`max_num_batched_tokens` 预算（vLLM V1 同款）；分块 prefill 只允许第一个被调度序列拆分；
+KV 块不足时抢占（decode/spec 序列优先 swap_out / 其余 recompute 回 waiting）；滚动/MLA
+模型的调度断言见 §8 阶段 2。
+
+**必问必答**：
+- **Q：混合批次为什么赢？** A：早完成 prefill 的请求立即 decode，消除死等；decode 提前释放
+  KV 块、降低抢占压力。实测吞吐 +7~21%、抢占减半（512 档 141→71）。但 TPOT 改善有限——
+  它受总工作量下界约束，收益在流式延迟与资源利用率。
+- **Q：分块 prefill 为什么只拆第一个序列？** A：多序列同时分块会让每步 token 预算碎片化且
+  块表管理复杂化；只拆第一个等价于"按到达顺序把预算给第一个长序列"，实现简单且覆盖主要场景。
+- **Q：抢占后怎么恢复？** A：recompute = 回 waiting + 释放块，恢复时按前缀缓存哈希命中部分免算；
+  swap = KV 拷 CPU、释放块、进独立 swapped 队列，恢复时直接 decode（免 prefill）。草稿作废。
+- **Q：MoE/MLA/滚动模型对调度有什么影响？** A：MoE 动态路由形状不能入 CUDA graph → eager；
+  MLA 的纯 int4/fp8 decode 走稠密兜底（动态 python 路径）→ eager + 免图；滚动模型停用前缀
+  缓存发布/消费（内容过期，refcount 守卫断言）。
+
+**数字**：混合调度吞吐全档 +7.2%~+21.3%；抢占 384 档 31→20、512 档 141→71；256 档峰值
+5840 tok/s（fp16，§10.3.2）。**诚实结论**：调度是"V1-style 简化版"——没有 SLO 感知优先级、
+没有 multi-step decode、没有 PD 分离（§8 阶段 3 待办）。**追问应对**：被问"生产调度还缺什么"
+→ 答 SLO（TTFT/TPOT 目标）、优先级队列、multi-step、preemption 策略参数化（swap vs recompute
+成本模型）。
+
+### 4.2 KV cache 与内存管理（paged / 前缀缓存 / COW / 分块 prefill / KV swap / 滚动环）
+
+**机制**：BlockManager 管理固定块池 + `hash_to_block_id`；块哈希链式（xxhash(token_ids) +
+前块哈希 8B LE）；**部分块也缓存**（末块按实际 token 数记账）；写共享块前 COW（GPU 整块 K/V
+拷贝，`cow_pairs` 在 run 前执行）；哈希条目删除带守卫（双胞胎块共享哈希）；KV swap 用独立
+swapped 队列 + CPU 非 pinned 缓冲 + `kv_swap_space_gb` 预算；**滚动环**（`rolling_cache`）：
+块表 = 窗口内容清单（`Sequence.kv_j0` 行首逻辑块序号），驱逐 `(front+1)·B ≤ N−W−slack`
+先释放再分配（净零 free 消耗），环模型块恒私有（不发布/消费前缀缓存）→ refcount 守卫断言。
+
+**必问必答**：
+- **Q：paged attention 与 vLLM 的差异？** A：块大小 256 vs vLLM 16（内部碎片与哈希粒度不同）；
+  我们的 COW 在调度器记账、引擎 step 执行；vLLM 的 block manager 更细（BlockAllocator 分
+  CPU/GPU、块级记账）。
+- **Q：COW 的安全性怎么保证？** A：写起点落在共享块（ref_count>1）时复制一块并换表；复制对
+  在 GPU 上执行；哈希条目删除带守卫防误删他人条目。
+- **Q：KV swap 为什么 bit-exact？** A：KV 内容原样拷 CPU、换入 `index_copy_` 原位写回新私有块
+  （不查前缀缓存），恢复后采样流确定。**坑**：高级索引 `kv_cache[:, :, ids]` 返回副本，`.copy_`
+  只改副本——必须 `index_copy_`（§6 故事 14）。
+- **Q：swap vs recompute 怎么选？** A：成本模型：swap = D2H+H2D 拷贝带宽；recompute = 重新
+  prefill 计算量。7B+ 重算贵 → swap 赢；0.6B 重算便宜 + WSL2 D2H 慢 → recompute 赢（实测
+  27.8s vs 11.8s）。
+- **Q：滚动环和掩码式 SWA 差在哪？** A：掩码式（vLLM 同款）KV 随生成长度线性增长，只限注意力；
+  滚动环让**稳态 KV = 窗口 + B 余量**，但 flash-attn 无法表达环表的 key 位置偏移（它从表下标推
+  位置）→ 需要自研 paged decode 内核 + varlen 环装配；滚动模型不参与前缀缓存（重复 prompt 有
+  代价，见 config 注释与 §8 阶段 2）。
+
+**数字**：前缀缓存跨批次 prefill 降为 0 token/0 步；FP8 KV 容量 1.9×（421→802 块）；KV swap
+bit-exact 0 误差、96×512 压力 699 次换出、27.8s vs recompute 11.8s；滚动环真实 Mistral-7B
+5050-token（>W=4096）环 vs 掩码 fp8 KV **全程逐位一致**，真实 gemma-2-2b-it split 环池表长
+到 cap(18) 封顶而 full/掩码继续线性增长（§8 阶段 2）。
+**诚实结论**：滚动环 × KV swap 组合未验证（断言关）；环 decode 无 CUDA graph（eager）；
+split 双池仅 bf16/无投机。**追问应对**：被问"前缀缓存怎么失效"→ 内容哈希链式、被拒草稿永不进
+哈希（投机）、COW 副本重新发布哈希、滚动模型整体退出。
+
+### 4.3 CUDA 内核与性能工程（Triton 内核 + CUDA graph + roofline 归因）
+
+**机制**：自研内核按形态分两类——**计算型 GEMM**（int8/int4/fp8/sparse24，M-adaptive tile：
+小 M 用 16×128 权重带宽主导、int4 大 M 用 BM16/BN128）与**访存型注意力**（fp8 KV decode/varlen
+内核，GQA 融合 + MMA + 寄存器内反量化；MLA 吸收式 decode 内核与稠密装配）。CUDA graph：decode
+按 batch 容量族捕获共享内存池；spec 步按"行容量 × 双 stride"捕获、零长度填充行重放（bit-exact）。
+**必问必答**：
+- **Q：int4 内核为什么小 M 赢、大 M 输？** A：小 M（decode）权重带宽主导——int4 权重字节 =
+  bf16 的 1/4 → 实测 gate_up M=8 4.36×；大 M（prefill）计算主导，MMA 数与稠密相同 + 反量化
+  开销 → 0.2-0.6×。**结论：软件低比特 GEMM 是带宽优化，不是计算优化**——双路径路由的动机。
+- **Q：roofline 归因怎么做？** A：实测标定上界（TC 48.5 TFLOPS、D2D 370 GB/s），按 arithmetic
+  intensity 分类：AI≥128 算力受限、<128 带宽受限，另有"启动/并行度受限"（小 M）。归因结果：
+  fp8 大 M 到 81% TC、int4 大 M 只有 44%、decode 小 M 启动受限。
+- **Q：手写 MatMul 到什么水平？** A：SMEM-tiled fp16（Triton）达 **101% cuBLAS**（4096³/16384³）；
+  CUDA C 版本（`_cuda_gemm_report.md`，nvcc 12.8）到 cuBLAS 53%（8 tile/warp + BsT 布局、bank
+  conflict 消融 +86%、SASS 实证）。消融：GROUP_M swizzle +4%、stages=2 最优；**最优配置 occupancy
+  只有 17%**——大 GEMM 是 TC 吞吐型，occupancy 不是瓶颈（反直觉反例）。
+- **Q：tile 搜索找到什么？** A：**int4 大 M 用 BM16/BN128（regs=128）反超 BM64/BN256（regs=255）
+  19%**——大 tile 的 acc 累加器把寄存器打到 255 上限、占用 1 block/SM；落地后纯 int4 大 batch
+  +28%（0.64×→0.82× fp16）。教训：快速搜索的 "+144%" 异常值被高迭代复测推翻。
+- **Q：自研 fp8 注意力内核的关键决策？** A：①GQA 融合（一 program 处理 seq×kv_head 整组 q 头，
+  KV 只读一次）；②直接 fp8 load + 硬件 cvt 反量化（无 LUT）；③MMA 计算（QPAD=16 满足 dot 的
+  N≥16，8× 计算浪费换内存效率——decode 是 memory-bound）；④BLOCK_T=32/warps=1（跨 warp 归约
+  顺序变化放大误差）。归因：有效 KV 读带宽 517-529 GB/s（超过 copy 370 的双向口径）。
+- **Q：CUDA graph 的坑？** A：形状必须静态（按容量族）；共享内存池避免碎片；spec 图用尾部重复
+  cu_seqlens 的空行填充（bit-exact 用 probe 验证过）；MLA/滚动模型跳过图（动态 python 路径
+  烘焙即错）。
+- **Q：MLA decode 内核的形态？** A：吸收式：W_UK 折进 q（q_abs）、W_UV 折进输出——每 token
+  只读 fused 576 元素而非重建稠密 K/V；纯 int4/fp8 的 kv_b 无 float 视图时回退稠密兜底
+  （逐层整段缓存稠密化，正确性等价、带宽优势消失，eager）。
+
+**数字**：硬件锚点 TC 48.5 TFLOPS / 带宽 370 GB/s / 36 SM / SMEM 100KB；手写 MatMul 101%
+cuBLAS；int4 gate_up M=8 4.36×、lm_head 3.42×、down_proj 0.40×；fp8 权重 K=4096 M=8 4.22×、
+M=256 scaled_mm 1.86×；fp8 decode 内核逐层 ~1.15ms；verify 启动税 ~10ms/步被 graph 消除。
+**追问应对**：被问"还能怎么快"→ cp.async/TMA 双缓冲流水（主差距）、ldmatrix canonical、KV 块
+排序提 L2 命中、w_deq 降精度存储（fp8 引入 dequant 流量不划算）；persistent/split-K 已实测
+（persistent 亏、split-K 仅小 M 赢——给条件不给背书）。
+
+### 4.4 量化（路径取舍 + 精度方法论 + 诚实数字）
+
+**机制**：w8a8（per-group 128 int8 + per-token int8 + SmoothQuant）、int4（per-group 对称 +
+2-dot 反量化内核 + 双路径 + `int4_group_size` 可配）、AWQ（α 搜索缩放折叠）、fp8 权重（e4m3
+全量化：per-column 权重 + per-token 激活，decode 权重-only Triton / prefill 硬件 `_scaled_mm`）、
+sparse24（2:4 幅值剪枝）、fp8 KV cache（另线）。**量化精度口径（2026-09-07 复测，真实文本
+ppl，12 条模型自生成续写 3060 token）**：fp16 3.23 / fp8 3.25（+0.6%）/ int4(RTN) 4.17（+29%）/
+awq 3.70（+15%，把 int4 差距砍半）——**ppl 语料每次运行重新采样，run 间有波动**（历史 run 曾
+报 fp16 3.32/int4 4.38/awq 3.76 与 fp16 3.60/int4 4.81/awq 4.22），只比同次 run 内；引擎级
+对齐指标（KL/top-1）不受此影响。
+
+**必问必答**：
+- **Q：AWQ 为什么有效？** A：大激活通道的权重误差贡献大——把 s 折进权重（W'=W·s）让大激活
+  通道的量化相对误差变小，激活侧除 s（X'=X/s）压小误差贡献。**方向必须对**（权重乘、激活除）；
+  方向错了 α 搜索会假装"不缩放最优"（§6 故事 7）。实测把 int4 相对 fp16 的 ppl 差距砍半。
+- **Q：fp8 为什么近乎无损？** A：e4m3 的 3 位尾数 + per-column scale + per-token 动态激活 scale；
+  同批 ppl +0.6%；引擎级 KL 0.017、top-1 100%（fp8 权重）。
+- **Q：2:4 稀疏为什么失败？** A：内核 bit-exact，但**一次性幅值剪枝丢 ~35% 权重质量**（KL 8.5、
+  top-1 0%）——SparseGPT 式误差补偿或剪枝感知训练是修复路线；且 sm_120 上 cuSPARSELt 每调用
+  0.3-0.5ms、CUTLASS 仅 sm_8x。
+- **Q：量化精度怎么测才可信？** A：8-prompt KL 会被尾部单点主导（曾与 ppl 结论相反）→ 换真实
+  文本困惑度；**指标的样本量决定结论方向**。ppl 语料随机 → 跨 run 比较只比同批。
+- **Q：fp8 KV 的写路径有什么坑？** A：torch 的 fp32→fp8 cast **溢出不饱和而是产生 NaN 位模式**
+  （实测 500→0x7F）→ 写路径必须 clamp(-448,448)；位模式解码（LUT）与硬件 cvt 在 NaN 语义上
+  不等价（§6 故事 1）。
+
+**数字**：fp8 KV KL 0.0073 / top-1 100% / 容量 1.9×；w8a8 KL 0.0379 / 吞吐 -16%；int4 双路径
+bs=8 +35%、bs=256 +3~6%、显存 1.73GB（比 fp16 还大 15%，w_deq 定价）；纯 int4 0.85GB、
+bs=256 0.82× fp16；AWQ 112/112 层逐层误差全赢；Qwen2.5-0.5B fp16 5.12 / int4 7.45（0.5B 量化
+鲁棒性弱）。
+**诚实结论**：int4 双路径的 w_deq 让显存超 fp16——吞吐无损的定价；纯 int4 仍是显存优先。
+**追问应对**：被问"为什么不用 GPTQ"→ GPTQ 用 Hessian 逆做逐列误差补偿，理论上优于 RTN；我们
+没实现——已知差距（§8 阶段 4）。
+
+### 4.5 投机解码（n-gram / Medusa / EAGLE / fp8 verify / 环上 verify）
+
+**机制**：verify 步 = 带前缀复用的 varlen prefill（query = [末 token, 草稿...]，位置从 len-1 起，
+num_cached = len-1）；接受规则（Leviathan et al.）：草稿是点质量分布，"接受 iff 目标采样==草稿"
+严格保持分布；被拒草稿不回滚 KV、永不进前缀缓存哈希（hash 范围只到接受长度）；verify 步 CUDA
+graph 化（行容量族 + 双 stride，stride = γ_max+1 与 3）。三个草稿源：n-gram（历史窗口搜索，零
+成本）、Medusa（γ+1 个 MLP 头 1024→256→vocab）、EAGLE（无 RoPE 草稿层 + 共享 LM head 自回归）。
+
+**必问必答**：
+- **Q：成本模型？** A：期望加速 = (1+αγ)/(γ·T_draft+T_verify+1)，α = 草稿接受率；**上界 α ≤
+  模型 top-1 可预测性**（实测自由文本 ~35%）——这解释了为什么所有方案在 free 文本 ~1.5-2×、
+  重复内容 3-4×。
+- **Q：为什么 EAGLE γ=2 赢、γ=4 输？** A：γ=4 每草稿一次 LM head 前向（0.6B 上 ~0.8ms）+ 特征
+  误差累积（草稿质量随深度下降）；γ=2 的 (1+αγ) 收益 > 成本。实测 γ=2 repeat +3.26×（α 0.525）、
+  γ=4 只有 +0.63×。
+- **Q：verify 步为什么用 varlen prefill 而不是 decode？** A：多草稿 = "一行多个 query token"——
+  本质是变长小 prefill；复用分块 prefill + 前缀复用路径（缓存形状 K/V + block tables）。
+- **Q：fp8 KV + 投机怎么结合？** A：verify 步走自研 fp8 varlen 内核直接读 fp8 缓存（免逐层全缓存
+  反量化，~18GB/步 搬运）——从 0.15× 变 +3.92×（bs=8 repeat）。逐列因果掩码必须 `<=`（差 1 会
+  让真实数据 logits 差 9-25，§6 故事 3）。
+- **Q：滚动环上怎么 verify？** A：verify 行的 key 集 = [kv_j0·B, end)（环驻留内容 + 本步刚写行）
+  稠密装配成段喂 flash——**段内相对下标使窗口掩码精确**（origin 常数抵消）；BlockManager 的 spec
+  账本按逻辑块 j0+i 记账；slack = γ+2（§8 阶段 2b-ext）。
+- **Q：为什么 α 低时反而亏？** A：每步固定付 γ+1 行 verify 成本，产出只有 1+αγ；α≈0.05-0.25
+  （Medusa 自由文本）时 1.2-2.0 token/行 盖不住大 batch 的 GPU 行成本。
+
+**数字**：ngram bs=8 repeat +3.87×、bs=256 +1.43×；Medusa bs=8 repeat +1.57×（head_0 达模型
+top-1 的 87%，vs 真实 next 30.9% = 上限 35.3% 的 87%）；EAGLE γ=2 repeat +3.26×；free 文本全部
+~1.5-2×（α 0.19-0.23）；0.6B top-1 可预测性 ~35%（temp=0.6 采样只有 ~20-30% 概率等于 argmax）。
+**诚实结论**：α 被模型可预测性封顶——投机在"模型太笨"时赚不到；工程侧（verify 路径、graph、
+fp8、环）已闭环，剩余瓶颈是草稿质量。**追问应对**：被问"怎么提草稿质量"→ 更大模型（7B+ top-1
+更高）、更久训练（原文百万级 vs 49K）、medusa_hidden 256→512、tree attention（Medusa-2）——
+但可预测性天花板不随这些改变。
+
+### 4.6 系统与工程（流式加载 / 多模型 / TP / 验证方法论）
+
+**机制**：按层流式加载（meta 构造 → 逐层 `to_empty` 物化 → 加载即量化 → 释放 fp16；自动触发 =
+fp16 估重 > 空闲显存 45% 且启用量化，估算用 **meta 实建数参数**——通用 qkv/o/inter 公式不含
+MoE/MLA 专家权重，会把 DeepSeek 33GB 误判成小模型直接建而 OOM）；注册表按 model_type 分发；
+TP 用 NCCL + 共享内存命令通道（weight_loader 分片 + all_reduce）；验证方法论 = HF 参考 logits
+对照（top-1 100%）+ 内核独立对照 + 引擎级 smoke + 真实文本 ppl。
+
+**必问必答**：
+- **Q：meta 物化踩了什么坑？** A：①torch 2.8 禁止 meta→真实设备 `.to()`/`set_data`，必须
+  `to_empty`；②to_empty 替换 Parameter 丢 weight_loader → 按模块重挂；③RoPE `cos_sin_cache`
+  是计算型 buffer，物化后全零 → q/k 被零旋转逐层发散 → `_finalize_streaming` 重建；④tie 词表
+  重绑；⑤meta 计数构造污染 `get_rope` 共享实例 → `cache_clear()`（§6 故事 18，2026-09 修复）。
+- **Q：16GB 卡怎么跑 7B+？** A：按层加载 + 即时量化——任一时刻 ≈ 累计量化权重 + 单层 fp16 +
+  embed；7B int4 峰值 10.7-11.6GB。**诚实边界**：streaming 限制——int4 强制纯 int4（MLA kv_b
+  例外保留 w_deq，占参 ~1%）、w8a8 无 SmoothQuant、awq 仅预生成 scales。
+- **Q：新架构端口（Gemma-2）怎么验证？** A：HF parity 逐层二分（embed → 层0 → 层1 → hidden）；
+  发现三个隐藏细节（embed ×√d、RMSNorm (1+w)、双残差四 norm），都是"checkpoint 里看不出来、
+  读源码才能发现"的初始化语义。**教训：debug 脚本自身的形状/口径也要先钉对**（§6 故事 15）。
+- **Q：transformers 5.15 的坑？** A：DeepseekV2 无缓存前向不传因果掩码（对照只能取末行/显式掩码）；
+  experts 内存 3D 存盘 2D（`use_experts_implementation`）；**MoE grouped 路径的 `torch._grouped_mm`
+  仅 sm_90**（CC 9.0）→ sm_120 无法 HF-GPU 直连做真权重对照（记录在案，用 nano fp16 稠密参考）。
+- **Q：TP 为什么没实测多卡？** A：单卡环境；实现完整（weight_loader 分片 + NCCL 命令通道 +
+  序列跨进程），multi-GPU 验证是已知空白。
+
+**数字**：Qwen2.5-7B int4 峰值 10.66GB / Llama-3.1-8B 11.62GB / Mistral-7B 11.37GB；parity：
+qwen2.5-0.5B top-1 100%（mean 0.096）、mistral 100%（0.014）、gemma2 100%（0.022）；DeepSeek-V2
+4 层真权重切片引擎 vs 稠密参考 0 失配（§8 阶段 2）。**诚实结论**：PP/DP/EP 未实现；TP 未实测；
+CacheBlend、PD 分离只在文档里设计过（§8 阶段 5）。
+
+### 4.7 MoE（router + 循环专家 + grouped 后端 + 量化专家）——阶段 1.5
+
+**机制**：MoE 只替换 FFN——`mlp.gate`（router，fp32 softmax → top-k，可选 norm_topk_prob）+
+`mlp.experts.{i}.gate_proj/up_proj/down_proj`（2D per-expert，参数名与 HF checkpoint 直配 →
+loader 零改动、量化路径继承）；前向 = 逐专家循环（串行、e 升序、x dtype 累加，与 transformers
+eager 同语义）；router 永不量化（gate 精度决定路由）。**grouped 后端（1.5b）**：排序分段 +
+padded 批量 bmm（gate_up 3D 融合 + silu·up 融合 + down）→ 组织税 3.8→0.7ms/层；条件 = 专家有
+float 权重（未量化或 int4 dual 的 w_deq），纯 int4/fp8 回退循环。**段式内核（1.5c）**：Triton
+真段式（无 padding，位级正确）——实测赢面窄：小 E + 极长段才赢（E=8/R=32K 快 43%），默认仍是
+padded bmm。
+
+**必问必答**：
+- **Q：MoE 影响引擎哪些部分？** A：只 FFN；调度/KV/注意力/CUDA graph 结构全复用；但动态 gather
+  形状不能进 CUDA graph → MoE 模型 eager（graph 化需路由 padding，未做）。
+- **Q：怎么验证 MoE 正确性？** A：三层：①数学同构参考（全行掩码 vs gather/index_add，同序累加）
+  → 位级一致；②CPU 单测进 pytest；③端到端：随机 toy（4 层混合 + tie）引擎 vs transformers 5.15
+  同权重同 dtype → top-1 100%、mean diff 0.003。
+- **Q：负载不均怎么办？** A：串行循环实现免疫且偏好集中（强制全 token 进一专家反而快 3.6-5×）；
+  padded 批量在不均衡时放大到 E·max_n（本尺度实测仅 +30%）；真段式内核（无 padding）是 128+
+  专家的下一步。
+- **Q：MoE 量化值不值？** A：decode 专家 GEMM 权重带宽受限 → int4/fp8 ≈2×（方向稳健、绝对值受
+  WSL 时钟噪声影响）；层误差 fp8 6.4% / int4 12.5%（随机 toy）。
+- **Q：DeepSeek-V2 的 MoE 形态？** A：shared experts（always-on）+ routed scaling（α 缩放）；
+  transformer 5.15 存盘 2D、内存 3D；V2-Lite 真实权重：27 层、n_routed_experts 64、topk 6、
+  intermediate 10944（=64×171，int4 组 64，§8 阶段 2b-ext）。
+
+**数字**：parity top-1 100%（mean 0.003）；decode int4/fp8 ≈2×；grouped 后端组织税 3.8→0.7ms/层
+（-80%），小 T 快 4-5×、T=4096 1.9×；int4 dual 自动走 grouped（w_deq）→ toy decode 2588 tok/s
+（~2.4-2.8× 观察）。**诚实边界**：量化纯 int4/fp8 无 float 视图仍回退循环；padded 后端在不均衡/
+大 E 时放大到 E·max_n。**追问应对**：被问"怎么快"→ grouped GEMM、路由 padding 入图、shared
+expert（Qwen3-235B 类，5.15 已删该结构）、EP + all-to-all 通信模型（§8 阶段 5）。
+
+### 4.8 MLA 与滚动环（阶段 2 主线，DeepSeek 面试必考）
+
+**机制（MLA，2a）**：DeepSeek-V2 latent 注意力——Q 也压缩（q_lora_rank）；K/V 共享一个 latent
+`c_kv`（kv_lora_rank）+ 解耦 rope key `k̃_pe`；W_UK 与 W_DKVᵀ 权重绑定（KV 无独立投影矩阵）；
+每 token 每层缓存 fused `[c_kv | k̃_pe]`（V2-Lite：512+64=576 元素，**7.11×** 压缩——修正口径：
+论文共享 rope key 全头共用，非"每头 rope key"的 naive 1536/2.7×）。decode 用**吸收式内核**：
+W_UK→q（q_abs）、W_UV→输出，每 token 只读 576 元素，重建不出稠密 K/V；varlen（prefill/verify）
+走稠密装配喂 flash（v head_dim 零填充对齐）。**机制（环，2b）**：见 §4.2。
+
+**必问必答**：
+- **Q：MLA 为什么省？** A：KV 每 token 每层从 (2×n_kv_heads×head_dim) 稠密降到 latent+rope；
+  V2-Lite 等效 GQA 口径 4096+ → 576（7.11×）；V3 官方口径 576 同理推导。
+- **Q：吸收式内核怎么工作的？** A：q_abs = q_nope·W_UKᵀ（把 latent-key 投影吸进 query 侧），
+  score = q_abs·c_kv + q_pe·k̃_pe；输出 o = Σ p·(c_kv·W_UV)（W_UV 是 down 投影，p·c_kv 先算再
+  投回）。注意与 W_UK/rope 的缩放因子按论文对齐（absorb 前乘 head 缩放）。
+- **Q：MLA 的 fp8 KV 怎么做？** A：fused 行 [c_kv|k̃_pe] 量级不同 → **两段独立 scale**（cal_c/
+  cal_r，主机侧 clamp±448 → e4m3）；读路径（内核/稠密装配）按段反量化回 fp32×scale→fp16。
+  验证：gather+dequant 内核逐位一致、toy 引擎 44 行 1 翻转（fp8 噪声带）。
+- **Q：纯 int4/fp8 的 MLA decode 呢？** A：吸收式内核要求 kv_b 投影有 float 视图；纯 int4/fp8
+  时 kv_b 保留反量化副本 w_deq（is_mla_kv_b 例外，占参 ~1%，V2-Lite 实测 113MB）→ 走稠密兜底
+  的自动 eager 被消除、吸收式 decode + CUDA graph 恢复（2b-ext）。
+- **Q：滚动环的正确性怎么保证？** A：驱逐保证 resident_start ≤ N−W−slack（verify 需要的
+  γ+2 余量）；decode/varlen 内核用 chunk_starts/装配偏移表达 key_pos=(j0+b)·B+t；refcount
+  守卫断言环块恒私有（无共享 → 无 COW）；与掩码式参考对齐验证（同内核位级、异内核 top-1）。
+
+**数字**：MLA decode 内核 vs 稠密参考**位级 0 误差**（3 场景跨块）；CPU 全模型 vs transformers
+5.15 同权重 top-1 100%（max 1e-6）；引擎 prefill/decode parity top-1 100%（mean 0.003-0.03）；
+真实 DeepSeek-V2-Lite 27 层流式 int4：启动 55s、权重 ~5GB 常驻（int4 + kv_b w_deq 113MB）、
+decode ~2.8 tok/s（3 并发、MoE eager、纯 int4）、中英连贯（§8 阶段 2b-ext 完整表）。
+**诚实边界**：fp8 KV×MLA 只在 toy 验证（真实 V2-Lite 未跑 fp8 KV）；ring+medusa/eagle 断言关；
+gemma2 split 仅 bf16/无投机/eager；KV swap×ring 未验证；MLA spec（投机 verify 吸收）未做。
+**追问应对**：被问"V3/V3.1 的 MLA 变体"→ 官方 576 口径推导、多 token 预测（MTP）未实现、EP 专家
+并行理论（§8 阶段 5）。
+
+## 5. 数字速查（全部带条件：RTX 5060 Ti 16GB / WSL2 / bf16 / 单卡；未注日期者为最近复测）
+
+| 项 | 数字 | 条件 |
+|---|---|---|
+| 引擎吞吐峰值 | **5825 tok/s**（fp8 权重，1.22× fp16）；fp16 基线 4792 tok/s（同批） | Qwen3-0.6B，bs=256，干净 workload，2026-08 批次 |
+| batch 缩放峰值 | **5840 tok/s**（fp16 @256） | 同 workload 另一批次（混合调度重测）；跨批只作量级参考 |
+| vLLM 对比 | 吞吐 1.35-1.61× 领先；prefill ~2×；**decode 单步持平** | 同 workload 同 seed 同 flash-attn，2026-08-18 |
+| 混合调度 | 吞吐 +7~21%；抢占减半（512 档 141→71） | 全 batch 档 |
+| 前缀缓存 | 满块重复批次 prefill 0 tok/0 步；300-token 部分块场景 batch1=2816（COW 正确语义） | Qwen3-0.6B |
+| FP8 KV | 容量 1.9×（421→802 块）；KL 0.0073；top-1 100% | fp8_e4m3 + 自研内核 |
+| fp8 权重 | 同批 ppl 3.23→3.25（+0.6%）；KL 0.017 top-1 100%；bs=256 5825 tok/s；8B prefill TTFT 210 vs int4 813ms | e4m3 全量化；K=4096 微基准 M=8 4.22×、M=256 scaled_mm 1.86× |
+| int4 双路径 | bs=8 +35%、bs=256 +3~6%；同批 ppl 4.17（RTN，+29%）；显存 1.73GB | w_deq 副本定价；qwen3-0.6B int4 dual 实测 1.730GB（2026-09-07） |
+| int4 纯模式 | 显存 0.85GB；bs=256 3916.5 tok/s（0.82× fp16，tile 搜索后从 0.64× +28%） | 大 batch 仍慢于 fp16，显存优先 |
+| AWQ | 同批 ppl 3.70（+15%，int4 差距砍半）；112 层 α 搜索逐层误差全赢 | 真实文本校准；历史 run：4.38→3.76 |
+| ppl 口径 | 语料每次随机续写 → run 间波动（fp16 基线 3.2-3.6 均见过） | **只比同 run 内**（§10.3.6） |
+| W8A8 | KL 0.0379（per-group 后）；吞吐 -16% | per-group 128 + SmoothQuant |
+| 2:4 稀疏 | 内核 bit-exact；一次性剪枝 KL 8.5；cuSPARSELt 0.02-0.17× | sm_120 无硬件稀疏 MMA |
+| ngram spec | bs=8 repeat +3.87×；bs=256 +1.43×；fp8 版 +3.92× | verify CUDA graph 后 |
+| Medusa | bs=8 repeat +1.57×；head_0 = 模型 top-1 的 87% | 自蒸馏 ~7min；大 batch 亏 |
+| EAGLE-1 | γ=2 repeat +3.26×（α 0.525）；γ=4 只有 +0.63× | 0.6B，重复内容 |
+| 模型可预测性 | 自由文本 top-1 ~35% → 投机 α 天花板 | 0.6B；7B+ 会右移 |
+| KV swap | bit-exact 0 误差；699 次换出；**27.8s vs recompute 11.8s（本机亏）** | 0.6B+WSL2；价值在 7B+ 与真实 Linux |
+| 流式加载峰值 | Qwen2.5-7B 10.66GB / Llama-3.1-8B 11.62GB / Mistral-7B 11.37GB | int4，16GB 卡 |
+| 端口 parity | qwen2.5 100%（0.096）/ mistral 100%（0.014）/ gemma2 100%（0.022） | prefill logits vs HF |
+| 模型吞吐 | Llama-3.1-8B 303.5 tok/s（bs=16）；Mistral-7B 311.4（bs=32，2026-08-24）；Gemma-2-2B 782.7-836.6（bs=64，2026-09-07 复测 ×2；08-24 首测 1094.7） | int4；WSL run 间波动 ±25% 级别 |
+| MLA | fused [c_kv\|k̃_pe] **576 元素**/token/层（**7.11×**，修正口径）；decode 内核 vs 稠密**位级 0 误差**；引擎 parity top-1 100% | DeepSeek-V2；V2-Lite 27 层流式 int4 decode ~2.8 tok/s（3 并发、MoE eager） |
+| 滚动环（2b） | 稳态 KV = 窗口+B/seq；真实 Mistral-7B 5050-token 环 vs 掩码 fp8 **逐位一致** | 环表 ≤ cap；滚动模型停用前缀缓存 |
+| split 双池（2b-ext） | gemma-2-2b-it 真实 split：环池 cap 18 封顶 vs full/掩码线性增长；30/30 稀疏步 | 仅 bf16/无投机/eager；softcap 层禁 fp8 KV |
+| 精度方法论 | 8-prompt KL 与 ppl 结论相反 → 用 3000+ token 困惑度；语料随机 → 只比同批 | 样本量决定结论方向 |
+| pytest | **57 passed**（2026-09-07） | 纯 Python（调度/块管理/投机/注册表） |
+
+---
+
+## 6. 踩坑故事精选（讲"方法论"而非"事故"；编号与 note.md §4 一一对应）
+
+1. **torch fp8 cast 溢出静默变 NaN**：fp32→fp8 cast 溢出不饱和而是产生 NaN 位模式（实测
+   500→0x7F）；v4 的 LUT 把 NaN 位模式读成 0.0 **掩盖**了它，v5/v6 换硬件 cvt 后 NaN 直接进
+   logits——修复（clamp±448）后精度反而变好（KL 0.0077→0.0073）。教训：**位模式解码与硬件 cvt
+   在 NaN 语义上不等价——换内核解码方式必须重跑引擎级精度检查**。
+2. **Medusa 三个集成 bug**：训练标签错位 1（head_0 训成预测当前位置 → 永不接受）、postprocess
+   清零 num_scheduled_tokens 后才读它（行索引全错）、capture_spec_graph 只对 ngram 调用——每个
+   都让 α 归零，靠"单元验证头是好 + 引擎 draft 与模型 argmax 49% 重合"逐层剥离定位。
+3. **fp8 varlen 差 1 掩码**：`tok_mask = key_pos < key_upper` 排除了 query 自己的 key——随机数据
+   上影响 ~1/key_len 没被独立检查抓住，真实数据上 self-attention 分量大 → logits 差 9-25。
+   **独立检查（随机数据）通过 ≠ 引擎正确——必须跑引擎级对齐检查**（掩码要 `<=`）。
+4. **训练 60× 慢**：引擎占 ~14GB 时 caching allocator 每步 7.3s（vs 释放后 123ms）——先
+   `llm.exit()` 再训练。
+5. **Gumbel 噪声在 GPU**：`torch.manual_seed` 不控 GPU RNG（噪声在 GPU 生成）——同 seed 对比
+   实验必须先种 `torch.cuda.manual_seed`；同进程多引擎必须 `empty_cache`。
+6. **INT4 打包列缺块偏移**：`offs_j` 没加 `pid_n·(BLOCK_N//2)` → 所有 N 块≥1 的程序读通道 0-63。
+   小形状检查全过、大 N 全错；按 N 块打印误差分布一眼定位（块 0 对、其余全错）。**小形状通过 ≠
+   内核正确，要覆盖多块路径**。
+7. **AWQ 方向三连错**：`W·s且X·s`（KL 8.6）→ 反方向 `W/s且X·s`（组塌缩 KL 12.4）→ 论文方向
+   `W·s且X/s` 才对；方向错时 α 搜索会假装"不缩放最优"（α=0）——**必须独立验证恒等式再信搜索**。
+8. **8-prompt KL 与 ppl 结论相反**：KL 对单个极端位置极敏感（seq3 单点 p=0.93 贡献 ~1.4），
+   8 个 prompt 的对比被一两点主导 → 换 3000+ token 困惑度（决定性指标）。教训：**指标的样本量/
+   敏感度决定结论方向**。
+9. **meta 物化丢计算 buffer（RoPE 全零）**：按层流式加载时 `to_empty` 只给未初始化内存，meta
+   设备上算出的 `cos_sin_cache` 值丢失 → q/k 被零旋转 → 从第 1 层起逐层发散。定位：逐层 hook
+   对比——embed 完全一致、layer0 首 token（只 attend 自己）精确、q_pre/k_pre 一致但 q_post/
+   k_post（RoPE 后）差 80-130 → 锁死 RoPE。此前"buffer 对比通过"是假象：`lru_cache(1)` 让同进程
+   两个模型共享同一实例，对比平凡相等——**检查脚本必须清缓存再重建**。
+10. **裸模型路径 .to() 打破 tie 共享（lm_head 全零）**：诊断脚本先 CPU 构造再 `.to(cuda)`——
+    `_apply` 重设每个 Parameter 的 `.data`，`__init__` 的存储共享被拆开；tie checkpoint 常不含
+    `lm_head.weight`（Qwen2.5-0.5B 没有，Qwen3-0.6B 有——所以 qwen3 一直侥幸没炸）→ logits 全零
+    → **ppl = 词表大小（uniform）是强信号**。修复：加载后按 tie 重绑。共享存储的 Parameter 在
+    `_apply`/`.to()` 下不保共享。
+11. **Triton JIT 编译落进计时区间（TTFT 435ms 假象）**：融合激活量化 kernel 每个 BLOCK_K 变体
+    首次调用编译 100-400ms；warmup 用 M=16384 而实测步 M=1042 → 编译成本吃进 TTFT（435 vs 真实
+    22ms）。定位：逐层 hook 发现"只有 layer0 慢"→ 事件计时拆出 quant 289ms → 冷/热首调对比。
+    **修复：bench 预热用真实 workload 形状**。否则会报告 20× 假数字。
+12. **投机多 token 接受跳过 max_tokens（`_maybe_finish` 的 `==`）**：精确相等在多 token 步进下
+    永不命中（62→65 跳过 64）→ 序列一路长到 max_model_len（EAGLE 实测 4093 → 块表溢出 spec
+    graph 16 列 → 崩）。ngram 的草稿预算恰好避免，EAGLE 没加就暴露。**修复：改 `>=` + 草稿循环
+    加 remaining-1 预算**。预存 bug 常由新路径触发。
+13. **SDPA 3-D 输入把 head_dim 当序列维（EAGLE 注意力语义错）**：`[n, heads, hd]` 被按 [B,H,L]
+    解释——因果/对角掩码全做在特征维上（数值稳定、训练照常收敛，但语义全错）。正确形式是
+    [1,heads,n,hd] 4-D；且 1-token-per-step 推理下对角注意力退化为 o=v，训练/推理语义才一致。
+    **API 的维度语义 ≠ 直觉——用之前先验证解释**。
+14. **高级索引写回是临时副本（swap 静默写垃圾 KV）**：`kv_cache[:, :, block_ids]`（list 索引）
+    返回 gather 副本，`.copy_()` 只改副本 → swap_in 写回后 KV 永远不变（输出全错但长度/无崩溃
+    全过）。bitexact 测试（读-写-读回对比，Δ=300 vs 期望 0）才抓到。修复：`index_copy_` 原位写。
+    **"跑通"不等于"写对"——写回缓存/参数必须验证内容**（torch 高级索引：读=copy、写=副本，
+    单 int 索引才是 view）。
+15. **Gemma-2 三个"读源码才能发现"的架构细节**：端口写完跑 HF parity，top-1 0%、logits 全不
+    相关。逐层二分：①embed diff 恒为 ~48× → HF 源码 `Gemma2TextScaledWordEmbedding` = **embed ×
+    √hidden_size**（√2304=48）；②层 0 仍炸（attn 输入 diff 31.7 非恒定比例）→ 单测 RMSNorm 是
+    bf16 噪声 → 反查 HF：`Gemma2RMSNorm` 是 **norm(x)×(1+weight)**（权重 init 0、存偏移量）——
+    用 ×weight 差 (1+w)/w 倍，小权重列 ~10×（实测比例 9.57 = 1.1167/0.1167 精确吻合）；③层内
+    双残差四 norm（第二个残差基 = x1）。教训：**架构细节藏在"初始化语义"里**；新端口唯一可靠验证
+    是逐层对照 HF，且 debug 脚本自身形状/口径先钉对。
+16. **flash window_size 的含两端语义**：flash 文档 `[i-left, i+right]` **含两端**——causal 窗口
+    W 个 key 必须传 (W-1, 0)，传 (W, 0) 多 attend 一个（probe 实测 (256,0) diff 2.1e-1 vs
+    (255,0) 1.6e-2）。**"窗口大小"语义不唯一**（SDPA 的 sliding_window=W 是"含自己共 W 个"），
+    先用最小对照实验钉死再写进生产代码。
+17. **fp8 内核窗口掩码的 `m=-inf` 全掩块 NaN**：SWA 掩掉前导块后 m 从 -inf 起步遇到全掩块 →
+    `exp(-inf-(-inf))=NaN`。修复：WINDOW>0 时 m 从 0 起步（softmax 平移不变）。flash 用"循环从
+    首有效块开始"回避——**任何给内核加掩码的改动都要检查 m/l 累加器的空块行为**。
+18. **meta 计数构造污染共享 RoPE 实例（2026-09 修）**：`_decide_streaming` 为估算权重用 meta
+    实建模型（c2e04d4），而 `get_rope` 是 `@lru_cache(1)` 的共享实例 → 计数后 `cos_sin_cache`
+    留在 meta；非流式（eager 量化）路径复用同一实例 → 首次前向 "Tensor on device meta is not
+    on the expected device cuda"（gemma2 int4 实测复现；流式路径因 `_finalize_streaming` 重建
+    而幸免、量化 none 因提前返回而幸免——所以此前探针全没踩到，**预存 bug 由新路径（meta 计数）
+    触发且被老路径掩盖**）。修复：计数后 `get_rope.cache_clear()`。教训：共享缓存实例要警惕
+    "在什么设备/上下文里被首次构造"。
+
+---
+
+## 7. 方法论总结（如何证明你懂推理系统）
+
+- **先讲成本模型与上界**：投机 γ·T_draft+T_verify vs (1+αγ)、α≤模型 top-1；swap 的 D2H 带宽
+  vs 重算；int4 的带宽 vs 计算主导；量化是"带宽优化不是计算优化"。
+- **讲"我证伪过什么"**：大 tile 假设、分页瓶颈假设、启动税假设——证明有实证习惯而不是背书。
+- **主动说"哪里是亏的"**：KV swap 本机亏、2:4 精度灾难、纯 int4 大 batch 慢、EAGLE γ=4 亏、
+  Medusa 大 batch 亏、vLLM 对比的近似口径——比吹嘘可信。
+- **数字带条件**：单卡、WSL2、模型量级、flash-attn 版本、dtype、run 日期；ppl 等随机语料指标
+  只比同 run 内。
+- **口径诚实**：vLLM 离线 API 不暴露逐请求指标 → 用聚合直方图并声明近似；decode 单步才是
+  kernel 级可比口径。
+- **验证分层**：单元级（内核 vs 参考）→ 引擎级（logits 对齐，同输入同位置）→ 端到端（token 流
+  /困惑度）；"独立检查通过 ≠ 引擎正确"、"小形状通过 ≠ 内核正确"。
+- **定位流程**：①探针分层（微基准隔离变量）；②步级计时拆阶段；③单元/引擎级分开验证；
+  ④用实验证伪自己的假设。每次定位留下可复现探针脚本。
+- **亮点句**："vLLM 在这张卡上跑不了 fp8 KV（FA3 是 Hopper-only），我的自研内核是唯一可跑的
+  实现，且精度 KL 0.0073、top-1 100%。"
+
+## 8. 精进路线图（已完成阶段 = 深水区素材；未完成 = 下一步计划）
+
+> 原则：按 **面试追问频率 × 技能可迁移性 × 本机可验证性** 加权排序。穿插项：每阶段读对应
+> vLLM/llama.cpp 源码做对照。
+
+### 阶段 1：内核与性能工程（CUDA 记忆模型 + roofline 归因 + 手写 MatMul）——✅ 已完成
+**交付（`benchmarks/_kernel_roofline.md` + `benchmarks/_cuda_gemm_report.md`）**：实测标定硬件
+锚点（TC 48.5 TFLOPS / 带宽 370 GB/s / 36 SM）；GEMM 三种性能形态归因（fp8 大 M 81% TC、
+int4 44% TC、decode 小 M 启动受限）；手写 SMEM-tiled fp16 MatMul **101% cuBLAS** + 消融
+（最优配置 occupancy 仅 17%——TC 吞吐型反直觉反例）；tile 网格搜索 → **int4 大 M 小 tile 反超
+19%（regs 255→128）→ 纯 int4 大 batch +28%**；教训：快速搜索的 +144% 异常值被高迭代复测推翻。
+**CUDA C 补课（1b，全部 SASS 实证）**：工具链四坑（pip nvcc wheel 拆包只剩 ptxas → conda nvcc
+12.8.93；gcc15 崩 pybind11 → conda gcc14；CUDAHOSTCXX 失效 → symlink；cuobjdump 12.4 不能解码
+SM120 → 12.8）。手写 fp16 GEMM：FMA naive 1.6 → mma 单 tile 6.1 → **8 tile/warp + BsT 转置
+布局 20.8 TFLOPS（cuBLAS 53%）**；**bank-conflict 消融：行距 32→34 消 16-way 写冲突，+86%**；
+split-K 只在 block 数 < SM 数时赢（M=64 S=4 +59%）；persistent 本机全亏（0.89×）。
+
+### 阶段 1.5：MoE（router + 循环专家 + grouped/段式后端 + 量化专家）——✅ 已完成
+**为什么插入**：DeepSeek-V2-Lite 是 MLA + MoE 双机制——两个新东西一起排错会互相污染归因。
+**交付**：①`layers/moe.py`（2D per-expert 对齐 HF 存盘格式——5.15 内存 3D/存盘 2D 的事实修正；
+loader 零改动、量化路径继承；router 永不量化）；②loader packed 匹配改"点分段相等"；③qwen3_moe/
+deepseek_v2 端口 + registry；④验证链：数学同构参考位级对照 → CPU 单测 → 端到端 parity top-1
+100%（mean 0.003）；⑤量化专家 decode ≈2×；反直觉实测：串行循环**偏好集中路由**、toy 量化 top-1
+全翻是**顶层贴边**假警报（gap 0.4-0.7σ）。
+**1.5b（grouped）**：组织税 3.8→0.7ms/层（小 T 快 4-5×）；auto 后端（w_deq 可组；纯 int4/fp8
+回退循环）；不均衡 padding 放大实测 +30%。
+**1.5c（Triton 段式）**：无 padding、位级正确 + parity 100%；实测赢面 = **小 E + 极长段**
+（E=8/R=32K 快 43%），E=128 持平、小段 3-10× 慢 → 默认仍 padded-bmm，段式作显式开关。教训：
+内核的"理论优势"要用实测边界校验。
+**下一步**：shared expert（Qwen3-235B 类）；EP 理论在阶段 5。
+
+### 阶段 2：MLA（DeepSeek latent attention）+ SWA 滚动缓冲——✅ 已完成（2a/2b/2b-ext）
+**为什么第二**：注意力是推理核心；MLA 有真模型可验证（DeepSeek-V2-Lite）；滚动缓冲把文档 TODO
+变完成且用上自研内核能力。
+
+**2a（MLA，提交 662a464 起）**：`models/deepseek_v2.py` 全模型端口（MLA + dense/MoE 混合 +
+shared experts + routed scaling）+ `layers/attention_mla.py`（fused cache [c_kv|k̃_pe] 576
+元素/token/层 + 吸收式 decode Triton 内核 + KV 布局泛化）+ 引擎集成。验证链：decode 内核 vs
+稠密参考**位级 0 误差**（3 场景跨块）→ CPU 全模型 vs transformers 5.15 同权重 top-1 100%
+（max 1e-6）→ 引擎 parity top-1 100%（mean 0.003-0.03）。上游怪癖：5.15 DeepseekV2 无缓存前向
+不传因果掩码；experts 内存 3D 直挂 Parameter（state_dict 无 .weight）；flash varlen 要求 v
+head_dim == k → 零填充 192 截断。**顺带修复**：RMSNorm fp32 下 x.float() 别名输入 → mul_ 原位
+归一化残差中间张量（CPU fp32 参考错——逐层对照定位）。账本修正：论文共享 rope key → 576 元素
+**7.11×**（旧口径 1536/2.7× 是"每头 rope key"的 naive 假设）。
+
+**2b（SWA 滚动环，754cd22）**：`rolling_cache=True`（mistral 全层统一窗口 + bf16/fp8 KV +
+ngram 投机可选）：块表 = 窗口内容清单（`Sequence.kv_j0` 行首逻辑块序号），驱逐
+`(front+1)·B ≤ N−W−slack` 先释放再分配（净零 free 消耗）；refcount 守卫断言（环模型不发布/
+不消费前缀缓存 → 块恒私有）；fp8 内核泛化 chunk_starts；自研 bf16 paged decode 内核 + varlen
+环装配（flash 无法表达环表 key 位置）。验证：BM CPU 属性 pytest；引擎 e2e（mistral toy W=512
+跨窗多轮）vs 稠密掩码参考 84 采样步 top-1 全一致。稳态内存 = 窗口 + B 余量/序列。
+
+**2b-ext（组合解锁 + 真实模型验证，报告 `benchmarks/_stage2b_ext_report.md`）**：
+① fp8 KV+环（decode 传 chunk_starts）与 fp8 KV+MLA（fused 行两段独立 scale：cal_c/cal_r、
+clamp±448、内核与稠密装配双路反量化）；② 投机(ngram)+环：BlockManager 环 spec 账本修复
+（表项 = 逻辑块 j0+i）、verify 行 key 集 [j0·B, end) 稠密装配喂 flash（段内相对下标 ⇒ 窗口
+掩码精确）、slack=γ+2；③ 非统一窗口（gemma2 交替 local/global）**split 双池**：环池（local，
+驱逐到 cap）+ full 池（global，普通分页永不驱逐）双 BM/双 GPU cache/Context full_* 侧 + 自研
+内核 softcap（cap·tanh，flash 同语义）；④ 纯 int4/fp8 MLA decode：kv_b 保留反量化副本
+（`is_mla_kv_b` 例外，占参 ~1%，V2-Lite 实测 113MB）→ 稠密兜底/强制 eager 消除（w8a8/sparse24
+兜底仍留）；⑤ int4 组大小可配（`int4_group_size`）+ 内核尾 K 掩码与组粒度静态展开（128 路径
+逐位不变）。
+**验证摘要（真实模型）**：Mistral-7B int4 流式 5050-token（>W=4096）**fp8 KV 环 vs 掩码全程
+逐位一致**（0.0 diff、轨迹含 EOS 全同；环表 ≤ cap 18）；gemma-2-2b-it 26 层 split 4800-token：
+环池表长到 ring_cap(18) 封顶而 full/掩码继续线性增长，30 稀疏步（含越窗后）vs 手工 fp16 稠密
+参考 top-1 失配 0；DeepSeek-V2-Lite（31.4GB 下载）：4 层真权重切片 fp16 引擎 vs 稠密参考
+0 失配、int4(group64) 23/24，全量 27 层流式 int4 启动 55s、权重常驻 ~5GB（int4 + kv_b w_deq
+113MB）、decode ~2.8 tok/s（3 并发、MoE eager、纯 int4）且中英文连贯。
+**顺带修复的真实 bug**：MLA decode 内核真实尺寸共享内存超限（BLOCK_T 32→16/warps 8）；int4
+内核 K 尾块漏算（10944=64×171 丢 64 列 → logits 漂移+NaN，掩码修复）；streaming 判定 meta
+实建数参数（旧通用公式漏 MoE/MLA 专家 → 曾把 33GB 当小模型直建 OOM）。
+**诚实边界（现行）**：gemma2 split 仅 bf16/无投机/eager decode（softcap 层禁 fp8 KV；双池
+CUDA graph 未实现）；ring+medusa/eagle 断言关；滚动模型停用前缀缓存（重复 prompt 代价）；
+KV swap×ring/split 未验证；fp8 KV×MLA 只在 toy 验证（真实模型未跑）；fp8 权重×MLA 与 kv_b
+同机制但无单独探针；真实模型对照的采样步一致性受"异内核数值差在近并列处翻转"限制（同内核
+位级、异内核 top-1 噪声带内，用稀疏步手工参考论证）；transformers 5.15 MoE `torch._grouped_mm`
+仅 sm_90 → 本机无 HF-GPU 直连真权重对照（nano fp16 稠密参考替代）。
+
+### 阶段 3：调度系统深读（vLLM V1 源码对照 + SLO + multi-step decode）——**第三**
+**为什么第三**：调度是 vLLM 面试核心话题；我们的实现是"V1-style 简化版"，逐行读 vLLM 找差距 =
+把概念钉死（不需要 GPU）。**具体动作**：①读 vLLM V1 scheduler/block_manager/preemption 源码，
+产出"vLLM vs nano"逐项差距表；②实现 SLO-aware 优先级调度（TTFT/TPOT 目标约束 + 优先级队列）；
+③multi-step decode（一次调度多步 decode，减少 kernel 启动与 CPU 空转）。
+
+### 阶段 4：量化/稀疏算法层（GPTQ 误差补偿 + 剪枝感知）——**第四**
+**为什么第四**：现有量化是应用层，补算法层才能答"为什么 AWQ 有效、2:4 怎么不丢精度、GPTQ 和
+RTN 差在哪"。**动作**：①GPTQ（Hessian 逆 + 逐列误差补偿）在 0.6B 上与 RTN/AWQ 对比 ppl；
+②SparseGPT 式误差补偿稀疏（把 2:4 的 KL 8.5 修到可用）；③精度方法论：校准集设计、离群通道
+分析、误差传播曲线。
+
+### 阶段 5：分布式推理理论（PP/DP/EP + NCCL 集体通信）——**最后**
+**为什么最后**：单卡无法实测，性价比最低；作理论补强。**动作**：PP 的 1F1B 内存分析（bubble
+比例 = (p-1)/(m+p-1)）与切分策略、EP 的路由 + 通信量、NCCL allreduce 的环/树带宽模型；paper
+推导 + 数值模拟验证（无实机）。
+
+### 穿插阅读（每阶段做一块）
+- vLLM：attention backends（阶段1 对照内核）、scheduler（阶段3）、quant（阶段4）；
+- llama.cpp：GGUF 量化与 kernel 设计（阶段1/4）；
+- 论文：FlashAttention、MLA 原论文、PD 分离/Mooncake、GPTQ/AWQ/SmoothQuant、Megatron 1F1B/
+  DeepSeek MoE。
+
+## 9. 代码地图（功能 → 文件 → 行号 + 运行链；行号为 2026-09-07 实测）
+
+### 9.1 文件地图（谁是谁，行号可直接跳转）
+
+| 文件 | 职责 | 核心锚点（行号实测） |
+|---|---|---|
+| `nanovllm/llm.py` | 公共 API 入口 | `LLM`（纯别名，没逻辑） |
+| `nanovllm/config.py` | 引擎配置解析 | `Config` L7（字段注释 = 功能词典；`__post_init__` 断言合法性） |
+| `nanovllm/sampling_params.py` | 采样参数 | `SamplingParams`（禁 greedy） |
+| `nanovllm/engine/llm_engine.py` | **引擎主循环** | `LLMEngine` L17：`add_request` L53 / `_verify` L61 / `_medusa_drafts` L100 / `_eagle_drafts` L145 / `step` L204 / `generate` L291 / `collect_metrics` L354 |
+| `nanovllm/engine/scheduler.py` | **调度器** | `Scheduler` L12：`schedule` L109 / `_compute_draft` L168 / `_schedule_mixed` L189 / `_spec_rows` L251 / `_schedule_spec` L294 / `_schedule_mixed_spec` L300 / `_schedule_prefill` L338 / `_schedule_decode` L384 / `preempt` L414 / `swap_out` L440 / `swap_in` L478 / `_try_swap_in` L488 / `_maybe_finish` L505 / `postprocess` L518 / `postprocess_spec` L532 |
+| `nanovllm/engine/sequence.py` | 序列状态（CPU 侧真源） | `SequenceStatus` L8、`Sequence` L15（`kv_table` 滚动/全池表；`__getstate__` L99） |
+| `nanovllm/engine/block_manager.py` | **KV 块池 + 前缀缓存 + COW + 滚动环** | `Block` L8、`BlockManager` L26：`_t` L63 / `ring_cap` L68 / `_evict_front` L79 / `compute_hash` L93 / `can_allocate` L118 / `allocate` L154 / `allocate_private` L184 / `deallocate` L214 / `can_append` L225 / `can_append_spec` L241 / `may_append_spec` L276 / `cow_block` L297 / `may_append` L319 / `hash_blocks` L330 |
+| `nanovllm/engine/model_runner.py` | **打包 + GPU 执行** | `ModelRunner` L16：`call` L169（TP）/ `cow_block` L177 / `swap_out` L190 / `swap_in` L203 / `warmup_model` L221 / `quantize_int4_weights` L286 / `quantize_fp8_weights` L296 / `prune_sparse24` L306 / `quantize_awq_weights` L311 / `_decide_streaming` L369（meta 计数 + `cache_clear`）/ `_streaming_quant_hook` L409 / `_finalize_streaming` L470 / `calibrate_fp8_kv` L492 / `_finalize_mla_mode` L521 / `_finalize_rolling` L547 / `allocate_kv_cache` L599 / `_ring_rows` L745 / `prepare_prefill` L783 / `prepare_mixed` L846 / `prepare_spec` L944 / `_prepare_mixed_spec` L1009 / `prepare_decode` L1086 / `run_model` L1140 / `_spec_graph_hidden` L1197 / `capture_spec_graph` L1226 / `run` L1284 / `capture_cudagraph` L1313 |
+| `nanovllm/engine/ngram.py` | n-gram 投机（纯函数） | `find_ngram_draft` L15、`verify_drafts` L54 |
+| `nanovllm/models/registry.py` | 按 model_type 选模型 | `get_model_class` L49；`_PLANNED_BLOCKERS` L38 |
+| `nanovllm/models/*.py` | 7 个模型族（同构模板） | qwen3 L14/107/139/185/212 · qwen2 L15/105/137/182/209 · llama3 L16/111/143/188/215 · mistral L18/97/126/168/192 · gemma2 L62/131/149/189/219 · qwen3_moe L35/51/100/119 · deepseek_v2 L40/59/90/137/158（Attention/MLP/DecoderLayer/Model/ForCausalLM）；`compute_logits` 各 ForCausalLM 末尾（qwen3.py:243） |
+| `nanovllm/layers/attention.py` | **注意力：写 KV + flash/自研内核路由** | `store_kvcache_kernel` L17 / `store_kvcache` L39 / fp8 decode 内核 L50 / `kv_rows_gather` L161 / `paged_decode_attention_fp8` L189 / `paged_decode_attention_bf16` L216 / fp8 varlen 内核 L241 / `paged_varlen_attention_fp8` L309 / `Attention` L333（`forward` L377、`_ring_varlen` L482、`_decode_rows` L510） |
+| `nanovllm/layers/attention_mla.py` | **MLA（DeepSeek）** | `mla_store` L69 / `mla_gather_dequant` L121 / `mla_decode_kernel` L154 / `mla_decode_attention` L212 / `MLAAttention` L249（`forward` L464、`_decode_rows` L554、`_decode_kernel` L580） |
+| `nanovllm/layers/linear.py` | **全部 GEMM + 量化** | int8 内核 L24 / w8a8 L74 / int4 内核 L98 / int4_gemm L160 / sparse24 内核 L193 / sparse24_gemm L258 / fp8 激活量化 L286 / fp8 内核 L308 / fp8_gemm L356 / `WeightQuantMixin` L382（quantize_int4 L396、_int4_forward L441、quantize_fp8 L458、quantize_sparse24 L508）/ `LinearBase` L540（quantize_w8a8 L567、forward L610）/ Column L639 / Merged L669 / QKV L689 / Row L724 |
+| `nanovllm/layers/moe.py` | **MoE（1.5）** | `ExpertFFN` L34 / `MoE` L51（`_route` L90、forward L134、`_forward_loop` L140、`_forward_grouped` L169、`reference` L217） |
+| `nanovllm/layers/medusa.py` / `eagle.py` | 投机草稿头 | `MedusaHeads` L39 / `EagleLayer` L46 |
+| `nanovllm/layers/layernorm.py` / `rotary_embedding.py` / `activation.py` / `sampler.py` | 基础算子 | `RMSNorm`（含 weight_offset 变体）/ `RotaryEmbedding` L69（build_cache L98、forward L121）/ `get_rope` L148（**@lru_cache(1) 共享实例——meta 污染教训 §6 故事 18**）/ `SiluAndMul` / `Sampler`（Gumbel） |
+| `nanovllm/layers/embed_head.py` | Embedding + LM Head | `VocabParallelEmbedding` L10 / `ParallelLMHead` L46（继承 WeightQuantMixin） |
+| `nanovllm/utils/context.py` | **每步张量契约** | `Context` L6 / `get_context` L45 / `set_context` L48（位置传参，**新字段必须追加末尾**）/ `reset_context` L68 |
+| `nanovllm/utils/loader.py` | 权重加载 | `default_weight_loader` L8 / `load_model` L42 / `_load_eager` L64 / `_materialize` L78 / `_load_streaming` L95 |
+
+### 9.2 运行链
+
+**链 A：进程启动（只跑一次）**
+```
+LLM(...) → LLMEngine.__init__ [llm_engine.py:19]
+ └─ ModelRunner.__init__ [model_runner.py:18]
+     ├─ dist.init_process_group("nccl", ...)          # 无条件，TP=1 也初始化
+     ├─ get_model_class(model_type)                   # registry.py:49
+     ├─ _decide_streaming() [369] → load_model(...)   # meta 计数(cache_clear)→ 流式逐层物化+量化 / eager
+     ├─ eager 量化：quantize_int4/fp8/w8a8/awq/sparse24  # model_runner.py:286-311（streaming 走 chunk_hook）
+     ├─ _finalize_mla_mode() [521] / _finalize_rolling() [547]
+     ├─ warmup_model() [221]                           # 真实形状：JIT 编译 + 峰值显存
+     ├─ allocate_kv_cache() [599]                      # 大块 KV（MLA fused / ring / full 双池）绑层
+     ├─ capture_cudagraph() [1313]                     # decode 图族 [1,2,4,8,16..512]
+     └─ capture_spec_graph() [1226]                    # 投机：stride 家族 × 行容量家族（MLA/滚动跳过）
+```
+
+**链 B：每步推理循环（`generate` 内 `while not is_finished()`）**
+```
+step() [llm_engine.py:204]
+ ├─ scheduler.schedule() → (seqs, kind)                # scheduler.py:109
+ │   ├─ _try_swap_in() [488]                           # 先把换出的 KV 换回
+ │   ├─ 投机：先给 running 全算草稿 (_compute_draft [168])
+ │   └─ 分支：waiting+running→mixed | waiting→prefill | 其余→decode/spec
+ ├─ COW 拷贝：cow_pairs → call("cow_block") [169/177]  # run() 之前
+ ├─ swap 拷贝：swap_pairs → call("swap_out"/"swap_in") [190/203]
+ ├─ model_runner.call("run", seqs, kind) [1284]
+ │   ├─ prepare_prefill [783]/mixed [846]/decode [1086]/spec [944] → set_context() [context.py:48]
+ │   ├─ run_model(input_ids, positions, kind) [1140]
+ │   │   ├─ kind=spec → spec CUDA graph 重放（零长填充行）
+ │   │   ├─ kind=decode 且 bs≤512 且非 eager → decode CUDA graph 重放
+ │   │   └─ 否则 eager：model(input_ids, positions)
+ │   ├─ model.compute_logits(hidden)                   # LM Head（图外）
+ │   └─ Sampler(logits, temperatures) → token_ids      # Gumbel 采样
+ │       └─ reset_context() [context.py:68]
+ ├─ 投机：_verify() [llm_engine.py:61] → postprocess_spec() [scheduler.py:532]
+ │         → _medusa_drafts [100]/_eagle_drafts [145]  # 用 hidden 生成下轮草稿
+ ├─ 否则：postprocess() [518]                          # 追加 token/EOS/rehash
+ └─ 收集 finished 序列 → outputs
+```
+
+**链 C：单层前向（以 Qwen3 为例，锚点 = qwen3.py）**
+```
+Qwen3ForCausalLM.forward [235]
+ └─ Qwen3Model.forward [199]
+     ├─ embed_tokens(input_ids) → hidden
+     ├─ for layer: Qwen3DecoderLayer.forward [169]
+     │   ├─ Qwen3Attention.forward [80]
+     │   │   ├─ qkv_proj(x) → q,k,v                    # QKVParallelLinear
+     │   │   ├─ RotaryEmbedding(q,k)                   # 按 positions 旋转
+     │   │   ├─ Attention.forward [attention.py:377]   # 链 D
+     │   │   └─ o_proj(o)
+     │   ├─ Qwen3MLP.forward [132]（gate_up → SiluAndMul → down）
+     │   └─ 残差相加（norm 走 add_rms_forward）
+     ├─ norm(hidden, residual)                         # RMSNorm（残差融合）
+     └─ compute_logits [243] → ParallelLMHead          # 词表映射（TP>1 gather）
+```
+
+**链 D：Attention 数据流（Context 契约——本项目最核心的接口设计）**
+```
+prepare_* 构建 GPU 张量 ──set_context()──> Context（全局单例）
+   [cu_seqlens_q/k, max_seqlen_q/k, slot_mapping, context_lens, block_tables,
+    chunk_starts/ring_*, full_*（滚动/split 侧）, n_prefill_tokens, is_mixed, is_spec]
+                    │
+Attention.forward [attention.py:377]  ← get_context()
+ ├─ store_kvcache(k, v, k_cache, v_cache, slot_mapping)  # 本步 K/V 散写分页缓存
+ └─ 读路由（按批次形态 / 模型形态）：
+     ├─ is_spec / is_mixed → varlen（分块序列用缓存形状 K/V；环序列走 _ring_varlen 装配）
+     ├─ MLA → MLAAttention._decode_rows/_decode_kernel（吸收式）或稠密兜底
+     ├─ 滚动环 decode → bf16/fp8 paged 内核（chunk_starts 表达环位置）
+     ├─ 纯 prefill → flash_attn_varlen_func（连续 K/V）
+     └─ 纯 decode → fp16 flash kvcache / fp8 paged_decode_attention_fp8 / bf16 自研内核
+```
+
+**链 E：量化路由决策（以 int4 为例）**
+```
+LinearBase.forward [linear.py:610]
+ └─ 已量化? → _int4_forward [441]
+     ├─ M≤128 且 N≥2048 → Triton int4_gemm [160]（group_size 可配 + 尾 K 掩码）
+     └─ 否则            → F.linear(x, w_deq)（bf16 反量化副本，cuBLAS）
+ 权重来源：quantize_int4 [396] 在 warmup 前一次性打包（dual-path 存 q/scale + w_deq；
+ 纯 int4 不存 w_deq；MLA kv_b 恒存 w_deq）
+```
+
+**链 F：投机解码完整链路**
+```
+Scheduler._compute_draft [scheduler.py:168] ─每步 CPU─> 写 seq.draft_tokens
+ → schedule() → kind="spec" / "mixed" [294/300]
+ → prepare_spec/_prepare_mixed_spec [model_runner.py:944/1009]
+     verify 行 = query=[last_token, 草稿...] 的 chunked prefill，num_cached = len-1
+     （滚动环：key 集 [kv_j0·B, end) 装配，spec 表项 = 逻辑块 j0+i）
+ → run_model：spec CUDA graph（stride×容量家族）或 eager varlen
+ → LLMEngine._verify [llm_engine.py:61]：γ+1 行采样 s_i ↔ 草稿 d_i 逐个验收；末行 bonus
+ → postprocess_spec [scheduler.py:532]
+     只提交接受 token；hash 范围 [num_tokens-n_acc-1, num_tokens-1)（被拒草稿不进前缀缓存）
+ → medusa/eagle：_medusa_drafts/_eagle_drafts [llm_engine.py:100/145] 生成下轮草稿
+```
+
+## 10. 基准档案（指标口径 · 快速开始 · 实测结果（现行）· profiling）
+
+### 10.1 指标口径与计时
+
+| 指标 | 定义 |
+|---|---|
+| Throughput | 总输出 token 数 / 总耗时（wall time），tok/s |
+| TTFT | 每个请求从提交（加入调度队列）到生成第一个 completion token 的时间 |
+| TPOT | 每个请求 (完成时间 − 首token时间) / (输出token数 − 1)，即稳态解码的单token延迟 |
+| E2E | 每个请求从提交到完成的端到端延迟 |
+| SLO 达成率 | TTFT < 500ms 与 TPOT < 10ms 的请求占比（阈值可用 `--slo-*` 调整） |
+| preemptions | KV cache 块不足时调度器抢占（swap/回退重算）的次数，0 表示容量充足 |
+
+计时插桩在引擎内部：`Sequence.t_submitted/t_first_token/t_completed`（driver 侧，不跨进程传输），
+由 `LLMEngine.collect_metrics()` 统一导出，`benchmarks/bench.py` 统计。
+**TTFT 语义注意**：`t_first_token` 在该序列 **prefill 完成的那次 postprocess** 记录，因此 TTFT ≈
+请求自身 prefill 完成时刻（含排队），整批 TTFT 呈阶梯分布。SLO 的 TTFT<500ms 在离线批处理下通常
+难达成。
+
+### 10.2 环境与快速开始
+
+硬件/软件：RTX 5060 Ti 16GB（sm_120，36 SM）、WSL2（11GB RAM + 4GB swap）、torch 2.8.0+cu128、
+flash-attn 2.8.3.post1、triton 3.4.0。**conda 环境里 editable install 可能指向另一克隆
+（如 ~/AI/nano-vllm）——运行前确认 `python -c "import nanovllm; print(nanovllm.__file__)"`；
+`benchmarks/run_in_wsl.sh` 通过 PYTHONPATH 强制本工作区副本。**
+
+```bash
+# 1. 默认吞吐/延迟基准（256 seqs，in 128-1024 / out 64-512）
+python benchmarks/bench.py --num-seqs 256
+# 2. 共享前缀 workload（前缀缓存；非整块前缀 → 部分块共享 + COW）
+python benchmarks/bench.py --num-seqs 256 --shared-prefix-len 512
+# 3. 前缀缓存跨批次演示：相同批次跑 3 遍，第 2/3 批 prefill 应大幅减少
+python benchmarks/bench.py --num-seqs 64 --min-input-len 1024 --max-input-len 1024 \
+    --min-output-len 32 --max-output-len 32 --repeat-batches 3
+# 4. 与真实 vLLM 对比（隔离环境 vllm-compare；workload 一次生成两侧共享）
+python benchmarks/compare_workload.py --tag small --num-seqs 128 --min-input-len 64 \
+    --max-input-len 128 --min-output-len 64 --max-output-len 128
+python benchmarks/compare_nanovllm.py --workload results/compare_workload_small.json \
+    --kv-cache-dtype auto --output results/compare_nanovllm_small_fp16.json   # nano 侧（nano-vllm 环境）
+python benchmarks/compare_vllm.py --workload results/compare_workload_small.json \
+    --kv-cache-dtype auto --output results/compare_vllm_small_fp16.json       # vLLM 侧（vllm-compare 环境）
+python benchmarks/compare_merge.py results/compare_*.json                     # → compare_report.md/.csv
+# 5. 耗时分解（torch.profiler，prefill/decode 分开）
+python benchmarks/profiler.py --num-seqs 64 --max-input-len 512 --max-output-len 64
+# 6. Batch 缩放实验（吞吐-延迟权衡曲线，单引擎复用）
+python benchmarks/batch_scale.py
+# 7. 量化 / fp8 KV
+python benchmarks/bench.py --num-seqs 256 --quantization fp8
+python benchmarks/bench.py --num-seqs 256 --kv-cache-dtype fp8_e4m3
+# 8. 投机（草稿质量按内容类型变化大，见 §10.3.5）
+python benchmarks/spec_bench.py --speculative ngram
+```
+
+结果 JSON → `results/bench_<workload>_<ts>.json`；profiling → `profiles/{prefill,decode}.txt`。
+
+### 10.3 实测结果（现行；每张表自带日期与 workload，跨表数字只作量级参考）
+
+#### 10.3.1 与真实 vLLM 对比（2026-08-18，Qwen3-0.6B）
+
+**环境**：隔离 conda 环境 `vllm-compare`（`benchmarks/setup_vllm_compare.sh`）。vLLM **0.10.2** +
+torch 2.8.0+cu128 + **同一份 flash-attn 2.8.3.post1 wheel**（注意力后端同源）；transformers 4.57.6；
+`XFORMERS_IGNORE_FLASH_VERSION_CHECK=1`。两侧配置对齐：`gpu_memory_utilization=0.9`、
+`max_model_len=4096`、`max_num_batched_tokens=16384`、chunked prefill、CUDA graph、prefix
+caching、无 CPU offload。差异如实记录：**block size 256 vs 16**（KV 容量 nano 107,776 vs
+vLLM 97,440 token）。
+**指标口径（诚实声明）**：nano = 逐请求精确时间戳；vLLM 0.10.2 V1 离线 API **不暴露逐请求指标**
+（`RequestOutput.metrics` 恒 None）→ 用 `LLM.get_metrics()` 聚合直方图（**avg = sum/count 精确；
+p50/p99 = 桶内线性插值近似**）。另：**decode 单步耗时（`_step_timing.py`）才是两侧可比的
+kernel 级指标**。
+
+| workload | 指标 | nano-vllm | vLLM 0.10.2 | nano/vllm |
+|---|---|---|---|---|
+| **small**（128 seqs，in 64-128，out 64-128，容量内） | throughput | **6587 tok/s** | 4624 | **1.42×** |
+| | TTFT p50 / p99 | 353.1 / 353.3 ms | 372.0 / 497.4 | 0.95 / 0.71 |
+| | TPOT p50 / p99 | **13.5 / 13.7 ms** | 17.4 / 24.9 | **0.78 / 0.55** |
+| | E2E avg / p99 | **1.62 / 1.89 s** | 2.27 / 4.92 | **0.71 / 0.38** |
+| **clean**（256 seqs，in 128-1024，out 64-512，超容双方都抢占） | throughput | **2552 tok/s** | 1888 | **1.35×** |
+| | TTFT p50 / p99 | 2520 / 21862 ms | 3246 / 39034 | 0.78 / 0.56 |
+| | TPOT p50 / p99 | **45.1 / 73.6 ms** | 56.0 / 149.2 | **0.81 / 0.49** |
+| **long fp8**（128 seqs，1024 in + 128 out，147k 总上下文） | throughput | **1854 tok/s**（fp8 KV，0 抢占） | 1150（fp16） | **1.61×** |
+| long fp16 | throughput | 1421 tok/s（2 抢占） | 1150 | 1.24× |
+
+**decode 单步耗时（引擎墙钟，同口径）**：small ~13.5ms（nano TPOT）vs vLLM ~17ms；clean fp16
+36.4ms vs vLLM ~56ms（含抢占）；long fp16 29.2ms / fp8 32.2ms vs vLLM ~33ms——**fp16 打平或略快，
+fp8 已达 vLLM fp16 水平**。
+**结论与诚实修正**：①吞吐全面领先 1.35-1.61×（prefill 阶段快 ~2×）；②vLLM 0.10.2 在 sm_120
+上无法跑 fp8 KV：V1 不支持 `kv_cache_dtype`（回退 V0），V0 fp8 路径选 XFormers → xformers 0.0.32
+把 fp8 派发到 FA3（Hopper sm_90 专属）→ `CUDA error: invalid argument`；vLLM 0.11-0.13 V1 fp8
+也是 FA3 路线（`flash_attn_supports_fp8()` 要求 capability.major==9）——**nano 自研 fp8 KV 是
+这张卡上唯一可跑的实现**；③所有数字条件：单卡 WSL2、vLLM 0.10.2 V1（fp16）/V0（不可达）、
+flash-attn 2.8.3.post1、无 FlashInfer、WSL `pin_memory=False`。
+
+#### 10.3.2 混合调度 + 前缀缓存 + batch 缩放（Qwen3-0.6B）
+
+- **混合调度收益**（同 workload 同 seed 方案对比旧"先全 prefill 后 decode"）：吞吐全档
+  **+7.2%~+21.3%**（256 档 4854→5840）；TTFT p50 全档下降（早完成者下一步即出 token，不再空等）；
+  抢占 384 档 31→20、512 档 **141→71（近半）**；TPOT p50 同步下降（256 档 33.07→27.44ms）。
+  长期 workload 视角：long fp16 +11.3%（抢占 21→2）、clean fp16 +10.2%（85→68）。**诚实说明**：
+  span 口径的 TPOT 受"总工作量"下界约束，混合批次的真正收益是消除死等 + 抢占压力（不体现在
+  span 指标里）。
+- **前缀缓存**：跨批次 1024-token 相同 prompt（64 seqs×3 遍）：冷缓存 prefill 65536 tok/4 步；
+  满块复用后 batch 1/2 prefill **0 tok / 0 步**。**部分块共享 + COW**（300-token 批次，含 44-token
+  部分块）：batch 1 prefill 2816 tok（64×44，非缺陷——batch 0 的 decode 把共享部分块写成了 76
+  token，缓存内容已变，只有满块可复用；**前缀缓存只对"内容真正一致"的部分生效**）。共享前缀 512
+  （128 seqs）：批次内前缀块建立后 prefill 只算尾部（25,393 vs 77,824 tok，67% 跳过）。E2E 不是
+  前缀缓存收益的正确视角——用重复批次或 prefill 计算量看。
+- **batch 缩放**（混合调度重测，干净 workload in 64-256/out 32-128）：
+
+| num_seqs | throughput (tok/s) | TTFT p50 | TPOT p50 | preemptions |
+|---|---|---|---|---|
+| 16 | 1639 | 62.4ms | 5.16ms | 0 |
+| 32 | 2857 | 135.0ms | 6.03ms | 0 |
+| 64 | 4524 | 243.7ms | 7.80ms | 0 |
+| 128 | 5325 | 414.2ms | 13.27ms | 0 |
+| 256 | **5840（峰值）** | 845.0ms | 27.44ms | 0 |
+| 384 | 5029 | 839.3ms | 50.09ms | 20 |
+| 512 | 5245 | 1565.1ms | 54.08ms | 71 |
+
+  结论：吞吐 256 附近见顶——KV 容量（421 块）被 384+ seqs 超出后抢占侵蚀收益，但混合调度让
+  decode 提前释放块、容量压力缓解（512 档反超 384 档的"单调回落"消失）；TTFT 随 batch 近似线性；
+  512 档 TTFT p50 跳升是单次运行噪声（p99 5462ms 长尾），需多次取中位数。
+
+#### 10.3.3 FP8 KV cache（`--kv-cache-dtype fp8_e4m3`，Qwen3-0.6B）
+
+自研 Triton paged 内核直接读 FP8(E4M3)：decode v6（直接 fp8 load + 硬件 cvt 反量化 + MMA，
+QPAD=16、GQA 融合、BLOCK_T=32/warps=1）、varlen v7（多查询扩展，逐列因果掩码 `<=`）；写路径
+warmup 校准每层 scale、**显式 clamp±448**（§6 故事 1）。
+
+- 容量：421 → **802 块**（1.9×）；精度：**KL 0.0073、top-1 100%**（首个 decode 步对齐 logits）
+- 引擎级 decode 单步：long 32.2ms、clean 35.0ms（vs vLLM fp16 ~33/~56ms，§10.3.1）；吞吐以
+  §10.3.1/§10.3.2 同批表为准
+- **大 tile 假设被数据否定**（BLOCK_T 64/128 因寄存器压力 1.1-13× 更慢）
+- **诚实记录**：短上下文（<256 token）仍有 ~15-25% 差距（内核开销未摊薄）；split-K/持久内核是
+  进一步路线；SWA 窗口（Mistral/gemma2-local）由 WINDOW 掩码/chunk_starts 支持（2b 起滚动环走
+  bf16/fp8 自研内核，见 §8 阶段 2）
+
+#### 10.3.4 W8A8（`--quantization w8a8`，Qwen3-0.6B）
+
+per-group（K 维 128，AWQ 标准）int8 权重 + per-token int8 激活 + Triton int8 GEMM（int32 块内
+累加、乘组 scale 后 fp32 跨组累加）；SmoothQuant 校准折权重（恒等变换）。精度：**KL 0.064→
+0.0379（-41%），top-1 87.5%→100%**（per-group 把 scale 粒度细 8×，残余误差来自激活 per-token
+量化）；性能：5382→4497 tok/s（-16%，int8 GEMM 未调优）；权重显存减半。路线：GPTQ 式舍入、
+int8 GEMM tile/warp 调优。
+
+#### 10.3.5 投机解码（Qwen3-0.6B；`spec_bench.py`）
+
+**ngram（verify CUDA graph 化后的最终版）**：
+
+| 风格 | bs | α | 吞吐 baseline→spec | TPOT p50 |
+|---|---|---|---|---|
+| repeat（echo，最好情况） | 8 | 1.0 | 1435→**5561（+3.87×）** | 5.2→**1.2ms** |
+| repeat | 256 | 0.99 | 7749→**11076（+1.43×）** | 27.5→**15.5ms** |
+| json（结构化续写） | 8 | 0.42 | 856→**982（+1.15×）** | 7.2→3.7ms |
+| free（随机 token） | 8 | 0.34 | 1180→**1236（+1.05×）** | 5.1→5.1ms |
+| json / free | 256 | 0.26 / 0.46 | 0.64× / 0.85×（亏） | — |
+
+**为什么从"打平"变"赢"**：verify 路径本身高效（47µs/tok vs decode 110µs/tok）——初版打平的真凶
+是 **eager 启动税 ~10ms/步**（~300 次 launch）；spec CUDA graph（容量族 × 双 stride + 零长填充行，
+bit-exact）后 repeat bs=8 从 1.40× → **+3.87×**。剩余亏损场景 = 草稿质量低（α<0.4），是草稿源
+问题不是 verify 路径问题。**fp8+spec 解锁**：v7 varlen 内核免"逐层全缓存反量化"（~18GB/步）→
+bs=8 repeat 0.15×→**+3.92×**、free +1.31×；bs=256 repeat +1.53×（与 fp16 同量级，容量优势不变）。
+**Medusa**：bs=8 repeat **+1.57×**（TPOT 5.4→4.4ms）；bs=256 repeat 0.61×、free/json 大 batch
+0.49-0.70×（α 0.02-0.27——0.6B 可预测性天花板，head_0 达模型 top-1 的 87%）。
+**EAGLE-1**：γ=2 repeat **+3.26×**（α 0.525）；γ=4 只有 +0.63×；free γ=2 +0.70×（α 0.19）。
+条件：WSL2 单卡、flash-attn 2.8.3、0.6B（大模型 + 结构化内容 α 更高，结论会右移）；vLLM 同款
+ngram 对照测试留作后续。
+
+#### 10.3.6 INT4/AWQ/2:4 稀疏（Qwen3-0.6B）
+
+**精度（真实文本 ppl——决定性指标）**：语料 = 12 条模型自生成续写（每次运行重新采样 → 有 run
+间波动）。**2026-09-07 复测**：fp16 **3.23** / fp8 **3.25**（+0.6%）/ int4(RTN) **4.17**（+29%）/
+awq **3.70**（+15%，把 int4 差距砍半）。历史 run（同脚本不同语料）：fp16 3.32 / int4 4.38 /
+awq 3.76（2026-08-16 报告），fp16 3.60 / fp8 3.60 / int4 4.81 / awq 4.22（2026-08-24 报告）——
+**跨 run 只比同批内**。引擎级对齐（决定性、无 run 波动）：fp8 权重 KL 0.017 top-1 100%；fp8 KV
+KL 0.0073；w8a8 KL 0.0379；int4 8-prompt KL 1.08（**注意：8-prompt KL 与 ppl 曾方向相反——被
+尾部单点主导，ppl 才是真相**）。
+**吞吐**（干净 workload in 64-256/out 32-128；int4/awq 为双路径配置，与 fp16 同批测量）：
+
+| 模式 | bs=256 | bs=8 | 说明 |
+|---|---|---|---|
+| fp16 | 4792 tok/s | 1099 tok/s | 基线（该批次） |
+| fp8 权重 | **5825 tok/s（1.22×）** | — | 全模式峰值（K=4096 的 8B 上 prefill TTFT 210ms vs int4 813ms） |
+| int4（双路径） | 5057（1.06×） | 1488（**1.35×**） | 显存 1.73GB（w_deq 定价，比 fp16 大 15%） |
+| awq（双路径） | 4932（1.03×） | 1305（1.19×） | ppl 更好 |
+| int4（纯） | 3073（0.64×）→ tile 搜索后 **3916.5（0.82×）** | 1033 | 显存 0.85GB；int4 组 64/尾 K 掩码后 128 路径逐位不变 |
+| sparse24 | 2357（0.49×） | 385（0.35×） | 内核 bit-exact；一次性剪枝 KL 8.5（丢 35% 权重质量） |
+
+**内核形态结论**：软件 int4 只赢权重带宽主导的小 M GEMM（gate_up M=8 4.36×、lm_head 3.42×、
+qkv 1.6-2.0×；down_proj 0.40×，M≥128 全输 0.2-0.6×）——**双路径按形态路由**是正面解法；
+cuSPARSELt 每调用 0.3-0.5ms、CUTLASS 仅 sm_8x（sm_120 全废），软件 2:4 无稀疏 MMA 只是带宽优化。
+
+#### 10.3.7 新模型端口（Mistral-7B SWA / Gemma-2-2B，2026-08-24 首测 + 2026-09-07 复测）
+
+**正确性（HF 参考 prefill logits，`_parity.py`）**：Mistral-7B-v0.1 top-1 100%（mean 0.014，
+首跑即过；SWA 窗口数学由 `_swa_probe.py` 独立验证）；gemma-2-2b-it top-1 100%（mean 0.022，
+三个隐藏架构细节修完后）。**真实长解码**（阶段 2b/2b-ext）：见 §8 阶段 2 验证摘要。
+
+**吞吐**（`benchmarks/bench.py`，in 128-1024 / out 64-512，0 抢占；JSON 存档于 results/）：
+
+| 模型 | 日期 | seqs | 吞吐 | decode | TPOT avg/p50 | TTFT avg | 权重 | KV |
+|---|---|---|---|---|---|---|---|---|
+| Mistral-7B（int4 流式纯 int4） | 2026-08-24 | 32 | 311.4 tok/s | 475 tok/s | 46.8 / 49.0ms | 10.7s | 4.14GB | 213 块 |
+| gemma-2-2b（int4 双路径） | 2026-08-24 首测 | 64 | 1094.7 tok/s | 1211 tok/s | 35.9 / 34.6ms | 2.47s | — | 220 块 |
+| gemma-2-2b（int4 双路径） | 2026-09-07 复测 ×2 | 64 | 782.7 / 836.6 tok/s | 841 / 906 tok/s | 46.2-53.0 / 44.8-52.1ms | 2.56-2.67s | **7.45GB**（双路径实测；纯 int4 3.40GB） | 220 块（56,320 tok） |
+
+要点：Mistral TTFT 10.7s = 32×~576 token 预填充批在 7B int4 上的真实成本（吞吐 311 tok/s 与
+Llama-3.1-8B 303.5 tok/s（bs=16）同量级，两代 7B+ 端口互相印证）；SWA 长上下文（4876-token
+prompt 跨 sliding_window=4096）分块 prefill + decode 全路径跑通（957 tok/s prefill），无
+NaN/崩溃；attn soft-cap 量级（cap=50 的 tanh 在层 0 原始 logits ±11 时最大只改 1.7%——flash
+原生 softcap 精确实现；final cap=30 压 logits ±30+，必须实现）。**诚实记录**：gemma2 双路径
+09-07 两轮复测一致地比 08-24 首测慢 ~25-30%（同 workload 同 seed、KV 220 块逐 token 复现）；
+原因未定位（环境波动或 2b 解码路径改动），跨日期比较以 09-07 为准、首测数字仅作对照。mistral
+行仍为 08-24 数据（未复测）。gemma2 softcap 层不支持 fp8 KV（断言拦截）；全部条件：WSL2 单卡、
+bf16、flash-attn 2.8.3.post1。
+
+#### 10.3.8 阶段 2 组合（MLA / 滚动环 / 2b-ext）关键数字
+
+完整证据表与复现命令见 `benchmarks/_stage2b_ext_report.md`；本文 §4.8/§8 阶段 2 已摘要。
+速查：MLA fused 576 元素/token/层（7.11×，修正口径）；MLA decode 内核位级 0 误差、引擎 parity
+top-1 100%；fp8 KV×环/×MLA 与 spec×环 toy 全绿（同内核位级、异内核 top-1 噪声带内）；
+真实 Mistral-7B fp8 环 vs 掩码 5050-token **逐位一致**；真实 gemma-2-2b-it split 30/30 稀疏步、
+环池 cap 18 封顶；DeepSeek-V2-Lite 4L parity 0 失配 / 全量流式 int4 ~2.8 tok/s（3 并发、MoE
+eager）、kv_b w_deq 113MB。
+
+### 10.4 Profiling
+
+**torch.profiler（CPU 侧；WSL 下 CUPTI 不可用，无 CUDA kernel 时间）**：
+`profiler.py` 产出 `profiles/prefill.txt`/`decode.txt`——prefill：`aten::copy_`（锁页→GPU 输入
+搬运）Self CPU 93%+；decode (eager)：`aten::mm` 22.96%、TorchDynamo Cache Lookup 7.01% +
+Pregraph bytecode 4.63%（torch.compile 图查找开销）；decode (CUDA-graph)：`aten::copy_`（往 graph
+静态输入拷贝）96.22%（CPU 开销集中在输入搬运，单次 replay 内部不可见）。
+**CUDA 内核级统计（nsys/ncu）**：本机 CUPTI 不可用（torch.profiler CUDA activity 报
+`CUPTI_ERROR_INVALID_DEVICE`、ncu 报 `ERR_NVGPUCTRPERM`）——只能拿 CPU 侧与 wall-clock；在
+CUPTI 可用环境执行：
+
+```bash
+nsys profile -o /tmp/nanovllm_kernels -t cuda python benchmarks/bench.py --num-seqs 8 \
+  --min-input-len 128 --max-input-len 128 --min-output-len 16 --max-output-len 16 --enforce-eager
+nsys stats -r cuda_gpu_kern_sum /tmp/nanovllm_kernels.nsys-rep
+ncu --set basic --launch-count 20 python benchmarks/bench.py --num-seqs 8 \
+  --min-input-len 128 --max-input-len 128 --min-output-len 16 --max-output-len 16 --enforce-eager
+```
+
+### 10.5 读数要点与诚实规则
+
+- decode 单 token 延迟由 KV cache 带宽决定（memory-bound）；prefill 由矩阵运算决定（compute-bound）。
+- 重复批次 batch 1 的 prefill tokens 若不为 0，先查"缓存内容与 prompt 是否真的一致"
+  （如 300-token 场景 2816 = 缓存块已被 decode 改写）。
+- TPOT p99-p50 差距反映批大小波动/抢占影响；`preemptions > 0` 时所有延迟指标恶化。
+- **基准的可信度来自"同 workload、同 seed、指标口径一致 + 探针可复现"**；随机语料类指标
+  （ppl/生成文本）只比同批；所有数字带日期与环境条件。
+
+## 11. 附录：合并映射与 2026-09-07 变更记录
+
+### 11.1 旧文件 → 本档章节映射（已删除的 BENCHMARKS.md / LEARNING.md 内容去向）
+
+| 旧位置 | 去向 |
+|---|---|
+| LEARNING.md 阶段 0-7 | §0/§1（1.1-1.7 对齐原阶段编号），工具箱 → §1.8 |
+| LEARNING.md 面试对照（尾注） | §1 各表 + §4 深水区 + §6 故事 |
+| INTERVIEW.md §0-§7 | §2（电梯）、§3（主线）、§4（深水区）、§5（速查）、§6（故事）、§7（方法论）、§8（路线图，原 §6）、§9（代码地图，原 §7） |
+| BENCHMARKS.md 指标定义/快速开始 | §10.1 / §10.2 |
+| BENCHMARKS.md §1-§6 | §10.3.1 / §10.3.2（过程性旧 run 数字已按"只保留现行结论"删除，保留演进结论） |
+| BENCHMARKS.md §7 / §8 / §9+9b / §10 / §11 | §10.3.3 / §10.3.4 / §10.3.5 / §10.3.6 / §10.3.7 |
+| note.md 故事编号 | §6 故事 1-18 同编号一一对应 |
+
+### 11.2 2026-09-07 合并时的修正清单（保证正确性）
+
+1. **代码行号全部实测校准**（2b/2b-ext 后 scheduler/block_manager/model_runner/attention 大幅
+   位移，旧 §7 行号大面积失效；§9.1 为实测值）。
+2. **ppl 口径统一**：三批互不一致的历史数字（fp16 3.32 / 3.60 / 3.63 等）实为同脚本不同随机
+   续写语料——2026-09-07 复测 fp16 3.23 / fp8 3.25 / int4 4.17 / awq 3.70 为现行口径，并明示
+   run 间波动。
+3. **gemma2 int4 权重数字裁定**：`_quant_mem` 实测双路径 **7.45GB**、纯 int4 **3.40GB**——
+   BENCHMARKS §11 原表"~4GB"是纯 int4 的数、双路径行标注错误；note.md 的 7.46GB 正确。
+4. **gemma2 int4 dual 基准复测**（2026-09-07 ×2）：783-837 tok/s，比 08-24 首测慢 ~25-30%；
+   两轮一致，原因未定位（环境/2b 路径改动），跨日期以新测为准。
+5. **修复引擎回归（commit 本档提交）**：`_decide_streaming` 的 meta 计数构造污染 `get_rope`
+   lru_cache 共享实例 → eager 量化路径（gemma2 int4 实测复现）首前向崩溃；加 `cache_clear()`。
+   修复后 qwen3-0.6B int4 dual 实测 1.730GB 与文档一致（§6 故事 18）。
+6. **pytest 计数更新**：41 → **57**（2026-09-07 实测）。
+7. **陈旧状态更新**："SWA 不做滚动复用（TODO）" → 滚动环已实现（2b）并附边界；"fp8 KV×MLA
+   断言关 / 纯 int4 MLA 兜底 eager" → 2b-ext 已解锁；streaming 限制补 MLA kv_b w_deq 例外。
+8. 删除三合一前的重复段落（电梯陈述×2、故事×2、数字速查×2、学习路线×2、文件地图×2 等），
+   保留各自角色定位下的最小重叠（速查表/深水区/基准档案分属"背数字/答追问/查证据"三种用途）。
+
+### 11.3 相关文件
+
+- `note.md`（未跟踪的个人时间线，截止 2026-08-24；§6 故事同编号，头部有指向本档的说明）
+- `benchmarks/_stage2b_ext_report.md`（阶段 2b-ext 完整证据表 + 复现命令）
+- `benchmarks/_kernel_roofline.md` / `_cuda_gemm_report.md`（阶段 1 交付物）
+- 结果存档：`results/bench_*.json`、`results/compare_*.json`、`results/batch_scale.{csv,png}`
+- 本文档内相对引用若失配，以 git 历史对应提交（`git log --oneline`）为准。
+
+<!-- EOF -->

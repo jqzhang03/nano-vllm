@@ -82,7 +82,7 @@ def main():
 
     from nanovllm.layers.linear import LinearBase
     from nanovllm.layers.embed_head import ParallelLMHead
-    # 与引擎 _quant_mods 默认一致：不量化 lm_head（logits 直接由它决定，见 BENCHMARKS.md §10）
+    # 与引擎 _quant_mods 默认一致：不量化 lm_head（logits 直接由它决定，见 INTERVIEW.md §10.3.6）
     mods = [(name, m) for name, m in llm.model_runner.model.named_modules()
             if isinstance(m, LinearBase) and not isinstance(m, ParallelLMHead)]
     for _, m in mods:

@@ -112,7 +112,7 @@ class Scheduler:
         waiting与running都非空时返回混合批次（decode行在后，prefill行在前）：
         早完成prefill的请求立即开始decode，不用等全部prefill跑完
         （vLLM V1同款策略；此前"先prefill后decode"会让早完成者空等数秒，
-        见BENCHMARKS.md §5.3）。decode与prefill共享max_num_batched_tokens预算。
+        见INTERVIEW.md §10.3.2）。decode与prefill共享max_num_batched_tokens预算。
 
         投机解码（spec_decode）时：先给所有running序列算n-gram草稿；只要有任一
         草稿非空，running行全部变为verify行（γ=0的行退化为1-token varlen行），

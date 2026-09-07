@@ -385,7 +385,7 @@ class WeightQuantMixin:
     # 稠密反量化路径的路由阈值（微基准 _int4_tune.py 结论：int4 只在"小M大N"的
     # 权重带宽主导形态赢）——M≤128 且 N≥2048 走 int4 内核，其余（大M prefill/
     # decode、小N 的 o_proj/down_proj）走 w_deq 的 cuBLAS 稠密路径，收掉大M亏损
-    # 与 TTFT 回归（见 BENCHMARKS.md §10）。
+    # 与 TTFT 回归（见 INTERVIEW.md §10.3.6）。
     int4_max_m = 128
     int4_min_n = 2048
     # fp8 路由阈值：M≤128（decode）走 Triton 内核（带宽赢），M>128（prefill）走
@@ -572,7 +572,7 @@ class LinearBase(WeightQuantMixin, nn.Module):
         按 s[k] = x_max[k]^0.5 / w_col_max[k]^0.5 把激活尺度折进权重（X'=X·s, W'=W/s，
         数学恒等），使X'更平滑、量化误差显著下降。
         权重 scale 按 K 维 128 一组（组内amax/127）——比 per-channel 细 8 倍
-        （K=1024），是精度缺口的主要修复手段（见BENCHMARKS.md §8）。
+        （K=1024），是精度缺口的主要修复手段（见INTERVIEW.md §10.3.4）。
         """
         w = self.weight.detach().float()
         if x_max is not None:

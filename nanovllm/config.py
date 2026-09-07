@@ -19,17 +19,17 @@ class Config:
     num_kvcache_blocks: int = -1 # KV Cache块的数量，-1表示GPU根据显存大小、模型大小、block size等自动计算
     kv_cache_dtype: str = "auto" # KV缓存数据类型："auto"（模型dtype，默认）或 "fp8_e4m3"（FP8 E4M3量化，容量翻倍，decode用自研Triton内核）
     kv_swap: bool = True # KV swap 抢占：KV块不足时把序列的KV拷到CPU内存并释放GPU块，恢复时直接换回（bit-exact，免重新prefill）。仅TP=1且非fp8 KV时生效（fp8的float8_e4m3是CUDA-only，无法分配CPU缓冲）
-    kv_swap_space_gb: float = 2.0 # KV swap 的 CPU 缓冲空间上限（GB，vLLM swap_space 同款）。换出缓冲累计超限时回落 recompute 抢占，防止 CPU RAM 耗尽（本机 WSL 仅 7GB，0.6B 单 KV 块 28MB）
+    kv_swap_space_gb: float = 2.0 # KV swap 的 CPU 缓冲空间上限（GB，vLLM swap_space 同款）。换出缓冲累计超限时回落 recompute 抢占，防止 CPU RAM 耗尽（本机 WSL 内存有限，0.6B 单 KV 块 28MB）
     rolling_cache: bool = False # SWA 滚动缓冲（阶段 2b）：解码期每序列 KV 只保留窗口内容（块数 ≤ 窗口/块大小 + 2），旧块到期自动释放——长生成序列的 KV 内存有界。支持：mistral（全层统一窗口，bf16/fp8 KV，可加 ngram 投机）；gemma2（**交替 local/global**，阶段 2b 扩展 split 模式：local 层走环池、global 层走独立 full 池普通分页永不驱逐，仅 bf16 KV、无投机、eager decode）。滚动模型不参与前缀缓存发布/消费（窗口内容过期，重复 prompt 有代价，见 block_manager.py 头注）；环语义需自研 paged 内核（flash-attn 无法表达环表位置偏移，vLLM 传统实现也只掩码不滚动）
     num_ring_kvcache_blocks: int = 0  # split 模式：环池块数（runner 分配后写回，scheduler 建 BM 用）
     num_full_kvcache_blocks: int = 0  # split 模式：full 池块数（同上）
     quantization: str = "none" # 权重量化："none" | "w8a8"（per-channel int8权重+per-token int8激活，Triton int8 GEMM）| "int4"（per-group int4权重，Triton反量化GEMM）| "awq"（int4 + AWQ激活感知缩放）| "sparse24"（2:4结构化剪枝+cuSPARSELt半结构化matmul）| "fp8"（e4m3全量化：per-column权重+per-token激活；decode走Triton内核、prefill走硬件FP8 MMA _scaled_mm）
     awq_scales_path: str = "" # AWQ激活感知缩放文件（.pt，benchmarks/awq_calibrate.py真实文本校准产出）；为空时用随机token内联校准
-    quantize_lm_head: bool = False # 是否量化LM head（默认不量化——与w8a8一致：logits由lm_head点积直接决定，量化它精度损失最大，见BENCHMARKS.md §10）
-    int4_dense_path: bool = True # int4双路径模式（默认开）：大M prefill/decode 与小N层走 w_deq 稠密反量化（cuBLAS，收掉大M亏损与TTFT回归），小M大N层走int4内核；代价是显存 1.73GB（比fp16的1.50还大）。False=纯int4（0.85GB，大batch慢），见BENCHMARKS.md §10。streaming 模式下自动强制 False（w_deq 全尺寸副本与按层加载目的冲突）
+    quantize_lm_head: bool = False # 是否量化LM head（默认不量化——与w8a8一致：logits由lm_head点积直接决定，量化它精度损失最大，见INTERVIEW.md §10.3.6）
+    int4_dense_path: bool = True # int4双路径模式（默认开）：大M prefill/decode 与小N层走 w_deq 稠密反量化（cuBLAS，收掉大M亏损与TTFT回归），小M大N层走int4内核；代价是显存 1.73GB（比fp16的1.50还大）。False=纯int4（0.85GB，大batch慢），见INTERVIEW.md §10.3.6。streaming 模式下自动强制 False（w_deq 全尺寸副本与按层加载目的冲突；MLA kv_b 例外保留反量化副本）
     int4_group_size: int = 128 # int4 量化组大小（K 维，须整除各线性层 K）。DeepSeek-V2-Lite 的 dense 中间维 10944 = 64×171 不能被 128 整除 → 该模型需 64（精度代价小，官方社区 int4 同样受此约束）
-    streaming_load: bool = False # 按层流式加载+即时量化（16GB 卡跑 7B+ 的前提，见 LEARNING.md 阶段7）：模型在 meta 设备构造（0显存）→ loader 逐 decoder layer 物化→加载→立即量化→释放 fp16。显式开启；或当估算 fp16 权重超过空闲显存 45% 且启用了权重量化时自动开启（7B+ 必触发）。限制：int4 强制纯 int4（无 w_deq）；w8a8 无 SmoothQuant 校准（需全模型前向）；awq 仅支持预生成 awq_scales_path（内联校准需全 fp16 模型）
-    speculative: str = "none" # 投机解码："none" | "ngram"（n-gram/prompt-lookup草稿，无模型零显存，见BENCHMARKS.md §9）| "medusa"（Medusa多头，需medusa_path）| "eagle"（EAGLE-1草稿层：无RoPE transformer层 + 共享LM head 自回归草稿，需eagle_path）
+    streaming_load: bool = False # 按层流式加载+即时量化（16GB 卡跑 7B+ 的前提，见 INTERVIEW.md §1.7）：模型在 meta 设备构造（0显存）→ loader 逐 decoder layer 物化→加载→立即量化→释放 fp16。显式开启；或当估算 fp16 权重超过空闲显存 45% 且启用了权重量化时自动开启（7B+ 必触发）。限制：int4 强制纯 int4（无 w_deq，MLA kv_b 例外保留反量化副本 ~1%）；w8a8 无 SmoothQuant 校准（需全模型前向）；awq 仅支持预生成 awq_scales_path（内联校准需全 fp16 模型）
+    speculative: str = "none" # 投机解码："none" | "ngram"（n-gram/prompt-lookup草稿，无模型零显存，见INTERVIEW.md §10.3.5）| "medusa"（Medusa多头，需medusa_path）| "eagle"（EAGLE-1草稿层：无RoPE transformer层 + 共享LM head 自回归草稿，需eagle_path）
     ngram_window: int = 4 # n-gram窗口上限（vLLM --ngram-prompt-lookup-max 默认同款）
     ngram_min_window: int = 1 # n-gram窗口下限（先长后短回退，vLLM --ngram-prompt-lookup-min 默认同款）
     max_draft_len: int = 4 # 每步最大草稿数γ（vLLM --num-speculative-tokens 常用值）

@@ -11,7 +11,7 @@ against the real vLLM. Three workload modes:
   * real prompts (--prompts-file): JSONL file with one {"prompt": "..."} per
     line, tokenized with the model's tokenizer.
 
-Run from the WSL conda env (see BENCHMARKS.md):
+Run from the WSL conda env (see INTERVIEW.md §10):
 
     python benchmarks/bench.py --num-seqs 256
     python benchmarks/bench.py --num-seqs 256 --shared-prefix-len 512
@@ -277,9 +277,9 @@ def parse_args():
     p.add_argument("--awq-scales-path", default="",
                    help="AWQ缩放文件（benchmarks/awq_calibrate.py产出）；空=随机token内联校准")
     p.add_argument("--quantize-lm-head", action="store_true",
-                   help="同时量化LM head（默认不量化，见BENCHMARKS.md §10）")
+                   help="同时量化LM head（默认不量化，见INTERVIEW.md §10.3.6）")
     p.add_argument("--no-int4-dense-path", action="store_true",
-                   help="int4 关闭双路径模式（纯 int4 显存模式，0.85GB；吞吐回退见 BENCHMARKS.md §10；"
+                   help="int4 关闭双路径模式（纯 int4 显存模式，0.85GB；吞吐回退见 INTERVIEW.md §10.3.6；"
                         "流式加载(7B+)自动强制关闭）")
     p.add_argument("--no-swap-kv", action="store_true",
                    help="关闭KV swap抢占（KV块不足时回退重算 recompute 而非换出到CPU；"

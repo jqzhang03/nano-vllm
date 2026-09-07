@@ -9,7 +9,7 @@ All source code lives under `nanovllm/`:
 - `models/` – model definitions (`Qwen3ForCausalLM`)
 - `utils/` – weight loading and the global inference context
 
-Root-level `example.py` and `bench.py` are runnable demos; `assets/` holds images; `pyproject.toml` defines packaging and dependencies. `benchmarks/` holds the performance tooling (see `BENCHMARKS.md`): `bench.py` (throughput/latency/SLO/vLLM comparison), `profiler.py` (torch.profiler prefill/decode breakdown), plus dev scripts to drive runs from Windows into WSL. There is no separate tests directory yet.
+Root-level `example.py` and `bench.py` are runnable demos; `assets/` holds images; `pyproject.toml` defines packaging and dependencies. `benchmarks/` holds the performance tooling (see `INTERVIEW.md` §10 基准档案): `bench.py` (throughput/latency/SLO/vLLM comparison), `profiler.py` (torch.profiler prefill/decode breakdown), plus dev scripts to drive runs from Windows into WSL. Tests live under `tests/` (pure-Python pytest suite, currently 57 cases, no GPU needed).
 
 ## Build, Test, and Development Commands
 
@@ -35,7 +35,7 @@ Requires Python 3.10–3.12 and an NVIDIA GPU; `flash-attn`, `triton`, and NCCL 
 
 ## Testing Guidelines
 
-No automated test suite exists today. When adding tests:
+A pure-Python pytest suite exists under `tests/` (57 cases; scheduler/block-manager/registration logic, no GPU). When adding tests:
 
 - Place them under `tests/` with `test_*.py` naming.
 - Run with `pytest`.

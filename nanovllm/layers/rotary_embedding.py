@@ -86,7 +86,7 @@ class RotaryEmbedding(nn.Module):
         # (i, i+d/2)（llama/qwen）。两种约定的 cos/sin 表相同，仅 apply 不同。
         self.interleaved = interleaved
         # rope_scaling 只支持无操作（default/None）与 llama3 变体；yarn/linear/dynamic
-        # 未实现 → 构造时报错（见 LEARNING.md 阶段7 卡点清单）
+        # 未实现 → 构造时报错（见 INTERVIEW.md §1.7 卡点清单）
         if rope_scaling:
             rtype = rope_scaling.get("rope_type")
             if rtype not in ("default", "llama3"):
@@ -99,8 +99,8 @@ class RotaryEmbedding(nn.Module):
         """（重新）计算 cos/sin 缓存。
 
         meta 设备构造时算出的值不落地（meta 张量无数据）；按层流式加载的
-        to_empty 物化只给未初始化内存 → 必须在这里重算（见 LEARNING.md 阶段7
-        的坑：cos_sin_cache 全零 → q/k 被零旋转 → 逐层发散）。
+        to_empty 物化只给未初始化内存 → 必须在这里重算（见 INTERVIEW.md §1.7
+        与 §6 故事 9 的坑：cos_sin_cache 全零 → q/k 被零旋转 → 逐层发散）。
         """
         inv_freq = 1.0 / (self.base**(torch.arange(0, self.head_size, 2, dtype=torch.float) / self.head_size))
         if self.rope_scaling and self.rope_scaling.get("rope_type") == "llama3":

@@ -1,6 +1,6 @@
 """模型注册表：按 HuggingFace config.model_type 分发到对应模型类。
 
-新模型适配的入口（见 LEARNING.md 阶段7）：
+新模型适配的入口（见 INTERVIEW.md §1.7）：
   1. 在 models/ 下新建 <family>.py（以 qwen3.py/qwen2.py 为模板）；
   2. 在 _MODEL_REGISTRY 里登记 model_type → 模型类；
   3. 引擎侧（model_runner.py）只通过 get_model_class(model_type) 构造，
@@ -33,17 +33,17 @@ _MODEL_REGISTRY: dict[str, Type[nn.Module]] = {
     "deepseek_v2": DeepseekV2ForCausalLM,
 }
 
-# 规划中的模型：model_type → 未实现的具体卡点（见 LEARNING.md 阶段7 卡点清单）。
+# 规划中的模型：model_type → 未实现的具体卡点（见 INTERVIEW.md §1.7 卡点清单）。
 # 构造时给出可操作的报错（指明缺什么），而不是笼统的 "unsupported"。
 _PLANNED_BLOCKERS: dict[str, str] = {
-    "mixtral": "Mixtral 端口未实现：MoE 层（router + top-k + expert FFN + load-balancing "
-               "aux loss + 专家并行分片）未做——见 LEARNING.md 阶段7 MoE 卡点。",
+    "mixtral": "Mixtral 端口未实现：MoE 机制已通（阶段 1.5，见 INTERVIEW.md §4.7），"
+               "但 mixtral 具体端口（router 细节与 HF 对齐）未做——见 INTERVIEW.md §1.7。",
 }
 
 # 常见框架卡点（跨模型）：
 # - rotary_embedding.get_rope 不支持 rope_scaling（YaRN/linear/dynamic）——长上下文扩展
-#   模型（如 Llama-3.2、Mistral-Nemo）需要先实现。
-# - 流式加载限制：int4 强制纯 int4、w8a8 无 SmoothQuant、awq 仅预生成 scales。
+#   模型（如 Llama-3.2、Mistral-Nemo）需要先实现（INTERVIEW.md §1.7 卡点清单）。
+# - 流式加载限制：int4 强制纯 int4（MLA kv_b 例外）、w8a8 无 SmoothQuant、awq 仅预生成 scales。
 
 
 def get_model_class(model_type: str) -> Type[nn.Module]:

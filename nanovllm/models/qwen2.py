@@ -61,7 +61,7 @@ class Qwen2Attention(nn.Module):
             if rope_type not in (None, "default"):
                 raise NotImplementedError(
                     f"rope_scaling type {rope_type!r} unsupported: only 'default' is handled "
-                    f"(full rope_scaling e.g. YaRN 未实现，见 LEARNING.md 阶段7)")
+                    f"(full rope_scaling e.g. YaRN 未实现，见 INTERVIEW.md §1.7)")
             rope_theta = rope_scaling.get("rope_theta", rope_theta)
 
         # 初始化旋转位置编码模块

@@ -45,8 +45,7 @@ def load_model(model: nn.Module, path: str, streaming: bool = False,
 
     streaming=False（默认）：一次性遍历所有 safetensors 文件加载（原行为）。
 
-    streaming=True：**按层加载 + 加载即量化**（16GB 卡跑 7B+ 的前提，见 LEARNING.md
-    阶段7）。模型须先在 meta 设备构造（不占显存）；这里按"顶层块"（embed_tokens /
+    streaming=True：**按层加载 + 加载即量化**（16GB 卡跑 7B+ 的前提，见 INTERVIEW.md §1.7）。模型须先在 meta 设备构造（不占显存）；这里按"顶层块"（embed_tokens /
     每个 decoder layer / norm / lm_head）逐个物化到 cuda → 加载权重 → 调用
     chunk_hook(module, chunk_path)（ModelRunner 用它立即量化该层，`del self.weight`
     释放 fp16），再处理下一块。chunk_path 是模块完整路径（如 "model.layers.0"），

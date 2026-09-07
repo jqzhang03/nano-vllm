@@ -270,7 +270,7 @@ class ModelRunner:
 
     def _quant_mods(self):
         """参与权重量化的模块：全部 LinearBase；LM head 默认不量化（quantize_lm_head=True
-        才纳入——logits 由 lm_head 点积直接决定，量化它精度损失最大，见 BENCHMARKS.md §10）。
+        才纳入——logits 由 lm_head 点积直接决定，量化它精度损失最大，见 INTERVIEW.md §10.3.6）。
 
         词嵌入是查表，不量化；权重绑定时（tie_word_embeddings）LM head 与词嵌入共享存储，
         强制跳过。
@@ -389,6 +389,12 @@ class ModelRunner:
             m = _gmc(cfg.hf_config.model_type)(cfg.hf_config)
         est = sum(p.numel() for p in m.parameters()) * cfg.hf_config.dtype.itemsize
         del m
+        # meta 计数构造会把 get_rope 的 lru_cache(1) 共享实例的 cos_sin_cache 建在
+        # meta 上；不清除的话,后续 eager（非流式）路径复用同一实例 → 首次前向
+        # "Tensor on device meta is not on the expected device cuda" 崩（gemma2 int4
+        # 实测复现,2026-09 修）。流式路径随后 _finalize_streaming 会重建缓存,无害。
+        from nanovllm.layers.rotary_embedding import get_rope as _get_rope
+        _get_rope.cache_clear()
         free, _ = torch.cuda.mem_get_info()
         return est > free * 0.45
 
@@ -1140,7 +1146,7 @@ class ModelRunner:
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, kind: str,
                   return_hidden: bool = False):
         # 纯spec批次（verify）走spec CUDA graph：固定容量+零长度行填充，消除eager的
-        # 逐kernel启动税（实测~10ms/步，见BENCHMARKS.md §9）。按本步最大query长度
+        # 逐kernel启动税（实测~10ms/步，见INTERVIEW.md §10.3.5）。按本步最大query长度
         # 选stride家族（低γ步用stride-3图，容量=3×行数，减少填充浪费）。
         # fp8也入图：fp8 verify走自研varlen内核（直接读fp8缓存，无反量化）。
         if (kind == "spec" and not self.enforce_eager

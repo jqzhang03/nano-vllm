@@ -12,9 +12,11 @@ from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 # Mistral-7B 注意力模块：与 Llama-3 同构（无 QK-Norm、无 bias），关键差异是
 # **滑动窗口注意力（SWA）**：config.sliding_window=4096，每 token 只 attend 前
 # sliding_window 个位置（window_size 传给 Attention → flash-attn window_size 参数
-# / 自研 fp8 内核的 WINDOW 掩码）。窗口只影响注意力掩码，KV 缓存布局不变
-# （不做 vLLM 式滚动块复用——flash-attn 从块表索引推导 key 位置，滚动表会让
-# 位置错位；vLLM 同样是掩码而非滚动，见 LEARNING.md 卡点清单）。
+# / 自研 fp8 内核的 WINDOW 掩码）。默认只掩码不滚动、KV 缓存布局不变（与 vLLM 传统
+# 一致——flash-attn 从块表索引推导 key 位置，滚动表会让位置错位）；阶段 2b 起
+# `rolling_cache=True` 开启逐序列滚动环：块表 = 窗口内容清单（Sequence.kv_j0），
+# 解码期 KV 有界，环表位置偏移由自研 bf16/fp8 paged 内核 + varlen 环装配表达
+# （见 INTERVIEW.md §4.2/§8 阶段 2）。
 class MistralAttention(nn.Module):
 
     def __init__(
