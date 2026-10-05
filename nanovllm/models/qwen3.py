@@ -191,7 +191,7 @@ class Qwen3Model(nn.Module):
         super().__init__()
         # 词嵌入层
         self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
-        # 创建config.num_hidden_layers个解码层
+        # 创建config.num_hidden_layers个解码层，28层
         self.layers = nn.ModuleList([Qwen3DecoderLayer(config) for _ in range(config.num_hidden_layers)])
         # 在输出之前的归一化层
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)

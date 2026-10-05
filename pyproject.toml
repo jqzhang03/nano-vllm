@@ -17,7 +17,12 @@ dependencies = [
     "transformers>=4.51.0",
     "flash-attn",
     "xxhash",
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
 ]
+
+[project.scripts]
+nanovllm-serve = "nanovllm.server:main"
 
 [project.urls]
 Homepage="https://github.com/GeeeekExplorer/nano-vllm"

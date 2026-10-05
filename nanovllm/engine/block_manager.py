@@ -1,8 +1,8 @@
-from collections import deque
+from collections import OrderedDict, deque
 import xxhash
 import numpy as np
 
-from nanovllm.engine.sequence import Sequence
+from nanovllm.engine.sequence import PrefixFeatureContext, Sequence
 
 
 class Block:
@@ -12,6 +12,7 @@ class Block:
         self.ref_count = 0
         self.hash = -1
         self.token_ids = []
+        self.pending_free = False
 
     def update(self, hash: int, token_ids: list[int]):
         self.hash = hash
@@ -21,13 +22,16 @@ class Block:
         self.ref_count = 1
         self.hash = -1
         self.token_ids = []
+        self.pending_free = False
 
 
 class BlockManager:
 
     def __init__(self, num_blocks: int, block_size: int,
                  rolling_window: int | None = None, ring_slack: int = 0,
-                 no_share: bool = False, table_attr: str = "block_table"):
+                 no_share: bool = False, table_attr: str = "block_table",
+                 max_free_prefix_blocks: int = 0,
+                 prefix_feature_cache: bool = True):
         """滚动缓冲（SWA 环，rolling_window 非 None 时启用）：
 
         每序列块表 = **窗口内容的物理清单**（按逻辑块序号升序，第 i 项是第
@@ -52,6 +56,23 @@ class BlockManager:
         self.block_size = block_size  # 块大小
         self.blocks: list[Block] = [Block(i) for i in range(num_blocks)]  # 所有可用块的编号
         self.hash_to_block_id: dict[int, int] = dict()  # 哈希值到块id的映射，用于前缀缓存
+        # Least-recently-used order for canonical prefix-cache blocks. Feature
+        # probes never touch this order; only an actual cache allocation does.
+        self.prefix_lru: OrderedDict[int, None] = OrderedDict()
+        self.kv_generation = 0
+        self.prefix_feature_cache = prefix_feature_cache
+        # Per-workload counters. Resetting these never rewinds kv_generation,
+        # which is part of the cache-validity contract for live sequences.
+        self.kv_generation_mutations = 0
+        self.prefix_feature_invalidations = 0
+        self.max_free_prefix_blocks = max_free_prefix_blocks
+        self.deferred_free_block_ids: list[int] = []
+        self.deferred_free_refs_queued = 0
+        self.deferred_free_refs_committed = 0
+        self.deferred_free_flushes = 0
+        self.deferred_free_peak_blocks = 0
+        self.deferred_free_peak_refs = 0
+        self.prefix_cache_evictions = 0
         self.free_block_ids: deque[int] = deque(range(num_blocks))  # 空闲块队列
         self.used_block_ids: set[int] = set()  # 已使用块集合
         self.rolling = rolling_window is not None
@@ -100,20 +121,142 @@ class BlockManager:
         h.update(np.array(token_ids).tobytes())
         return h.intdigest()
 
+    def get_prefix_cached_tokens(self, seq: Sequence) -> int:
+        """Return the longest reusable token prefix without reserving any blocks."""
+        if self.rolling or self.no_share:
+            return 0
+        h = -1
+        cached_tokens = 0
+        for i in range(seq.num_blocks):
+            token_ids = seq.block(i)
+            h = self.compute_hash(token_ids, h)
+            block_id = self.hash_to_block_id.get(h, -1)
+            if (block_id == -1 or self.blocks[block_id].pending_free
+                    or self.blocks[block_id].token_ids != token_ids):
+                break
+            cached_tokens += len(token_ids)
+        return cached_tokens
+
+    def resolve_prefix_features(self, seq: Sequence) -> tuple[PrefixFeatureContext, bool]:
+        """Resolve Top-W scheduler features, caching by KV generation when enabled.
+
+        Returns (features, parsed_now). With ``prefix_feature_cache=False`` every
+        call reparses; this is the benchmark ablation for the lazy feature cache.
+        Probes never update prefix-cache recency; only allocate() records reuse.
+        """
+        cached = (seq.prefix_feature_context if self.prefix_feature_cache else None)
+        if cached is not None and cached.kv_generation == self.kv_generation:
+            return cached, False
+        if cached is not None:
+            self.prefix_feature_invalidations += 1
+        if self.rolling or self.no_share:
+            features = PrefixFeatureContext(self.kv_generation, 0, 0, 0)
+        else:
+            h = -1
+            cached_tokens = 0
+            cached_blocks = 0
+            first_miss_block = seq.num_blocks
+            for i in range(seq.num_blocks):
+                token_ids = seq.block(i)
+                h = self.compute_hash(token_ids, h)
+                block_id = self.hash_to_block_id.get(h, -1)
+                if (block_id == -1 or self.blocks[block_id].pending_free
+                        or self.blocks[block_id].token_ids != token_ids):
+                    first_miss_block = i
+                    break
+                cached_blocks += 1
+                cached_tokens += len(token_ids)
+            features = PrefixFeatureContext(
+                self.kv_generation, cached_tokens, cached_blocks, first_miss_block)
+        if self.prefix_feature_cache:
+            seq.prefix_feature_context = features
+        else:
+            seq.prefix_feature_context = None
+        return features, True
+
+    def _bump_kv_generation(self) -> None:
+        self.kv_generation += 1
+        self.kv_generation_mutations += 1
+
+    def reset_metrics(self) -> None:
+        """Reset observability counters without changing live cache state."""
+        self.kv_generation_mutations = 0
+        self.prefix_feature_invalidations = 0
+        self.prefix_cache_evictions = 0
+        self.deferred_free_refs_queued = 0
+        self.deferred_free_refs_committed = 0
+        self.deferred_free_flushes = 0
+        self.deferred_free_peak_blocks = len(set(self.deferred_free_block_ids))
+        self.deferred_free_peak_refs = len(self.deferred_free_block_ids)
+
+    def _is_reusable_prefix_block(self, block: Block) -> bool:
+        return (block.hash != -1 and not block.pending_free
+                and self.hash_to_block_id.get(block.hash) == block.block_id)
+
+    def _remove_prefix_entry(self, block: Block) -> bool:
+        removed = False
+        if block.hash != -1 and self.hash_to_block_id.get(block.hash) == block.block_id:
+            del self.hash_to_block_id[block.hash]
+            removed = True
+        self.prefix_lru.pop(block.block_id, None)
+        return removed
+
+    def _evict_prefix_block(self, block: Block) -> None:
+        if self._remove_prefix_entry(block):
+            self.prefix_cache_evictions += 1
+        block.hash = -1
+        block.token_ids = []
+        self._bump_kv_generation()
+
+    def _enforce_free_prefix_limit(self) -> None:
+        if self.max_free_prefix_blocks <= 0:
+            return
+        reusable_free = sum(
+            self._is_reusable_prefix_block(self.blocks[block_id])
+            for block_id in self.free_block_ids)
+        while reusable_free > self.max_free_prefix_blocks:
+            victim_id = next((block_id for block_id in self.prefix_lru
+                              if block_id in self.free_block_ids
+                              and self._is_reusable_prefix_block(self.blocks[block_id])), None)
+            if victim_id is None:
+                return
+            self._evict_prefix_block(self.blocks[victim_id])
+            reusable_free -= 1
+
     def _allocate_block(self) -> int:
-        block_id = self.free_block_ids.popleft()
+        # Consume uncached free blocks first. Under pressure, sacrifice the
+        # least recently *used* free prefix entry before one used recently.
+        block_id = next((candidate for candidate in self.free_block_ids
+                         if not self._is_reusable_prefix_block(self.blocks[candidate])), None)
+        if block_id is None:
+            block_id = next((candidate for candidate in self.prefix_lru
+                             if candidate in self.free_block_ids
+                             and self._is_reusable_prefix_block(self.blocks[candidate])), None)
+        if block_id is None:
+            block_id = self.free_block_ids[0]
+        self.free_block_ids.remove(block_id)
         block = self.blocks[block_id]
         assert block.ref_count == 0
-        if block.hash != -1 and self.hash_to_block_id.get(block.hash) == block_id:
-            del self.hash_to_block_id[block.hash]
+        assert not block.pending_free
+        if self._is_reusable_prefix_block(block):
+            self._evict_prefix_block(block)
+        elif block.hash != -1:
+            self._remove_prefix_entry(block)
+            block.hash = -1
+            block.token_ids = []
+            self._bump_kv_generation()
         block.reset()
         self.used_block_ids.add(block_id)
+        self._bump_kv_generation()
         return block_id
 
     def _deallocate_block(self, block_id: int):
-        assert self.blocks[block_id].ref_count == 0
+        block = self.blocks[block_id]
+        assert block.ref_count == 0 and not block.pending_free
         self.used_block_ids.remove(block_id)
         self.free_block_ids.append(block_id)
+        self._bump_kv_generation()
+        self._enforce_free_prefix_limit()
 
     def can_allocate(self, seq: Sequence) -> int:
         t = self._t(seq)
@@ -134,7 +277,8 @@ class BlockManager:
             h = self.compute_hash(token_ids, h)
             block_id = self.hash_to_block_id.get(h, -1)
             # 找不到或者遇到了哈希碰撞，直接退出
-            if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
+            if (block_id == -1 or self.blocks[block_id].pending_free
+                    or self.blocks[block_id].token_ids != token_ids):
                 break
             num_cached_blocks += 1
             last_cached_id = block_id
@@ -155,6 +299,7 @@ class BlockManager:
         t = self._t(seq)
         assert not t
         seq.kv_j0 = 0
+        seq.num_prefix_cached_tokens = 0
         if self.rolling or self.no_share:
             # 全新私有块（滚动/no_share 模型 can_allocate 恒返回 0）
             for _ in range(seq.num_blocks):
@@ -173,6 +318,9 @@ class BlockManager:
                 block.ref_count = 1
                 self.free_block_ids.remove(block_id)
                 self.used_block_ids.add(block_id)
+            self.prefix_lru[block_id] = None
+            self.prefix_lru.move_to_end(block_id)
+            self._bump_kv_generation()
             t.append(block_id)
         for i in range(num_cached_blocks, seq.num_blocks):
             t.append(self._allocate_block())
@@ -180,6 +328,7 @@ class BlockManager:
             seq.num_cached_tokens = 0
         else:
             seq.num_cached_tokens = (num_cached_blocks - 1) * self.block_size + len(seq.block(num_cached_blocks - 1))
+        seq.num_prefix_cached_tokens = seq.num_cached_tokens
 
     def allocate_private(self, seq: Sequence):
         """KV swap 换入专用：分配全新私有块（不查前缀缓存、不参与共享、不发布哈希）。
@@ -209,18 +358,59 @@ class BlockManager:
             block = self.blocks[block_id]
             block.ref_count -= 1
             if block.ref_count == 0:
+                # The physical KV was copied to host memory and is no longer
+                # available for prefix reuse in this GPU pool.
+                self._evict_prefix_block(block)
                 self._deallocate_block(block_id)
+            else:
+                self._bump_kv_generation()
 
-    def deallocate(self, seq: Sequence):
+    def deallocate(self, seq: Sequence, *, deferred: bool = False):
         t = self._t(seq)
-        for block_id in reversed(t):
-            block = self.blocks[block_id]
-            block.ref_count -= 1
-            if block.ref_count == 0:
-                self._deallocate_block(block_id)
+        if deferred:
+            for block_id in reversed(t):
+                self.blocks[block_id].pending_free = True
+                self.deferred_free_block_ids.append(block_id)
+            self.deferred_free_refs_queued += len(t)
+            self.deferred_free_peak_blocks = max(
+                self.deferred_free_peak_blocks,
+                len(set(self.deferred_free_block_ids)))
+            self.deferred_free_peak_refs = max(
+                self.deferred_free_peak_refs, len(self.deferred_free_block_ids))
+            if t:
+                self._bump_kv_generation()
+        else:
+            for block_id in reversed(t):
+                block = self.blocks[block_id]
+                block.ref_count -= 1
+                if block.ref_count == 0:
+                    self._deallocate_block(block_id)
+                else:
+                    self._bump_kv_generation()
         seq.num_cached_tokens = 0
         t.clear()
         seq.kv_j0 = 0
+
+    def flush_deferred_free(self) -> None:
+        """Commit deferred sequence releases after the whole batch is finalized."""
+        if not self.deferred_free_block_ids:
+            return
+        pending = self.deferred_free_block_ids
+        self.deferred_free_block_ids = []
+        self.deferred_free_flushes += 1
+        self.deferred_free_refs_committed += len(pending)
+        touched: set[int] = set()
+        for block_id in pending:
+            block = self.blocks[block_id]
+            block.ref_count -= 1
+            touched.add(block_id)
+        for block_id in touched:
+            block = self.blocks[block_id]
+            block.pending_free = False
+            if block.ref_count == 0:
+                self._deallocate_block(block_id)
+            else:
+                self._bump_kv_generation()
 
     def can_append(self, seq: Sequence) -> bool:
         t = self._t(seq)
@@ -350,8 +540,11 @@ class BlockManager:
         end_blk = (end + self.block_size - 1) // self.block_size
         if start_blk == end_blk: return
         h = self.blocks[t[start_blk - 1]].hash if start_blk > 0 else -1
+        changed = False
         for i in range(start_blk, end_blk):
             block = self.blocks[t[i]]
+            assert not block.pending_free, \
+                "KV content changed while the block release was deferred"
             token_ids = seq.block(i)
             h = self.compute_hash(token_ids, h)
             # 块内容变化（如部分块追加token）时，删除旧哈希条目，避免脏数据。
@@ -360,5 +553,23 @@ class BlockManager:
             if block.hash != -1 and block.hash != h:
                 if self.hash_to_block_id.get(block.hash) == block.block_id:
                     del self.hash_to_block_id[block.hash]
+                self.prefix_lru.pop(block.block_id, None)
+                changed = True
+            old_tokens = block.token_ids
+            was_indexed = block.block_id in self.prefix_lru
             block.update(h, token_ids)
+            previous_id = self.hash_to_block_id.get(h)
+            if previous_id is not None and previous_id != block.block_id:
+                self.prefix_lru.pop(previous_id, None)
             self.hash_to_block_id[h] = block.block_id
+            # A newly published block is the coldest entry. Feature probes do
+            # not change recency; allocate() records actual cache reuse.
+            if not was_indexed:
+                self.prefix_lru.pop(block.block_id, None)
+                self.prefix_lru[block.block_id] = None
+                self.prefix_lru.move_to_end(block.block_id, last=False)
+            if old_tokens != token_ids or previous_id != block.block_id:
+                changed = True
+        if changed:
+            self._bump_kv_generation()
+        self._enforce_free_prefix_limit()

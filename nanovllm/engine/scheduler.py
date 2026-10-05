@@ -1,4 +1,5 @@
 from collections import deque
+from math import ceil
 from time import perf_counter
 
 import torch
@@ -16,6 +17,26 @@ class Scheduler:
         self.max_num_batched_tokens = config.max_num_batched_tokens
         self.eos = config.eos
         self.block_size = config.kvcache_block_size
+        self.latency_aware_scheduling = config.latency_aware_scheduling
+        self.cache_affinity_admission = config.cache_affinity_admission
+        self.admission_window = config.admission_window
+        self.aging_fairness = config.aging_fairness
+        self.aging_timeout_s = config.aging_timeout_ms / 1000.0
+        self.prefill_reserve_tokens = config.prefill_reserve_tokens
+        self.slo_aware_scheduling = config.slo_aware_scheduling
+        self.default_ttft_slo_s = (None if config.default_ttft_slo_ms is None else
+                                    config.default_ttft_slo_ms / 1000.0)
+        self.tpot_aware_scheduling = config.tpot_aware_scheduling
+        self.default_tpot_slo_ms = config.default_tpot_slo_ms
+        self.tpot_decode_ms_fallback = config.tpot_decode_ms_fallback
+        self.external_tpot_pressure = 0.0
+        self.external_tpot_target_active = False
+        self.max_prefill_chunk_tokens = config.max_prefill_chunk_tokens
+        self.queue_depth_for_full_prefill = config.queue_depth_for_full_prefill
+        self.recompute_aware_preemption = config.recompute_aware_preemption
+        self._prefill_seconds_per_token = 1.0 / config.preempt_prefill_tokens_per_second
+        self._swap_seconds_per_byte = 1.0 / (config.preempt_kv_transfer_gbps * 1e9)
+        self._single_slot_prefill_turn = True
         # ---- SWA 滚动缓冲（阶段 2b/2b扩展）----
         # 前置：统一窗口（mistral）或交替 local/global（gemma2，**split 模式**：
         # local 层走环池、global 层走 full 池普通分页、永不驱逐）的 bf16/fp8 KV
@@ -60,27 +81,49 @@ class Scheduler:
             self.block_manager = BlockManager(
                 nb_r, config.kvcache_block_size,
                 rolling_window=ring_window,
-                ring_slack=config.max_draft_len + 2)
+                ring_slack=config.max_draft_len + 2,
+                max_free_prefix_blocks=config.prefix_cache_max_free_blocks,
+                prefix_feature_cache=config.prefix_feature_cache)
             self.full_block_manager = BlockManager(
                 nb_f, config.kvcache_block_size,
                 no_share=True, table_attr="kv_table")
         else:
             self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size,
                                               rolling_window=ring_window,
-                                              ring_slack=config.max_draft_len + 2)
+                                              ring_slack=config.max_draft_len + 2,
+                                              no_share=config.pd_separation,
+                                              max_free_prefix_blocks=config.prefix_cache_max_free_blocks,
+                                              prefix_feature_cache=config.prefix_feature_cache)
             self.full_block_manager = None
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
         self.swapped: deque[Sequence] = deque()  # KV swap 抢占：KV 已换出到 CPU 的序列
         self.num_preemptions = 0  # 抢占次数统计（基准测试使用）
         self.num_swaps = 0  # KV swap 换出次数统计（基准测试使用）
+        self.num_recompute_preemptions = 0
+        self.recompute_tokens = 0
+        self.estimated_recompute_seconds = 0.0
+        self.estimated_swap_seconds = 0.0
+        self.num_affinity_probes = 0
+        self.num_prefix_feature_parses = 0
+        self.num_prefix_feature_reuses = 0
+        self.prefix_cache_hit_tokens = 0
+        self.prefix_cache_hit_requests = 0
+        self.num_aging_promotions = 0
+        self.num_slo_prefill_steps = 0
+        self.slo_prefill_budget_sum = 0
+        self.slo_prefill_budget_max = 0
+        self.slo_prefill_rows_sum = 0
+        self.num_tpot_prefill_steps = 0
+        self.tpot_prefill_budget_sum = 0
+        self.num_tpot_priority_steps = 0
+        self._last_tpot_pressure = 0.0
         self.cow_pairs: list[tuple[int, int]] = []  # 本轮调度产生的COW复制对 (old_block_id, new_block_id)
         self.swap_pairs: list[tuple[Sequence, list[int], object, str]] = []  # 本轮KV swap对 (seq, gpu块id, cpu缓冲, "out"/"in")——GPU拷贝由engine在run前执行
-        self._swap_buffers: dict[int, object] = {}  # seq_id → CPU pinned 缓冲（换出时分配，换入后释放）
-        # KV swap 仅 TP=1 且非 fp8 KV 时启用：fp8(float8_e4m3) 是 CUDA-only dtype，无法分配
-        # CPU pinned 缓冲；TP>1 的 spawn 进程不共享 CPU 内存（vLLM 用 shared memory，未实现）
-        self.kv_swap = config.kv_swap and config.tensor_parallel_size == 1 \
-            and config.kv_cache_dtype == "auto"
+        self._swap_buffers: dict[int, object] = {}  # seq_id → CPU 缓冲（换出时分配，换入后释放）
+        # FP8 KV 在 CPU 侧按 uint8 原始字节保存并往返，避免 float8 的 CPU 算子限制。
+        # TP>1 的 spawn 进程尚未实现每个 rank 的独立 offload buffer，因此仍回退 recompute。
+        self.kv_swap = config.kv_swap and config.tensor_parallel_size == 1
         self._swap_max_bytes = int(config.kv_swap_space_gb * 1e9)
         self._swap_bytes = 0  # 当前换出缓冲累计字节（超预算回落 recompute）
         if self.kv_swap:
@@ -92,7 +135,16 @@ class Scheduler:
                                    or hf.hidden_size // hf.num_attention_heads)
             self._swap_mla_d = (hf.kv_lora_rank + hf.qk_rope_head_dim
                                 if self._swap_mla else 0)
-            self._swap_dtype = hf.dtype
+            self._swap_fp8 = config.kv_cache_dtype == "fp8_e4m3"
+            self._swap_dtype = torch.uint8 if self._swap_fp8 else hf.dtype
+            itemsize = 1 if self._swap_fp8 else hf.dtype.itemsize
+            if self._swap_mla:
+                self._swap_bytes_per_block = (self._swap_layers * self.block_size
+                                              * self._swap_mla_d * itemsize)
+            else:
+                self._swap_bytes_per_block = (2 * self._swap_layers * self.block_size
+                                              * self._swap_kv_heads * self._swap_head_dim
+                                              * itemsize)
         # ---- 投机解码（n-gram / Medusa） ----
         self.spec_decode = config.speculative in ("ngram", "medusa", "eagle")
         self.spec_mode = config.speculative   # "ngram" | "medusa" | "eagle"
@@ -105,6 +157,307 @@ class Scheduler:
 
     def add(self, seq: Sequence):
         self.waiting.append(seq)
+
+    def reset_metrics(self) -> None:
+        self.num_preemptions = 0
+        self.num_swaps = 0
+        self.num_recompute_preemptions = 0
+        self.recompute_tokens = 0
+        self.estimated_recompute_seconds = 0.0
+        self.estimated_swap_seconds = 0.0
+        self.num_affinity_probes = 0
+        self.num_prefix_feature_parses = 0
+        self.num_prefix_feature_reuses = 0
+        self.prefix_cache_hit_tokens = 0
+        self.prefix_cache_hit_requests = 0
+        self.block_manager.reset_metrics()
+        if self.full_block_manager is not None:
+            self.full_block_manager.reset_metrics()
+        self.num_aging_promotions = 0
+        self.num_slo_prefill_steps = 0
+        self.slo_prefill_budget_sum = 0
+        self.slo_prefill_budget_max = 0
+        self.slo_prefill_rows_sum = 0
+        self.num_tpot_prefill_steps = 0
+        self.tpot_prefill_budget_sum = 0
+        self.num_tpot_priority_steps = 0
+        self._last_tpot_pressure = 0.0
+
+    def observe_prefill(self, num_tokens: int, elapsed_seconds: float) -> None:
+        """Update the recompute cost estimate from observed pure-prefill steps."""
+        if num_tokens <= 0 or elapsed_seconds <= 0:
+            return
+        observed = elapsed_seconds / num_tokens
+        self._prefill_seconds_per_token = (
+            0.8 * self._prefill_seconds_per_token + 0.2 * observed)
+
+    def observe_kv_transfer(self, num_bytes: int, elapsed_seconds: float) -> None:
+        """Update the swap bandwidth estimate from completed D2H/H2D transfers."""
+        if num_bytes <= 0 or elapsed_seconds <= 0:
+            return
+        observed = elapsed_seconds / num_bytes
+        self._swap_seconds_per_byte = 0.8 * self._swap_seconds_per_byte + 0.2 * observed
+
+    def _estimated_prefill_tokens(self, seq: Sequence) -> int:
+        cached_tokens = seq.num_cached_tokens
+        if self.cache_affinity_admission:
+            features, parsed = self.block_manager.resolve_prefix_features(seq)
+            if parsed:
+                self.num_prefix_feature_parses += 1
+            else:
+                self.num_prefix_feature_reuses += 1
+            cached_tokens = max(cached_tokens, features.cached_tokens)
+        return max(1, seq.num_tokens - min(cached_tokens, seq.num_tokens))
+
+    def _estimated_ttft_slack(self, seq: Sequence, now: float) -> float | None:
+        target = (seq.ttft_slo_ms / 1000.0 if seq.ttft_slo_ms is not None
+                  else self.default_ttft_slo_s)
+        if target is None:
+            return None
+        submitted = seq.t_submitted if seq.t_submitted is not None else now
+        estimated_prefill_seconds = (
+            self._estimated_prefill_tokens(seq) * self._prefill_seconds_per_token)
+        return target - max(0.0, now - submitted) - estimated_prefill_seconds
+
+    def _tpot_target_ms(self, seq: Sequence) -> float | None:
+        return (seq.tpot_slo_ms if seq.tpot_slo_ms is not None
+                else self.default_tpot_slo_ms)
+
+    def _has_active_tpot_target(self) -> bool:
+        return (self.tpot_aware_scheduling
+                and (self.external_tpot_target_active
+                     or any(self._tpot_target_ms(seq) is not None for seq in self.running)))
+
+    def _estimated_tpot_slack_ms(self, seq: Sequence) -> float | None:
+        target = self._tpot_target_ms(seq)
+        if target is None:
+            return None
+        observed = (seq.tpot_ewma_ms if seq.tpot_ewma_ms is not None
+                    else self.tpot_decode_ms_fallback)
+        return target - observed
+
+    def _tpot_decode_pressure(self) -> float:
+        if not self.tpot_aware_scheduling:
+            return 0.0
+        pressure = self.external_tpot_pressure
+        for seq in self.running:
+            target = self._tpot_target_ms(seq)
+            if target is None:
+                continue
+            slack = self._estimated_tpot_slack_ms(seq)
+            pressure = max(pressure, min(1.0, max(0.0, 1.0 - slack / target)))
+        return pressure
+
+    def _order_running_by_tpot(self) -> None:
+        """Prioritize active requests with the least remaining TPOT slack."""
+        if not self.tpot_aware_scheduling or len(self.running) < 2:
+            return
+        items = list(self.running)
+        if not any(self._tpot_target_ms(seq) is not None for seq in items):
+            return
+        ranked = sorted(
+            enumerate(items),
+            key=lambda pair: (
+                0 if self._tpot_target_ms(pair[1]) is not None else 1,
+                float("inf") if self._estimated_tpot_slack_ms(pair[1]) is None
+                else self._estimated_tpot_slack_ms(pair[1]),
+                pair[0],
+            ),
+        )
+        self.running = deque(seq for _, seq in ranked)
+
+    def _slo_prefill_controls(self, now: float | None = None) -> tuple[int, int, float]:
+        """Choose a per-step prefill token quota and row quota from SLO pressure."""
+        self._last_tpot_pressure = 0.0
+        if not self.waiting:
+            return self.max_num_batched_tokens, 0, 0.0
+        if not (self.slo_aware_scheduling or self._has_active_tpot_target()):
+            return self.max_num_batched_tokens, self.max_num_seqs, 0.0
+
+        now = perf_counter() if now is None else now
+        if self.slo_aware_scheduling or self._has_active_tpot_target():
+            depth_target = self.queue_depth_for_full_prefill
+            if depth_target <= 1:
+                queue_pressure = 1.0
+            else:
+                queue_pressure = min(1.0, max(0.0, (len(self.waiting) - 1)
+                                               / (depth_target - 1)))
+        else:
+            queue_pressure = 0.0
+
+        items = list(self.waiting)
+        urgency = 0.0
+        if self.slo_aware_scheduling:
+            for seq in items[:self.admission_window]:
+                slack = self._estimated_ttft_slack(seq, now)
+                target = (seq.ttft_slo_ms / 1000.0 if seq.ttft_slo_ms is not None
+                          else self.default_ttft_slo_s)
+                if slack is not None and target is not None:
+                    urgency = max(urgency, min(1.0, max(0.0, 1.0 - slack / target)))
+
+        prefill_pressure = max(queue_pressure, urgency)
+        tpot_pressure = self._tpot_decode_pressure()
+        self._last_tpot_pressure = tpot_pressure
+        max_budget = min(self.max_num_batched_tokens, self.max_prefill_chunk_tokens)
+        min_budget = min(self.prefill_reserve_tokens, max_budget)
+        token_budget = round(min_budget + prefill_pressure * (max_budget - min_budget)
+                             * (1.0 - tpot_pressure))
+        if self.max_num_seqs <= 1:
+            prefill_rows = 1
+        else:
+            row_capacity = self.max_num_seqs - 1
+            row_pressure = prefill_pressure * (1.0 - tpot_pressure)
+            prefill_rows = min(len(self.waiting), max(1, ceil(row_capacity * row_pressure)))
+        return max(1, token_budget), prefill_rows, prefill_pressure
+
+    def _record_slo_controls(self, token_budget: int, prefill_rows: int) -> None:
+        if not (self.slo_aware_scheduling or self._has_active_tpot_target()) or not self.waiting:
+            return
+        if self.slo_aware_scheduling:
+            self.num_slo_prefill_steps += 1
+            self.slo_prefill_budget_sum += token_budget
+            self.slo_prefill_budget_max = max(self.slo_prefill_budget_max, token_budget)
+            self.slo_prefill_rows_sum += prefill_rows
+        if self._has_active_tpot_target():
+            self.num_tpot_prefill_steps += 1
+            self.tpot_prefill_budget_sum += token_budget
+            self.num_tpot_priority_steps += int(self._last_tpot_pressure >= 0.5)
+
+    def _waiting_score(self, seq: Sequence, now: float, original_index: int) -> tuple:
+        submitted = seq.t_submitted if seq.t_submitted is not None else now
+        age = max(0.0, now - submitted)
+        if self.aging_fairness and age >= self.aging_timeout_s:
+            # Once aged, old requests outrank cache/short-prompt preference.
+            return (0, submitted, original_index)
+
+        cached_tokens = seq.num_cached_tokens
+        if self.cache_affinity_admission:
+            features, parsed = self.block_manager.resolve_prefix_features(seq)
+            if parsed:
+                self.num_prefix_feature_parses += 1
+            else:
+                self.num_prefix_feature_reuses += 1
+            cached_tokens = max(cached_tokens, features.cached_tokens)
+        cached_tokens = min(cached_tokens, seq.num_tokens)
+        remaining_tokens = max(0, seq.num_tokens - cached_tokens)
+        slack = self._estimated_ttft_slack(seq, now)
+        if self.slo_aware_scheduling or self._has_active_tpot_target():
+            # Least laxity first within Top-W; cache reuse and prompt cost break ties.
+            return (1, float("inf") if slack is None else slack,
+                    -cached_tokens, remaining_tokens,
+                    submitted, original_index)
+        if self.cache_affinity_admission and self.latency_aware_scheduling:
+            return (1, -cached_tokens, remaining_tokens, submitted, original_index)
+        if self.cache_affinity_admission:
+            return (1, -cached_tokens, submitted, original_index)
+        if self.latency_aware_scheduling:
+            return (1, remaining_tokens, submitted, original_index)
+        return (1, submitted, original_index)
+
+    def _order_waiting(self) -> None:
+        """Re-rank only the Top-W admission window; preserve FIFO beyond it."""
+        if len(self.waiting) < 2:
+            return
+        if not (self.latency_aware_scheduling or self.cache_affinity_admission
+                or self.aging_fairness or self.slo_aware_scheduling):
+            return
+        items = list(self.waiting)
+        now = perf_counter()
+        if self.aging_fairness:
+            aged = [(index, seq) for index, seq in enumerate(items)
+                    if seq.t_submitted is not None
+                    and now - seq.t_submitted >= self.aging_timeout_s]
+            if aged:
+                original_index, oldest = min(
+                    aged, key=lambda pair: (pair[1].t_submitted, pair[0]))
+                rest = items[:original_index] + items[original_index + 1:]
+                width = min(max(0, self.admission_window - 1), len(rest))
+                window = rest[:width]
+                ranked = sorted(
+                    enumerate(window),
+                    key=lambda pair: self._waiting_score(pair[1], now, pair[0]),
+                )
+                ordered = [oldest] + [seq for _, seq in ranked] + rest[width:]
+                if original_index > 0 and not oldest.age_promoted:
+                    oldest.age_promoted = True
+                    self.num_aging_promotions += 1
+                self.waiting = deque(ordered)
+                return
+
+        width = min(self.admission_window, len(items))
+        window = items[:width]
+        ranked = sorted(
+            enumerate(window),
+            key=lambda pair: self._waiting_score(pair[1], now, pair[0]),
+        )
+        ordered = [seq for _, seq in ranked]
+        if ordered and ordered[0] is not window[0]:
+            first = ordered[0]
+            submitted = first.t_submitted if first.t_submitted is not None else now
+            if (self.aging_fairness and not first.age_promoted
+                    and now - submitted >= self.aging_timeout_s):
+                first.age_promoted = True
+                self.num_aging_promotions += 1
+        self.waiting = deque(ordered + items[width:])
+
+    def _prefill_reserve(self) -> int:
+        if not self.waiting or not self.latency_aware_scheduling:
+            return 0
+        if self.max_num_batched_tokens <= 1:
+            return 0
+        seq = self.waiting[0]
+        cached_tokens = seq.num_cached_tokens
+        if self.cache_affinity_admission:
+            features, parsed = self.block_manager.resolve_prefix_features(seq)
+            if parsed:
+                self.num_prefix_feature_parses += 1
+            else:
+                self.num_prefix_feature_reuses += 1
+            cached_tokens = max(cached_tokens, features.cached_tokens)
+        remaining = max(1, seq.num_tokens - min(cached_tokens, seq.num_tokens))
+        return min(self.prefill_reserve_tokens, remaining,
+                   self.max_num_batched_tokens - 1)
+
+    def _decode_row_limit(self, slo_controls: tuple[int, int, float] | None = None) -> int:
+        if not self.waiting:
+            return self.max_num_seqs
+        if self.slo_aware_scheduling or self._has_active_tpot_target():
+            token_budget, prefill_rows, _ = (slo_controls or
+                                               self._slo_prefill_controls())
+            if self.max_num_batched_tokens <= 1 or self.max_num_seqs == 1:
+                if self._single_slot_prefill_turn:
+                    self._single_slot_prefill_turn = False
+                    return 0
+                self._single_slot_prefill_turn = True
+                return min(1, self.max_num_seqs)
+            return min(self.max_num_seqs - prefill_rows,
+                       max(0, self.max_num_batched_tokens - token_budget))
+        if not self.latency_aware_scheduling:
+            return self.max_num_seqs
+        if self.max_num_batched_tokens <= 1 or self.max_num_seqs == 1:
+            if self._single_slot_prefill_turn:
+                self._single_slot_prefill_turn = False
+                return 0
+            self._single_slot_prefill_turn = True
+            return min(1, self.max_num_seqs)
+        reserve = self._prefill_reserve()
+        token_limit = max(0, self.max_num_batched_tokens - reserve)
+        return min(self.max_num_seqs - 1, token_limit)
+
+    def _mixed_prefill_row_limit(
+        self, slo_controls: tuple[int, int, float], decode_limit: int,
+    ) -> int:
+        if not (self.slo_aware_scheduling or self._has_active_tpot_target()):
+            return self.max_num_seqs
+        if self.max_num_seqs == 1:
+            return max(0, self.max_num_seqs - decode_limit)
+        return slo_controls[1]
+
+    def mark_prefill_started(self, seq: Sequence) -> None:
+        """Record admission start once, preserving request-arrival timestamps."""
+        now = perf_counter()
+        if seq.t_prefill_started is None:
+            seq.t_prefill_started = now
 
     def schedule(self) -> tuple[list[Sequence], str]:
         """返回 (被调度序列, kind)；kind ∈ {"prefill", "decode", "mixed", "spec"}。
@@ -121,9 +474,11 @@ class Scheduler:
         """
         self.cow_pairs = []
         self.swap_pairs = []
+        self._order_waiting()
         # KV swap 换入优先：把 KV 已换出到 CPU 的序列换回 GPU（free块足够时），
         # 换入后直接参与本步 decode（KV 完整，无需重新 prefill）
         self._try_swap_in()
+        self._order_running_by_tpot()
         if self.spec_decode:
             for seq in self.running:
                 self._compute_draft(seq)
@@ -163,6 +518,10 @@ class Scheduler:
         self.block_manager.allocate(seq, num_cached_blocks)
         if self.full_block_manager is not None and not seq.kv_table:
             self.full_block_manager.allocate(seq, 0)
+        self.num_affinity_probes += 1
+        if seq.num_prefix_cached_tokens > 0:
+            self.prefix_cache_hit_requests += 1
+            self.prefix_cache_hit_tokens += seq.num_prefix_cached_tokens
         return True
 
     def _compute_draft(self, seq: Sequence):
@@ -192,11 +551,16 @@ class Scheduler:
             return self._schedule_mixed_spec()
         # 1) decode部分（batch行序在后）
         decode_seqs = []
-        while self.running and len(decode_seqs) < self.max_num_seqs:
+        slo_controls = self._slo_prefill_controls()
+        decode_limit = self._decode_row_limit(slo_controls)
+        prefill_row_limit = self._mixed_prefill_row_limit(
+            slo_controls, decode_limit)
+        self._record_slo_controls(slo_controls[0], prefill_row_limit)
+        while self.running and len(decode_seqs) < decode_limit:
             seq = self.running.popleft()
             while not self._dec_can(seq):
                 if self.running:
-                    self.preempt(self.running.pop())
+                    self._preempt_another_running()
                 else:
                     self.preempt(seq)
                     break
@@ -215,9 +579,15 @@ class Scheduler:
         # 2) prefill部分（batch行序在前），共享token预算
         prefill_seqs = []
         num_batched_tokens = len(decode_seqs)  # decode每序列1 token计入预算
-        while self.waiting and len(prefill_seqs) < self.max_num_seqs:
+        prefill_tokens_used = 0
+        prefill_token_limit = (slo_controls[0]
+                               if self.slo_aware_scheduling or self._has_active_tpot_target()
+                               else self.max_num_batched_tokens)
+        while (self.waiting and len(prefill_seqs) < prefill_row_limit
+               and len(prefill_seqs) + len(decode_seqs) < self.max_num_seqs):
             seq = self.waiting[0]
-            remaining = self.max_num_batched_tokens - num_batched_tokens
+            remaining = min(self.max_num_batched_tokens - num_batched_tokens,
+                            prefill_token_limit - prefill_tokens_used)
             if remaining == 0:
                 break
             if not seq.block_table:
@@ -230,23 +600,31 @@ class Scheduler:
                 break
             seq.num_scheduled_tokens = min(num_tokens, remaining)
             num_batched_tokens += seq.num_scheduled_tokens
+            prefill_tokens_used += seq.num_scheduled_tokens
             if seq.num_scheduled_tokens > 0:
                 pair = self.block_manager.cow_block(seq, seq.num_cached_tokens)
                 if pair is not None:
                     self.cow_pairs.append(pair)
             if seq.num_cached_tokens + seq.num_scheduled_tokens == seq.num_tokens:
+                self.mark_prefill_started(seq)
                 seq.status = SequenceStatus.RUNNING
                 self.waiting.popleft()
                 self.running.append(seq)
             if num_tokens != 0:
+                self.mark_prefill_started(seq)
                 prefill_seqs.append(seq)
 
         if prefill_seqs and decode_seqs:
             return prefill_seqs + decode_seqs, "mixed"
         if prefill_seqs:
             return prefill_seqs, "prefill"
-        assert decode_seqs
-        return decode_seqs, "decode"
+        if decode_seqs:
+            return decode_seqs, "decode"
+        # A full-prefix hit can enter running without contributing a prefill row.
+        # Let it make decode progress rather than asserting on an empty mixed batch.
+        if self.running:
+            return self._schedule_decode()
+        return self._schedule_prefill()
 
     def _spec_rows(self, max_rows: int, budget: int) -> list[Sequence]:
         """把running序列编排为verify行（草稿已由_compute_draft算好）。
@@ -267,7 +645,7 @@ class Scheduler:
                 n = avail
             while not self.block_manager.can_append_spec(seq, n):
                 if self.running:
-                    self.preempt(self.running.pop())
+                    self._preempt_another_running()
                 else:
                     self.preempt(seq)
                     break
@@ -299,12 +677,26 @@ class Scheduler:
 
     def _schedule_mixed_spec(self) -> tuple[list[Sequence], str]:
         """投机混合步：verify行（后）+ prefill行（前），共享token预算。"""
-        spec_rows = self._spec_rows(self.max_num_seqs, self.max_num_batched_tokens)
+        slo_controls = self._slo_prefill_controls()
+        row_limit = self._decode_row_limit(slo_controls)
+        prefill_row_limit = self._mixed_prefill_row_limit(slo_controls, row_limit)
+        self._record_slo_controls(slo_controls[0], prefill_row_limit)
+        if self.slo_aware_scheduling or self._has_active_tpot_target():
+            prefill_token_limit = slo_controls[0]
+            spec_budget = max(1, self.max_num_batched_tokens - prefill_token_limit)
+        else:
+            reserve = self._prefill_reserve()
+            prefill_token_limit = self.max_num_batched_tokens
+            spec_budget = max(1, self.max_num_batched_tokens - reserve)
+        spec_rows = self._spec_rows(row_limit, spec_budget)
         prefill_seqs = []
         num_batched_tokens = sum(seq.num_scheduled_tokens for seq in spec_rows)
-        while self.waiting and len(prefill_seqs) + len(spec_rows) < self.max_num_seqs:
+        prefill_tokens_used = 0
+        while (self.waiting and len(prefill_seqs) < prefill_row_limit
+               and len(prefill_seqs) + len(spec_rows) < self.max_num_seqs):
             seq = self.waiting[0]
-            remaining = self.max_num_batched_tokens - num_batched_tokens
+            remaining = min(self.max_num_batched_tokens - num_batched_tokens,
+                            prefill_token_limit - prefill_tokens_used)
             if remaining == 0:
                 break
             if not seq.block_table:
@@ -317,34 +709,52 @@ class Scheduler:
                 break
             seq.num_scheduled_tokens = min(num_tokens, remaining)
             num_batched_tokens += seq.num_scheduled_tokens
+            prefill_tokens_used += seq.num_scheduled_tokens
             if seq.num_scheduled_tokens > 0:
                 pair = self.block_manager.cow_block(seq, seq.num_cached_tokens)
                 if pair is not None:
                     self.cow_pairs.append(pair)
             if seq.num_cached_tokens + seq.num_scheduled_tokens == seq.num_tokens:
+                self.mark_prefill_started(seq)
                 seq.status = SequenceStatus.RUNNING
                 self.waiting.popleft()
                 self.running.append(seq)
             if num_tokens != 0:
+                self.mark_prefill_started(seq)
                 prefill_seqs.append(seq)
 
         if prefill_seqs and spec_rows:
             return prefill_seqs + spec_rows, "mixed"
         if prefill_seqs:
             return prefill_seqs, "prefill"
-        assert spec_rows
-        return spec_rows, "spec"
+        if spec_rows:
+            return spec_rows, "spec"
+        if self.running:
+            for seq in self.running:
+                if seq.draft_tokens is None:
+                    self._compute_draft(seq)
+            return self._schedule_spec()
+        return self._schedule_prefill()
 
     def _schedule_prefill(self) -> tuple[list[Sequence], str]:
         # 需要被调度的序列列表
         scheduled_seqs = []
         # 在prefill阶段需要处理的token数量
         num_batched_tokens = 0
+        slo_controls = self._slo_prefill_controls()
+        prefill_token_limit = (slo_controls[0]
+                               if self.slo_aware_scheduling or self._has_active_tpot_target()
+                               else self.max_num_batched_tokens)
+        prefill_row_limit = (slo_controls[1]
+                             if self.slo_aware_scheduling or self._has_active_tpot_target()
+                             else self.max_num_seqs)
+        self._record_slo_controls(slo_controls[0], prefill_row_limit)
 
         # prefill
-        while self.waiting and len(scheduled_seqs) < self.max_num_seqs:
+        while self.waiting and len(scheduled_seqs) < prefill_row_limit:
             seq = self.waiting[0]
-            remaining = self.max_num_batched_tokens - num_batched_tokens
+            remaining = min(self.max_num_batched_tokens - num_batched_tokens,
+                            prefill_token_limit - num_batched_tokens)
             if remaining == 0:
                 break
             # 判断当前序列是否占用KV Cache block块
@@ -369,11 +779,13 @@ class Scheduler:
             # 如果缓存的前缀token数量+当前调度的token数量等于总token数量，说明当前序列已经完成了prefill阶段，
             # 将其状态修改为RUNNING，加入decode序列当中
             if seq.num_cached_tokens + seq.num_scheduled_tokens == seq.num_tokens:
+                self.mark_prefill_started(seq)
                 seq.status = SequenceStatus.RUNNING
                 self.waiting.popleft()
                 self.running.append(seq)
             # 当前序列prefill如果未完成，再加入调度序列中
             if num_tokens != 0:
+                self.mark_prefill_started(seq)
                 scheduled_seqs.append(seq)
 
         if scheduled_seqs:
@@ -392,7 +804,7 @@ class Scheduler:
             while not self._dec_can(seq):
                 # 如果运行队列中还有其他序列，则中断当前序列，将其放回至等待队列中，释放其占用的资源
                 if self.running:
-                    self.preempt(self.running.pop())
+                    self._preempt_another_running()
                 else: # 否则，运行队列中没有其他队列，只能将自己释放，自己回退到等待队列
                     self.preempt(seq)
                     break
@@ -411,23 +823,80 @@ class Scheduler:
         self.running.extendleft(reversed(scheduled_seqs))
         return scheduled_seqs, "decode"
 
+    def _estimate_preemption_cost(self, seq: Sequence, num_swap_bytes: int
+                                  ) -> tuple[int, float, float]:
+        reusable_tokens = min(
+            seq.num_tokens,
+            self.block_manager.get_prefix_cached_tokens(seq),
+        )
+        recompute_tokens = max(1, seq.num_tokens - reusable_tokens)
+        recompute_seconds = recompute_tokens * self._prefill_seconds_per_token
+        swap_seconds = 2 * num_swap_bytes * self._swap_seconds_per_byte
+        return recompute_tokens, recompute_seconds, swap_seconds
+
+    def _preemption_plan(self, seq: Sequence) -> tuple[bool, int, float, float, int]:
+        required_bytes = (len(seq.block_table) * self._swap_bytes_per_block
+                          if self.kv_swap else 0)
+        can_swap = (self.kv_swap and not seq.is_prefill and seq.block_table
+                    and self._swap_bytes + required_bytes <= self._swap_max_bytes)
+        recompute_tokens, recompute_cost, swap_cost = self._estimate_preemption_cost(
+            seq, required_bytes)
+        use_swap = bool(can_swap and (
+            not self.recompute_aware_preemption or swap_cost < recompute_cost))
+        managers = [(self.block_manager, seq.block_table)]
+        if self.full_block_manager is not None:
+            managers.append((self.full_block_manager, seq.kv_table))
+        reclaimable = [
+            sum(manager.blocks[block_id].ref_count == 1 for block_id in table)
+            for manager, table in managers
+        ]
+        reclaimable_blocks = min(reclaimable, default=0)
+        selected_cost = swap_cost if use_swap else recompute_cost
+        return use_swap, recompute_tokens, recompute_cost, selected_cost, reclaimable_blocks
+
+    def _choose_preemption_victim(self, candidates) -> Sequence:
+        if not self.recompute_aware_preemption:
+            return candidates[-1]
+
+        plans = {seq: self._preemption_plan(seq) for seq in candidates}
+        useful = [seq for seq in candidates if plans[seq][4] > 0]
+        if useful:
+            candidates = useful
+
+        def score(seq: Sequence) -> tuple[float, float, float]:
+            _, _, _, cost, reclaimable = plans[seq]
+            retry_penalty = 1 + seq.preemption_count
+            adjusted_cost = cost * retry_penalty
+            unit_cost = adjusted_cost / max(1, reclaimable)
+            submitted = seq.t_submitted if seq.t_submitted is not None else perf_counter()
+            return unit_cost, adjusted_cost, -submitted
+
+        return min(candidates, key=score)
+
+    def _preempt_another_running(self) -> None:
+        victim = self._choose_preemption_victim(list(self.running))
+        self.running.remove(victim)
+        self.preempt(victim)
+
     def preempt(self, seq: Sequence):
         """抢占：KV 块不足时中断序列。
 
         - kv_swap 开启且序列 KV 完整（decode/spec 序列）→ **swap_out**：KV 拷到
-          pinned CPU、释放 GPU 块；恢复时直接换回（bit-exact，免重新 prefill）。
+          CPU、释放 GPU 块；恢复时直接换回（bit-exact，免重新 prefill）。
         - 否则（prefill 中途 / swap 关闭）→ **recompute**：释放块、回 waiting，
-          恢复时按前缀缓存重新 prefill（块哈希命中部分免算）。
+        恢复时按前缀缓存重新 prefill（块哈希命中部分免算）。
         """
         self.num_preemptions += 1
-        # can_swap：decode/spec 序列（KV 覆盖到 len-1，最后生成的 token 的 KV 本步才写——
-        # 换出拷贝已写入部分，恢复后最后 token 的 KV 由本步 decode 正常写入）。
-        # 不能用 cached == num_tokens（decode 序列恒差 1）；prefill 中途序列走 recompute
-        can_swap = (self.kv_swap and not seq.is_prefill and seq.block_table
-                    and self._swap_bytes < self._swap_max_bytes)
-        if can_swap:
+        seq.preemption_count += 1
+        use_swap, recompute_tokens, recompute_cost, swap_cost, _ = \
+            self._preemption_plan(seq)
+        if use_swap:
+            self.estimated_swap_seconds += swap_cost
             self.swap_out(seq)
         else:
+            self.num_recompute_preemptions += 1
+            self.recompute_tokens += recompute_tokens
+            self.estimated_recompute_seconds += recompute_cost
             seq.status = SequenceStatus.WAITING
             seq.is_prefill = True
             seq.draft_tokens = None  # 回waiting的序列下次以prefill行重新调度，草稿作废
@@ -455,7 +924,7 @@ class Scheduler:
         # → 缓冲只拷已分配的块（KV 已写入部分）；恢复后本步 decode 正常写最后 token
         # CPU 缓冲（不用 pin_memory：WSL2 下 GPU→pinned CPU 的大块 D2H 拷贝实测会
         # 崩 VM（cudaHostAlloc 支持有限）；普通 CPU 内存的 D2H/H2D 拷贝正确且稳定，
-        # 只是 H2D 略慢——swap 频率低，可接受）
+        # 只是 H2D 略慢——swap 频率低，可接受）。FP8 用 uint8 保存原始字节。
         # 布局与 kv_cache 一致：MHA [2, L, n, B, kvh, hd]；MLA fused [L, n, B, D]
         if self._swap_mla:
             buf = torch.empty(self._swap_layers, n_blocks, self.block_size,
@@ -465,7 +934,9 @@ class Scheduler:
                               self._swap_kv_heads, self._swap_head_dim,
                               dtype=self._swap_dtype)
         gpu_block_ids = list(seq.block_table)
-        self._swap_bytes += buf.numel() * buf.element_size()
+        actual_bytes = buf.numel() * buf.element_size()
+        assert actual_bytes == n_blocks * self._swap_bytes_per_block
+        self._swap_bytes += actual_bytes
         self._swap_buffers[seq.seq_id] = buf
         self.swap_pairs.append((seq, gpu_block_ids, buf, "out"))
         self.swapped.appendleft(seq)
@@ -479,11 +950,17 @@ class Scheduler:
         """KV swap 换入：重新分配私有 GPU 块，KV 从 CPU 拷回（bit-exact），直接 decode。"""
         seq.status = SequenceStatus.RUNNING
         seq.swapped = False
-        buf = self._swap_buffers.pop(seq.seq_id)
-        self._swap_bytes -= buf.numel() * buf.element_size()
+        # 拷贝完成前仍计入 host buffer 预算，避免同一步骤里先换入再换出
+        # 导致 CPU 缓冲峰值超过 kv_swap_space_gb。
+        buf = self._swap_buffers[seq.seq_id]
         self.block_manager.allocate_private(seq)  # 全新私有块（num_cached_tokens 保留）
         self.swap_pairs.append((seq, list(seq.block_table), buf, "in"))
         self.running.appendleft(seq)
+
+    def finish_swap_in(self, seq: Sequence):
+        """engine 完成 CPU→GPU 拷贝后释放 host buffer 并更新预算。"""
+        buf = self._swap_buffers.pop(seq.seq_id)
+        self._swap_bytes -= buf.numel() * buf.element_size()
 
     def _try_swap_in(self):
         """把 swapped 队列里 KV 足够的序列换回 GPU（free 块够一个换一个）。
@@ -510,24 +987,30 @@ class Scheduler:
         if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens >= seq.max_tokens:
             seq.status = SequenceStatus.FINISHED
             seq.t_completed = perf_counter()
-            self.block_manager.deallocate(seq)
+            self.block_manager.deallocate(seq, deferred=True)
             if self.full_block_manager is not None and seq.kv_table:
-                self.full_block_manager.deallocate(seq)
+                self.full_block_manager.deallocate(seq, deferred=True)
             self.running.remove(seq)
 
     def postprocess(self, seqs: list[Sequence], token_ids: list[int]):
         # 混合批次里prefill与decode序列并存：按各序列的is_prefill（调度器设置）分支
-        for seq, token_id in zip(seqs, token_ids):
-            self.block_manager.hash_blocks(seq, seq.is_prefill)
-            seq.num_cached_tokens += seq.num_scheduled_tokens
-            seq.num_scheduled_tokens = 0
-            if seq.is_prefill and seq.num_cached_tokens < seq.num_tokens:
-                continue
-            # 记录首个生成token的时间（用于TTFT统计），仅第一次追加时触发
-            if seq.t_first_token is None and seq.num_completion_tokens == 0:
-                seq.t_first_token = perf_counter()
-            seq.append_token(token_id)
-            self._maybe_finish(seq, token_id)
+        try:
+            for seq, token_id in zip(seqs, token_ids):
+                self.block_manager.hash_blocks(seq, seq.is_prefill)
+                seq.num_cached_tokens += seq.num_scheduled_tokens
+                seq.num_scheduled_tokens = 0
+                if seq.is_prefill and seq.num_cached_tokens < seq.num_tokens:
+                    continue
+                seq.record_output_timing()
+                seq.append_token(token_id)
+                self._maybe_finish(seq, token_id)
+        finally:
+            self._flush_deferred_frees()
+
+    def _flush_deferred_frees(self) -> None:
+        self.block_manager.flush_deferred_free()
+        if self.full_block_manager is not None:
+            self.full_block_manager.flush_deferred_free()
 
     def postprocess_spec(self, seqs: list[Sequence], token_lists: list[list[int]]):
         """投机步后处理：verify行按已接受token数更新缓存与哈希；prefill行同原逻辑。
@@ -536,28 +1019,29 @@ class Scheduler:
         不回滚（下一步覆盖即可），只截断逻辑长度；前缀缓存哈希只发布到接受长度
         （[num_tokens-n_acc-1, num_tokens-1)，追加后调用）——被拒token永不进哈希。
         """
-        for seq, tokens in zip(seqs, token_lists):
-            if seq.draft_tokens is not None:
-                n_acc = len(tokens)
-                if seq.t_first_token is None and seq.num_completion_tokens == 0:
-                    seq.t_first_token = perf_counter()
-                seq.append_tokens(tokens)
-                self.block_manager.hash_blocks(seq, False,
-                                               start=seq.num_tokens - n_acc - 1,
-                                               end=seq.num_tokens - 1)
-                seq.num_cached_tokens = seq.num_tokens
-                seq.num_scheduled_tokens = 0
-                seq.draft_tokens = None
-                self._maybe_finish(seq, tokens[-1])
-            else:
-                self.block_manager.hash_blocks(seq, seq.is_prefill)
-                seq.num_cached_tokens += seq.num_scheduled_tokens
-                seq.num_scheduled_tokens = 0
-                # 如果在prefill阶段，缓存的token数量小于总逻辑长度，说明序列的prefill阶段还没有结束
-                # 走到这步说明序列被分块处理了
-                if seq.is_prefill and seq.num_cached_tokens < seq.num_tokens:
-                    continue
-                if seq.t_first_token is None and seq.num_completion_tokens == 0:
-                    seq.t_first_token = perf_counter()
-                seq.append_token(tokens[0])
-                self._maybe_finish(seq, tokens[0])
+        try:
+            for seq, tokens in zip(seqs, token_lists):
+                if seq.draft_tokens is not None:
+                    n_acc = len(tokens)
+                    seq.record_output_timing(len(tokens))
+                    seq.append_tokens(tokens)
+                    self.block_manager.hash_blocks(seq, False,
+                                                   start=seq.num_tokens - n_acc - 1,
+                                                   end=seq.num_tokens - 1)
+                    seq.num_cached_tokens = seq.num_tokens
+                    seq.num_scheduled_tokens = 0
+                    seq.draft_tokens = None
+                    self._maybe_finish(seq, tokens[-1])
+                else:
+                    self.block_manager.hash_blocks(seq, seq.is_prefill)
+                    seq.num_cached_tokens += seq.num_scheduled_tokens
+                    seq.num_scheduled_tokens = 0
+                    # 如果在prefill阶段，缓存的token数量小于总逻辑长度，说明序列的prefill阶段还没有结束
+                    # 走到这步说明序列被分块处理了
+                    if seq.is_prefill and seq.num_cached_tokens < seq.num_tokens:
+                        continue
+                    seq.record_output_timing()
+                    seq.append_token(tokens[0])
+                    self._maybe_finish(seq, tokens[0])
+        finally:
+            self._flush_deferred_frees()

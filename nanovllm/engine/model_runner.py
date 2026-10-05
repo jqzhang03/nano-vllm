@@ -1,4 +1,6 @@
+import json
 import pickle
+from collections import OrderedDict
 import torch
 from torch import nn
 import torch.distributed as dist
@@ -9,30 +11,45 @@ from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.registry import get_model_class
 from nanovllm.layers.sampler import Sampler
-from nanovllm.utils.context import set_context, get_context, reset_context
+from nanovllm.utils.context import (
+    set_context, get_context, reset_context, restore_context,
+)
 from nanovllm.utils.loader import load_model
+from nanovllm.engine.kv_transfer import export_kv_cache, import_kv_cache
 
 
 class ModelRunner:
 
-    def __init__(self, config: Config, rank: int, event: Event | list[Event]):
+    def __init__(self, config: Config, rank: int, event: Event | list[Event],
+                 device: int | None = None):
         self.config = config
         hf_config = config.hf_config
         self.block_size = config.kvcache_block_size
         self.enforce_eager = config.enforce_eager
+        self.mixed_cudagraph_capture_count = 0
+        self.mixed_cudagraph_replay_count = 0
+        self.mixed_cudagraph_eager_fallbacks = 0
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
+        self.device = rank if device is None else device
 
-        # 初始化NCCL分布式进程组，所有GPU通过localhost:2333进行通信，用于张量并行时的命令执行
-        dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
-        torch.cuda.set_device(rank)
+        # 单卡运行不需要进程组；PD 模式会在同一进程内创建两个 TP=1 runner。
+        # 多卡张量并行仍由各 rank 初始化 NCCL 默认进程组。
+        if self.world_size > 1:
+            dist.init_process_group("nccl", "tcp://localhost:2333",
+                                    world_size=self.world_size, rank=rank)
+        torch.cuda.set_device(self.device)
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.dtype)
         torch.set_default_device("cuda")
         # 按 HF model_type 从注册表选模型类（多模型适配入口，见 models/registry.py）；
         # 引擎侧不再硬编码 Qwen3。
         model_class = get_model_class(hf_config.model_type)
+        # get_rope 使用进程级 lru_cache(1)。PD 的两个 runner 在同一进程、
+        # 不同 GPU 上构造相同模型时，先清掉缓存，避免第二个模型复用第一张卡的 RoPE 张量。
+        from nanovllm.layers.rotary_embedding import get_rope
+        get_rope.cache_clear()
         # 按层流式加载 + 即时量化：模型先在 meta 设备构造（0 显存），loader 逐
         # decoder layer 物化→加载→立即量化→释放 fp16（16GB 卡跑 7B+ 的前提）。
         # 自动触发阈值：fp16 权重估算超空闲显存 45%（7B≈14GB 必触发，0.6B 不触发）。
@@ -129,9 +146,12 @@ class ModelRunner:
             del self.graphs, self.graph_pool
             if hasattr(self, "spec_graphs"):
                 del self.spec_graphs, self.spec_graph_pool, self.spec_graph_vars
+            if hasattr(self, "mixed_graphs"):
+                del self.mixed_graphs, self.mixed_graph_pool
         torch.cuda.synchronize()
-        # 销毁分布式进程组，释放NCCL资源
-        dist.destroy_process_group()
+        # 单卡 / PD runner 不创建默认进程组。
+        if self.world_size > 1 and dist.is_initialized():
+            dist.destroy_process_group()
 
     def loop(self):
         # 无限循环执行任务，直到收到exit命令
@@ -167,12 +187,30 @@ class ModelRunner:
 
     # 统一的远程调用入口
     def call(self, method_name, *args):
+        torch.cuda.set_device(self.device)
         # 如果是张量并行且是主进程，先写入共享内存，再调用
         if self.world_size > 1 and self.rank == 0:
             self.write_shm(method_name, *args)
         # 根据方法名字符串动态获取对应的方法对象
         method = getattr(self, method_name, None)
         return method(*args)
+
+    def export_kv(self, block_ids: list[int], num_tokens: int) -> torch.Tensor:
+        """把某序列的 KV 按逻辑顺序整理为 CPU 张量，供 Decode runner 导入。"""
+        return export_kv_cache(self.kv_cache, block_ids, num_tokens,
+                               self.block_size, mla=self._kv_mla)
+
+    def import_kv(self, block_ids: list[int], num_tokens: int,
+                  rows: torch.Tensor) -> None:
+        """把 CPU KV 行写入 Decode runner 新分配的私有块。"""
+        import_kv_cache(self.kv_cache, block_ids, num_tokens,
+                        self.block_size, rows, mla=self._kv_mla)
+
+    def _kv_swap_payload(self, tensor: torch.Tensor) -> torch.Tensor:
+        """FP8 KV 在 CPU 上以 uint8 视图搬运，保留 E4M3 原始位模式。"""
+        if self.config.kv_cache_dtype == "fp8_e4m3" and tensor.dtype != torch.uint8:
+            return tensor.view(torch.uint8)
+        return tensor
 
     def cow_block(self, old_block_id: int, new_block_id: int):
         """COW：把旧块的KV内容复制到新块。
@@ -188,16 +226,21 @@ class ModelRunner:
             self.kv_cache[:, :, new_block_id] = self.kv_cache[:, :, old_block_id]
 
     def swap_out(self, block_ids: list[int], cpu_buffer: torch.Tensor):
-        """KV swap 换出：seq 的 GPU KV 块内容拷到 CPU pinned 缓冲（bit-exact）。
+        """KV swap 换出：GPU KV 块拷到 CPU 缓冲（bit-exact）。
 
         cpu_buffer 与 self.kv_cache 同布局（MHA [2, layers, n, B, kvh, hd] /
-        MLA [layers, n, B, kv_lora+rope]）；TP=1（swap 仅 TP=1 启用）。
+        MLA [layers, n, B, kv_lora+rope]）；FP8 缓冲为等形状 uint8。
         """
         if self._kv_mla:
             gpu = self.kv_cache[:, block_ids]          # [L, n, B, D]
         else:
             gpu = self.kv_cache[:, :, block_ids]       # [2, L, n, B, kvh, hd]
-        cpu_buffer.copy_(gpu)
+        payload = self._kv_swap_payload(gpu)
+        if payload.shape != cpu_buffer.shape or payload.dtype != cpu_buffer.dtype:
+            raise ValueError(
+                f"KV swap buffer has shape/dtype {tuple(cpu_buffer.shape)}/{cpu_buffer.dtype}, "
+                f"expected {tuple(payload.shape)}/{payload.dtype}")
+        cpu_buffer.copy_(payload)
         torch.cuda.synchronize()  # 确保换出完成（缓冲在 CPU 侧后续由调度器管理）
 
     def swap_in(self, block_ids: list[int], cpu_buffer: torch.Tensor):
@@ -208,15 +251,21 @@ class ModelRunner:
         **必须用 index_copy_ 原位写**：高级索引（list）返回临时副本，copy_ 只写
         副本不写回缓存（静默产生垃圾 KV）。
         """
+        src = cpu_buffer.to(device=self.kv_cache.device)
+        if self.config.kv_cache_dtype == "fp8_e4m3":
+            if src.dtype != torch.uint8:
+                raise ValueError(f"FP8 KV swap buffer must be uint8, got {src.dtype}")
+            src = src.view(self.kv_cache.dtype)
+        elif src.dtype != self.kv_cache.dtype:
+            src = src.to(dtype=self.kv_cache.dtype)
         if self._kv_mla:
             n = cpu_buffer.shape[1]
             ids = torch.tensor(block_ids[:n], device=self.kv_cache.device)
-            self.kv_cache.index_copy_(1, ids,
-                                      cpu_buffer.to(self.kv_cache.device))
+            self.kv_cache.index_copy_(1, ids, src)
         else:
             n = cpu_buffer.shape[2]
             ids = torch.tensor(block_ids[:n], device=self.kv_cache.device)
-            self.kv_cache.index_copy_(2, ids, cpu_buffer.to(self.kv_cache.device))
+            self.kv_cache.index_copy_(2, ids, src)
 
     def warmup_model(self):
         torch.cuda.empty_cache()
@@ -232,8 +281,9 @@ class ModelRunner:
         self.run(seqs, "prefill")
         torch.cuda.empty_cache()
         if self.config.kv_cache_dtype == "fp8_e4m3":
-            # FP8 KV缓存：用随机token的prefill前向校准每层K/V的固定scale
-            # （scale = max|·| / 448 * 安全系数；量化误差受E4M3的3位尾数限制）
+            # Use the configured token-ID corpus when provided; otherwise retain
+            # the deterministic random-token fallback. Scales are max|activation|
+            # / 448 * margin, with independent ranges for MHA K/V and MLA parts.
             self.calibrate_fp8_kv()
 
     def calibrate_and_quantize_w8a8(self):
@@ -498,31 +548,104 @@ class ModelRunner:
     def calibrate_fp8_kv(self):
         layers = [m for m in self.model.modules() if hasattr(m, "calibrating")]
         assert layers, "no attention layers found for FP8 KV calibration"
-        seq_len = min(self.config.max_num_batched_tokens, self.config.max_model_len)
-        num_seqs = min(self.config.max_num_batched_tokens // seq_len, self.config.max_num_seqs)
-        # 用常用token范围（id < 50000）校准：全词表随机会引入稀有token的激活异常值，
-        # 把scale撑大导致典型值量化变粗
-        vocab = min(self.config.hf_config.vocab_size, 50000)
-        rng = torch.Generator(device="cuda").manual_seed(42)
-        seqs = [Sequence(torch.randint(0, vocab, (seq_len,), generator=rng).tolist()) for _ in range(num_seqs)]
-        for seq in seqs:
-            seq.num_scheduled_tokens = seq_len
+        batches = self._fp8_calibration_batches()
         for m in layers:
+            for name in ("cal_max_k", "cal_max_v", "cal_c_max", "cal_r_max"):
+                if hasattr(m, name):
+                    setattr(m, name, 0.0)
             m.calibrating = True
-        self.run(seqs, "prefill")
-        for m in layers:
-            m.calibrating = False
-            if hasattr(m, "cal_c_max"):
-                # MLA fused 行：[c_kv | k̃_pe] 两段独立 scale（量级不同）
-                m.mla_c_scale = max(m.cal_c_max, 1e-6) / 448.0 * 1.1
-                m.mla_r_scale = max(m.cal_r_max, 1e-6) / 448.0 * 1.1
-                m.inv_c_scale = 1.0 / m.mla_c_scale
-                m.inv_r_scale = 1.0 / m.mla_r_scale
+        try:
+            for token_id_batches in batches:
+                seqs = [Sequence(token_ids) for token_ids in token_id_batches]
+                for seq in seqs:
+                    seq.num_scheduled_tokens = len(seq)
+                self.run(seqs, "prefill")
+        finally:
+            for m in layers:
+                m.calibrating = False
+        self.set_fp8_kv_scale_margin(self.config.kv_fp8_scale_margin)
+
+    def _fp8_calibration_batches(self) -> list[list[list[int]]]:
+        """Load real token-ID calibration prompts or make the legacy random fallback."""
+        if self.config.kv_calibration_path:
+            with open(self.config.kv_calibration_path, encoding="utf-8") as source:
+                payload = json.load(source)
+            if isinstance(payload, dict):
+                model_type = payload.get("model_type")
+                if model_type and model_type != self.config.hf_config.model_type:
+                    raise ValueError(
+                        f"FP8 KV calibration model_type {model_type!r} does not match "
+                        f"{self.config.hf_config.model_type!r}")
+                token_lists = payload.get("token_ids")
             else:
-                m.k_scale = max(m.cal_max_k, 1e-6) / 448.0 * 1.1
-                m.v_scale = max(m.cal_max_v, 1e-6) / 448.0 * 1.1
-                m.inv_k_scale = 1.0 / m.k_scale
-                m.inv_v_scale = 1.0 / m.v_scale
+                token_lists = payload
+            if not isinstance(token_lists, list) or not token_lists:
+                raise ValueError("FP8 KV calibration file must contain non-empty token_ids")
+            max_id = self.config.hf_config.vocab_size
+            max_prompt_tokens = min(self.config.max_model_len,
+                                    self.config.max_num_batched_tokens)
+            prompts = []
+            for index, token_ids in enumerate(token_lists):
+                if not isinstance(token_ids, list) or not token_ids:
+                    continue
+                if len(token_ids) > max_prompt_tokens:
+                    raise ValueError(
+                        f"FP8 KV calibration prompt {index} has {len(token_ids)} tokens, "
+                        f"above the calibration batch limit ({max_prompt_tokens}); "
+                        "shorten it or increase max_num_batched_tokens")
+                ids = [int(token_id) for token_id in token_ids]
+                if min(ids) < 0 or max(ids) >= max_id:
+                    raise ValueError(
+                        f"FP8 KV calibration prompt {index} has token IDs outside [0, {max_id})")
+                prompts.append(ids)
+            if not prompts:
+                raise ValueError("FP8 KV calibration file contains no usable prompts")
+        else:
+            seq_len = min(self.config.max_num_batched_tokens, self.config.max_model_len)
+            num_seqs = min(self.config.max_num_batched_tokens // seq_len,
+                           self.config.max_num_seqs)
+            # Legacy fallback uses common token IDs rather than rare full-vocabulary IDs.
+            vocab = min(self.config.hf_config.vocab_size, 50000)
+            rng = torch.Generator(device="cuda").manual_seed(42)
+            prompts = [torch.randint(0, vocab, (seq_len,), generator=rng).tolist()
+                       for _ in range(num_seqs)]
+
+        budget = max(1, self.config.max_num_batched_tokens)
+        batches: list[list[list[int]]] = []
+        current: list[list[int]] = []
+        current_tokens = 0
+        for prompt in prompts:
+            if current and (current_tokens + len(prompt) > budget
+                            or len(current) >= self.config.max_num_seqs):
+                batches.append(current)
+                current = []
+                current_tokens = 0
+            current.append(prompt)
+            current_tokens += len(prompt)
+        if current:
+            batches.append(current)
+        return batches
+
+    def set_fp8_kv_scale_margin(self, margin: float) -> None:
+        """Recompute FP8 KV scales from the recorded calibration maxima."""
+        from math import isfinite
+
+        if not isfinite(margin) or margin <= 0:
+            raise ValueError("FP8 KV scale margin must be a finite positive number")
+        layers = [m for m in self.model.modules() if hasattr(m, "calibrating")]
+        if not layers:
+            raise RuntimeError("no attention layers found for FP8 KV scale update")
+        for module in layers:
+            if hasattr(module, "cal_c_max"):
+                module.mla_c_scale = max(module.cal_c_max, 1e-6) / 448.0 * margin
+                module.mla_r_scale = max(module.cal_r_max, 1e-6) / 448.0 * margin
+                module.inv_c_scale = 1.0 / module.mla_c_scale
+                module.inv_r_scale = 1.0 / module.mla_r_scale
+            else:
+                module.k_scale = max(module.cal_max_k, 1e-6) / 448.0 * margin
+                module.v_scale = max(module.cal_max_v, 1e-6) / 448.0 * margin
+                module.inv_k_scale = 1.0 / module.k_scale
+                module.inv_v_scale = 1.0 / module.v_scale
 
     def _finalize_mla_mode(self):
         """MLA 模型（DeepSeek-V2 类）模式收尾：缓存类型识别 + decode 路径选择。
@@ -1160,8 +1283,16 @@ class ModelRunner:
                 hidden = self._spec_graph_hidden(input_ids, positions, s, cap, rows)
                 logits = self.model.compute_logits(hidden)
                 return (logits, hidden) if return_hidden else logits
+        if kind == "mixed":
+            if (not self.enforce_eager and self.config.mixed_cudagraph
+                    and self._mixed_graph_supported(input_ids)):
+                context = get_context()
+                hidden = self._mixed_graph_hidden(input_ids, positions, context)
+                logits = self.model.compute_logits(hidden)
+                return (logits, hidden) if return_hidden else logits
+            self.mixed_cudagraph_eager_fallbacks += 1
         # 只有纯decode批次且非强制eager且batch<=512时走CUDA graph；
-        # prefill与mixed批次一律eager（mixed含prefill行，无法用纯decode图）
+        # prefill与不支持的mixed批次走eager。
         if kind != "decode" or self.enforce_eager or input_ids.size(0) > 512:
             hidden = self.model(input_ids, positions)
             logits = self.model.compute_logits(hidden)
@@ -1285,6 +1416,107 @@ class ModelRunner:
                                     slot_mapping=slot_mapping, cu_seqlens_q=cu_seqlens_q,
                                     cu_seqlens_k=cu_seqlens_k, block_tables=block_tables,
                                     outputs=outputs)
+
+    def _mixed_graph_supported(self, input_ids: torch.Tensor) -> bool:
+        context = get_context()
+        return (context.is_mixed and not context.is_spec
+                and not self._mla_model and not self._rolling and not self._ring_split
+                and input_ids.numel() <= self.config.mixed_cudagraph_max_tokens
+                and context.chunk_starts is None
+                and context.mla_pre_starts is None
+                and context.mla_dec_starts is None
+                and context.full_block_tables is None
+                and context.full_prefill_block_tables is None
+                and context.full_slot_mapping is None
+                and context.cu_seqlens_q is not None
+                and context.cu_seqlens_k is not None
+                and context.slot_mapping is not None
+                and context.context_lens is not None
+                and context.context_lens.numel() <= 512
+                and context.block_tables is not None)
+
+    @staticmethod
+    def _mixed_graph_key(input_ids: torch.Tensor, context) -> tuple:
+        prefill_table_shape = (None if context.prefill_block_tables is None else
+                               tuple(context.prefill_block_tables.shape))
+        return (
+            tuple(input_ids.shape), tuple(context.cu_seqlens_q.shape),
+            tuple(context.cu_seqlens_k.shape), tuple(context.slot_mapping.shape),
+            tuple(context.context_lens.shape), tuple(context.block_tables.shape),
+            prefill_table_shape, context.n_prefill_tokens,
+            context.max_seqlen_q, context.max_seqlen_k,
+        )
+
+    @staticmethod
+    def _copy_mixed_graph_inputs(variables: dict, input_ids: torch.Tensor,
+                                 positions: torch.Tensor, context) -> None:
+        variables["input_ids"].copy_(input_ids)
+        variables["positions"].copy_(positions)
+        for name in ("cu_seqlens_q", "cu_seqlens_k", "slot_mapping",
+                     "context_lens", "block_tables"):
+            variables[name].copy_(getattr(context, name))
+        if context.prefill_block_tables is not None:
+            variables["prefill_block_tables"].copy_(context.prefill_block_tables)
+
+    @torch.inference_mode()
+    def _capture_mixed_graph(self, input_ids: torch.Tensor,
+                             positions: torch.Tensor, context) -> dict:
+        variables = {
+            "input_ids": torch.empty_like(input_ids),
+            "positions": torch.empty_like(positions),
+            "cu_seqlens_q": torch.empty_like(context.cu_seqlens_q),
+            "cu_seqlens_k": torch.empty_like(context.cu_seqlens_k),
+            "slot_mapping": torch.empty_like(context.slot_mapping),
+            "context_lens": torch.empty_like(context.context_lens),
+            "block_tables": torch.empty_like(context.block_tables),
+        }
+        if context.prefill_block_tables is not None:
+            variables["prefill_block_tables"] = torch.empty_like(
+                context.prefill_block_tables)
+        self._copy_mixed_graph_inputs(variables, input_ids, positions, context)
+
+        saved_context = context
+        set_context(
+            False,
+            variables["cu_seqlens_q"], variables["cu_seqlens_k"],
+            context.max_seqlen_q, context.max_seqlen_k,
+            variables["slot_mapping"], variables["context_lens"],
+            variables["block_tables"], is_mixed=True,
+            prefill_block_tables=variables.get("prefill_block_tables"),
+            n_prefill_tokens=context.n_prefill_tokens,
+        )
+        try:
+            self.model(variables["input_ids"], variables["positions"])
+            torch.cuda.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, self.mixed_graph_pool):
+                outputs = self.model(variables["input_ids"], variables["positions"])
+            torch.cuda.synchronize()
+            if self.mixed_graph_pool is None:
+                self.mixed_graph_pool = graph.pool()
+        finally:
+            restore_context(saved_context)
+        self.mixed_cudagraph_capture_count += 1
+        return {"graph": graph, "variables": variables, "outputs": outputs}
+
+    def _mixed_graph_hidden(self, input_ids: torch.Tensor,
+                            positions: torch.Tensor, context) -> torch.Tensor:
+        if not hasattr(self, "mixed_graphs"):
+            self.mixed_graphs = OrderedDict()
+            self.mixed_graph_pool = None
+        key = self._mixed_graph_key(input_ids, context)
+        entry = self.mixed_graphs.get(key)
+        if entry is None:
+            if len(self.mixed_graphs) >= self.config.mixed_cudagraph_max_graphs:
+                self.mixed_graphs.popitem(last=False)
+            entry = self._capture_mixed_graph(input_ids, positions, context)
+            self.mixed_graphs[key] = entry
+        else:
+            self.mixed_graphs.move_to_end(key)
+        self._copy_mixed_graph_inputs(entry["variables"], input_ids, positions, context)
+        entry["graph"].replay()
+        self.mixed_cudagraph_replay_count += 1
+        return entry["outputs"]
 
     # run流程：准备输入、运行模型、采样、返回生成的token id列表
     def run(self, seqs: list[Sequence], kind: str, return_logits: bool = False,

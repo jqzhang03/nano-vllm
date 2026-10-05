@@ -1,7 +1,7 @@
 # INTERVIEW.md — nano-vllm 总档（学习路线 · 面试串讲 · 基准档案）
 
 > **本文件是原 `BENCHMARKS.md` + `INTERVIEW.md` + `LEARNING.md` 三合一合并版**（2026-09-07）：
-> 重复内容只写一遍，数字统一到"现行结论 + 复测口径"，代码行号按当时 HEAD 实测校准。
+> 重复内容只写一遍。实现状态按 2026-10-05 源码校对；代码位置以核心符号定位，历史性能数据按原测试日期保留。
 > 原三文件已删除；git 历史保留旧版。
 >
 > **姊妹文件**：`note.md` = 个人时间线工作梳理（截止 2026-08-24 阶段 1.12，其踩坑故事编号
@@ -11,6 +11,12 @@
 > **全部数字带条件**：单卡 RTX 5060 Ti 16GB（Blackwell sm_120，36 SM）/ WSL2 Ubuntu /
 > conda `nano-vllm`（torch 2.8.0+cu128、triton 3.4.0、flash-attn 2.8.3.post1）/ bf16 /
 > Qwen3-0.6B 为主，除非另注模型。WSL 内存 11GB + 4GB swap（`C:\Users\admin\.wslconfig`）。
+>
+> **实现状态快照（2026-10-05）**：代码已包含 OpenAI 风格在线服务与 SSE、进程内会话文本/截断/可选摘要、每会话 prompt token 预算和累计前缀命中统计、持续请求接收、动态准入与背压、Top-W cache-affinity、aging、recompute-aware 抢占、TTFT SLO 感知调度与自适应 prefill 配额、TP=1 的 auto/FP8 KV CPU swap，以及实验性本机 PD 分离。Prefix feature context 只为 Top-W 排序/配额候选懒解析，并按 BlockManager 的 `kv_generation` 失效；`prefix_feature_cache=False` 可保留亲和策略但改为每次解析，作为独立消融。CPU 生命周期测试覆盖特征失效、LRU/容量淘汰、swap 释放、共享 deferred-free 提交与计数重置；benchmark 记录 parse/reuse、stale reparse、generation mutation、eviction 和 deferred-free 排队/提交引用数及峰值唯一块数/引用数。缓存回收优先消耗未缓存空闲块，再按真实缓存复用 LRU 淘汰空闲前缀块，完成批次的 deferred-free 在 postprocess 结束后统一提交。普通 MHA mixed Prefill/Decode batch 增加了按形状惰性捕获、有限 LRU 图缓存的 CUDA Graph，MLA、rolling/split 和 spec-mixed 路径继续 eager。新增 `benchmarks/context_concurrency.py` 提供并发 × 上下文长度压测和实际 KV 池容量账本；`benchmarks/kv_fp8_calibrate.py` 生成真实文本校准 token，并按 scale margin 对比 FP8 与 auto KV 的 held-out decode logits。准入估算 prompt 工作量、按最大输出长度和已完成请求的全局输出长度比例估算 decode 工作量，并结合实测 Prefill/Decode 速率、队列与 KV 压力；过载时有限时 FIFO 延迟，超时/硬上限时返回 429。KV 容量预测仍按最大输出上限保守预留。单卡 `auto` 选择 mixed；多卡只有在配置兼容时才选 PD。PD 仍是单进程、双模型/KV 池、主机内存交接和串行阶段执行。
+>
+> **本轮补充（2026-10-05）**：纯非投机 decode 可在一个 engine step 内连续执行最多 `max_decode_steps` 轮（默认 4），复用正常 KV 追加、COW、抢占及 CUDA Graph decode 路径；有 prefill 待处理时结束 burst。PD decode 同样支持 burst，并在独立 prefill 队列有剩余工作时让出。HTTP 请求和 `LLMEngine.add_request` 支持 `tpot_slo_ms`，也可设置 `default_tpot_slo_ms`；调度按请求观测的 token 间隔 EWMA 排 decode 优先级，并在 TPOT 压力升高时压低 prefill 配额。benchmark 记录 request TPOT 目标达成率、decode forward 数和 burst token 数；`benchmarks/scheduling_ablation.py` 增加了两个功能的单项消融。新实现尚未在 RTX 5060 Ti/WSL2 上验证收益，不作为性能结论。
+>
+> **当前限制**：混合 CUDA Graph、multi-step decode 与 TPOT 调度尚未在 RTX 5060 Ti/WSL2 上运行 benchmark；CUDA Graph 首次遇到每种形状会额外执行一次 eager warmup 和 capture，最多保留 `mixed_cudagraph_max_graphs` 种形状，超过 `mixed_cudagraph_max_tokens`（默认 4096）则 eager 回退。Multi-step 只覆盖纯非投机 decode，默认最多 4 轮；在线服务在 burst 结束后发送这段时间产生的 token，因此可能合并为一个 SSE 文本块。TPOT 调度是基于请求级 token 间隔 EWMA 的启发式目标，不保证硬 deadline。服务准入的输出长度比例是跨请求的全局 EWMA，未按请求类型区分；工作量预测尚未纳入前缀命中预测或按模型自动校准；Mixtral 未实现。PD 缺少异步 P/D 重叠、远端 worker/RDMA，且本机单卡环境不能验证多卡收益。历史性能表不作为新增策略的效果证明。
 >
 > **串讲三原则**：①先讲成本模型与上界，再讲实现；②主动交代"哪里亏、为什么"（比吹嘘可信）；
 > ③所有结论要么有探针证据、要么明确标注"未验证"。方法学信条：**跑通 ≠ 写对**。
@@ -28,7 +34,7 @@
 
 | 读什么 | 要点 |
 |---|---|
-| `CLAUDE.md` | 架构总览：请求生命周期、Context 单例契约、KV cache、前缀缓存/COW、调度、投机、CUDA graph、TP |
+| `CLAUDE.md` | 架构总览：请求生命周期、在线服务、Context 单例契约、KV cache/offload、调度、投机、CUDA graph、TP/PD |
 | 本档 §10.1 | TTFT/TPOT/E2E/p50/p99/SLO 的口径——后面所有数字都基于它 |
 | `AGENTS.md` | 模块组织、开发约定 |
 | `nanovllm/config.py` | 全部开关：quantization/speculative/kv_cache_dtype/int4_dense_path/awq_scales_path/rolling_cache……每个字段对应一个功能 |
@@ -101,11 +107,11 @@
 #### 1.4.1 FP8 KV cache（先看，注意力内核最独立）
 | 读什么 | 要点 |
 |---|---|
-| `model_runner.py` `calibrate_fp8_kv` | 随机 token 校准每层固定 scale（max/448×1.1；MLA 的 fused 行 [c_kv\|k̃_pe] 两段独立 scale） |
+| `model_runner.py` `calibrate_fp8_kv` | 支持 JSON token-ID 校准集并按预算分批；未提供文件时用随机 token；每层固定 scale = max/448×margin，MLA fused 行 [c_kv\|k̃_pe] 两段独立 scale |
 | `attention.py` `store_kvcache_kernel` | 写路径：fp32→fp8 cast **不饱和产生 NaN 位模式，必须 clamp(-448,448)**（§6 故事 1） |
 | `attention.py` `paged_decode_attention_fp8_kernel`（v6） | decode 内核：直接 fp8 load + 硬件 cvt 反量化、QPAD=16 MMA、GQA 融合、BLOCK_T=32/warps=1 |
 | `attention.py` `paged_varlen_attention_fp8_kernel`（v7） | 投机 verify 的多查询扩展（逐列因果掩码必须 `<=`，§6 故事 3） |
-| 配套 | `_fp8_kernel_check.py`、`_kernel_bench.py`、`accuracy_check.py`；§10.3.3 |
+| 配套 | `benchmarks/kv_fp8_calibrate.py`（真实文本 scale-margin 扫描、held-out 首个 decode logits、范围余量）及 `_fp8_kernel_check.py`、`_kernel_bench.py`、`accuracy_check.py`；§10.3.3 |
 
 #### 1.4.2 W8A8（int8 GEMM + SmoothQuant）
 | 读什么 | 要点 |
@@ -160,9 +166,14 @@
 | MoE（1.5） | `layers/moe.py`（`MoE`/`ExpertFFN`：2D per-expert 对齐 HF 存盘格式，router 永不量化）+ `models/qwen3_moe.py`/`deepseek_v2.py`（`DeepseekV2Moe`） | **已实现**：数学同构位级对照 + CPU 单测 + 端到端 parity top-1 100%（mean diff 0.003）；grouped 批量后端（§4.7） |
 | MLA（2a） | `layers/attention_mla.py` + `models/deepseek_v2.py`（fused [c_kv\|k̃_pe] 缓存、吸收式 decode 内核、共享 rope key） | **已实现**：decode 内核 vs 稠密参考位级 0 误差；引擎 parity top-1 100% |
 | 滚动环 / split（2b/2b-ext） | `config.py` `rolling_cache`；`block_manager.py` 环驱逐；双池（gemma2 交替窗口） | **已实现**：真实 Mistral-7B/gemma-2-2b-it/DeepSeek-V2-Lite 验证（§8 阶段 2） |
+| 在线服务 / 会话上下文 | `server.py`：OpenAI 风格 completions/chat、SSE、断连取消、会话 GET/DELETE、截断/摘要压缩 | **已实现**：文本会话默认最多 256 个、空闲 24h 过期；重启不持久化，摘要有损；KV 不跨轮保留 |
+| 动态准入与背压 | `server.py` `GenerationManager`：prompt 工作量、全局输出长度比例 EWMA、Prefill/Decode 吞吐 EWMA、队列/KV 压力；FIFO defer、超时 429 | **已实现，默认开启**：空闲时接收一个请求保证进展；硬队列上限 256、defer 上限 64、等待 2s；KV 预测按请求最大输出上限预留；`/health` 与响应暴露估算；`--no-dynamic-admission` 可消融；估算不含 prefix-cache 命中预测 |
+| 持续请求与调度策略 | `server.py` 单 engine worker；`scheduler.py` Top-W、aging、recompute-aware、TTFT/TPOT SLO、自适应分块/配额；`llm_engine.py` bounded multi-step decode；`block_manager.py` generation 失效与 deferred-free | **已实现，有消融脚本**：`benchmarks/scheduling_ablation.py` 对齐同一到达 trace，记录服务指标、request TPOT 目标达成、decode forward/burst token 数，以及 lazy-feature parse/reuse、stale reparse、generation mutation、LRU eviction、deferred-free queued/committed/peak；包含 `without_tpot_aware` 与 `without_multi_step_decode`。当前 checkout 尚无新策略的目标硬件实测结论；TPOT 是软目标启发式，不保证 deadline |
+| KV CPU swap / FP8 | `scheduler.py` 缓冲与抢占；`model_runner.py` 拷贝；`kv_transfer.py` P/D KV 布局交接 | **已实现**：TP=1 的 MHA/MLA、auto/FP8 KV；同步普通 CPU 内存，预算受限；TP>1 回退 recompute |
+| 执行模式自动选择 / PD | `config.py` / `llm_engine.py`：`auto|mixed|pd` | **已实现，PD 为实验性**：单卡 auto=mixed；兼容的多卡 auto=PD；TP>1、spec、rolling cache、非 auto KV 时 auto 回退 mixed；手动 PD 对不兼容配置报错 |
 | 按层流式加载 + 即时量化 | `loader.py` `load_model(streaming=True)`；`model_runner.py` `_decide_streaming`/`_streaming_quant_hook`/`_finalize_streaming` | **已实现**：Qwen2.5-7B 峰值 10.66GB / Llama-3.1-8B 11.62GB / Mistral-7B 11.37GB；自动触发 = fp16 估重 > 空闲显存 45% 且启用量化 |
 
-**卡点清单（未完成项，构造时报具体卡点）**：
+**卡点清单（未完成项或尚未验证的组合）**：
 
 | 模型/功能 | 需要的改动 | 卡点 / 依赖 |
 |---|---|---|
@@ -170,6 +181,9 @@
 | **rope_scaling 其余变体** | YaRN / linear / dynamic | 已支持：无操作（default）+ llama3 变体（波长分段，单元对照 HF 0 误差）；其余构造时报错 |
 | **滚动环 × KV swap / ring × medusa/eagle** | 组合验证与记账 | 断言关（§8 阶段 2 诚实边界）；KV swap × ring/split 未验证 |
 | **split 双池 CUDA graph** | gemma2 split 模式 decode 入图 | 现为 eager（动态 python 路径烘焙即错）；softcap 层禁 fp8 KV |
+| **准入估算校准** | 按模型/批大小拟合 service rate、识别前缀缓存命中、减少误拒和漏控 | 当前使用 token 数、全局输出长度 EWMA 和在线吞吐 EWMA 做启发式预测；需 `admission_ablation.py` 在目标 GPU 上校准 |
+| **multi-step decode / TPOT 调度** | 扩大支持到 mixed/spec decode、改善目标硬件效果 | 纯非投机 decode burst 与 request-level TPOT 排序/配额已实现；burst 上限默认 4、prefill 到来时让出；mixed/spec 仍单步。RTX 5060 Ti/WSL2 效果尚未实测，TPOT 是启发式软目标 |
+| **PD 生产化** | 异步重叠、远端 worker、网络/RDMA KV 传输、多卡基准 | 当前仅本地两卡、同步主机内存交接和串行阶段；单卡环境无法验证 |
 
 **流式加载的坑（阶段 7 特有，详见 §6 故事 9/10/18）**：①meta 物化必须 `to_empty`（torch 2.8 禁止 `.to()` 与 `set_data` 跨 meta）；②`to_empty` 替换 Parameter → 丢 `weight_loader`，须按模块重挂；③**计算型 buffer（RoPE `cos_sin_cache`）meta 上无数据 → `_finalize_streaming` 必须重建**；④tie 词表文件通常不含 `lm_head.weight` → 加载后重绑（先物化再 `weight.data =` 共享存储）；⑤**meta 计数构造会污染 `get_rope` 的共享实例 → 必须 `cache_clear()`**（2026-09 修复，§6 故事 18）。
 
@@ -182,7 +196,7 @@
 
 | 脚本 | 验证什么 | 何时跑 |
 |---|---|---|
-| `python -m pytest tests/ -q` | 调度/块管理/投机/注册表/layer_types 纯 Python 逻辑（**57 个用例**） | 任何引擎改动后 |
+| `python -m pytest tests/ -q` | 调度/块管理/投机/注册表/layer_types/KV 交接等 CPU 可测逻辑；用例数随测试扩充变化 | 任何引擎改动后 |
 | `benchmarks/_swa_probe.py` | SWA window/softcap 约定 + fp8 内核窗口掩码 vs torch 参考 | 动 attention.py / 内核后 |
 | `benchmarks/_parity.py <model>` | 新架构端口 vs HF 参考 logits（top-1 100% = 端口正确） | 新增/修改模型文件后 |
 | `benchmarks/_port_smoke.py <model> int4 --long` | 新模型 int4 冒烟 + 长上下文（跨 SWA 窗口） | 新增模型后 |
@@ -280,7 +294,8 @@
 三队列 WAITING/RUNNING/FINISHED；混合批次 = prefill 行在前、decode 行在后，共享
 `max_num_batched_tokens` 预算（vLLM V1 同款）；分块 prefill 只允许第一个被调度序列拆分；
 KV 块不足时抢占（decode/spec 序列优先 swap_out / 其余 recompute 回 waiting）；滚动/MLA
-模型的调度断言见 §8 阶段 2。
+模型的调度断言见 §8 阶段 2。在线服务持续将到达请求送入 engine；调度器可选 Top-W 前缀亲和、aging
+公平性、recompute-aware 抢占，以及按请求 TTFT slack、队列长度和实测 prefill 速度调整的配额。
 
 **必问必答**：
 - **Q：混合批次为什么赢？** A：早完成 prefill 的请求立即 decode，消除死等；decode 提前释放
@@ -291,14 +306,12 @@ KV 块不足时抢占（decode/spec 序列优先 swap_out / 其余 recompute 回
 - **Q：抢占后怎么恢复？** A：recompute = 回 waiting + 释放块，恢复时按前缀缓存哈希命中部分免算；
   swap = KV 拷 CPU、释放块、进独立 swapped 队列，恢复时直接 decode（免 prefill）。草稿作废。
 - **Q：MoE/MLA/滚动模型对调度有什么影响？** A：MoE 动态路由形状不能入 CUDA graph → eager；
-  MLA 的纯 int4/fp8 decode 走稠密兜底（动态 python 路径）→ eager + 免图；滚动模型停用前缀
-  缓存发布/消费（内容过期，refcount 守卫断言）。
+  MLA kv_b 的 int4/fp8 路径保留小份 `w_deq` 视图，维持吸收式 decode；没有 float 视图的量化兜底
+  （如 w8a8/sparse24）会触发 MLA 稠密路径/eager。滚动模型停用前缀缓存发布/消费（内容过期，refcount 守卫断言）。
 
 **数字**：混合调度吞吐全档 +7.2%~+21.3%；抢占 384 档 31→20、512 档 141→71；256 档峰值
-5840 tok/s（fp16，§10.3.2）。**诚实结论**：调度是"V1-style 简化版"——没有 SLO 感知优先级、
-没有 multi-step decode、没有 PD 分离（§8 阶段 3 待办）。**追问应对**：被问"生产调度还缺什么"
-→ 答 SLO（TTFT/TPOT 目标）、优先级队列、multi-step、preemption 策略参数化（swap vs recompute
-成本模型）。
+5840 tok/s（fp16，§10.3.2，早期基准）。后续加入的在线调度策略有 `benchmarks/scheduling_ablation.py`
+做同 trace 消融，但尚无本 checkout 的实测结果。**诚实边界**：TTFT 按 deadline slack 排序；TPOT 按已观测 token 间隔 EWMA 排序，并在压力升高时压低 prefill 配额，但只是软目标启发式。Multi-step decode 默认最多连续 4 轮，只在纯非投机 decode 窗口运行，prefill 到来时让出；该窗口内 SSE token 会成组交付。服务准入用 token 数、在线吞吐和 KV/队列压力估算后接收或 FIFO 延迟，达到等待预算或硬上限时返回 429，预测尚未感知前缀缓存命中。两项新调度策略尚无目标硬件实测结果。**追问应对**：用相同到达 trace 对比 baseline、all-on 和各单项移除结果，并检查 TPOT 目标达成率、TTFT、吞吐及 burst forward 数。
 
 ### 4.2 KV cache 与内存管理（paged / 前缀缓存 / COW / 分块 prefill / KV swap / 滚动环）
 
@@ -308,6 +321,8 @@ KV 块不足时抢占（decode/spec 序列优先 swap_out / 其余 recompute 回
 swapped 队列 + CPU 非 pinned 缓冲 + `kv_swap_space_gb` 预算；**滚动环**（`rolling_cache`）：
 块表 = 窗口内容清单（`Sequence.kv_j0` 行首逻辑块序号），驱逐 `(front+1)·B ≤ N−W−slack`
 先释放再分配（净零 free 消耗），环模型块恒私有（不发布/消费前缀缓存）→ refcount 守卫断言。
+KV swap 支持 TP=1 的 MHA/MLA 缓存，KV dtype 为模型原生 `auto` 或 FP8 E4M3；FP8 在 CPU 侧用
+`uint8` 保存原始字节。拷贝是同步普通主机内存传输，且受 `kv_swap_space_gb` 限制；TP>1 回退 recompute。
 
 **必问必答**：
 - **Q：paged attention 与 vLLM 的差异？** A：块大小 256 vs vLLM 16（内部碎片与哈希粒度不同）；
@@ -326,12 +341,13 @@ swapped 队列 + CPU 非 pinned 缓冲 + `kv_swap_space_gb` 预算；**滚动环
   位置）→ 需要自研 paged decode 内核 + varlen 环装配；滚动模型不参与前缀缓存（重复 prompt 有
   代价，见 config 注释与 §8 阶段 2）。
 
-**数字**：前缀缓存跨批次 prefill 降为 0 token/0 步；FP8 KV 容量 1.9×（421→802 块）；KV swap
-bit-exact 0 误差、96×512 压力 699 次换出、27.8s vs recompute 11.8s；滚动环真实 Mistral-7B
+**数字**：前缀缓存跨批次 prefill 降为 0 token/0 步；FP8 KV 容量 1.9×（421→802 块）；旧版 KV swap
+测量 bit-exact 0 误差、96×512 压力 699 次换出、27.8s vs recompute 11.8s；滚动环真实 Mistral-7B
 5050-token（>W=4096）环 vs 掩码 fp8 KV **全程逐位一致**，真实 gemma-2-2b-it split 环池表长
 到 cap(18) 封顶而 full/掩码继续线性增长（§8 阶段 2）。
-**诚实结论**：滚动环 × KV swap 组合未验证（断言关）；环 decode 无 CUDA graph（eager）；
-split 双池仅 bf16/无投机。**追问应对**：被问"前缀缓存怎么失效"→ 内容哈希链式、被拒草稿永不进
+**诚实结论**：Mistral 统一窗口 rolling decode 可用 CUDA Graph；rolling+ngram verify 支持但走 eager；
+Gemma-2 split 双池仅 auto KV、无投机、无 KV swap，decode eager；KV swap × rolling/split 尚未验证。
+**追问应对**：被问"前缀缓存怎么失效"→ 内容哈希链式、被拒草稿永不进
 哈希（投机）、COW 副本重新发布哈希、滚动模型整体退出。
 
 ### 4.3 CUDA 内核与性能工程（Triton 内核 + CUDA graph + roofline 归因）
@@ -359,11 +375,12 @@ split 双池仅 bf16/无投机。**追问应对**：被问"前缀缓存怎么失
   N≥16，8× 计算浪费换内存效率——decode 是 memory-bound）；④BLOCK_T=32/warps=1（跨 warp 归约
   顺序变化放大误差）。归因：有效 KV 读带宽 517-529 GB/s（超过 copy 370 的双向口径）。
 - **Q：CUDA graph 的坑？** A：形状必须静态（按容量族）；共享内存池避免碎片；spec 图用尾部重复
-  cu_seqlens 的空行填充（bit-exact 用 probe 验证过）；MLA/滚动模型跳过图（动态 python 路径
-  烘焙即错）。
+  cu_seqlens 的空行填充（bit-exact 用 probe 验证过）；只有特定动态图路径需 eager：MLA 的稠密兜底、
+  Gemma-2 split 双池；Mistral rolling decode 和覆盖容量族的纯 spec（含 FP8 KV）有 graph 路径，
+  mixed/超容量 spec 会回退 eager。
 - **Q：MLA decode 内核的形态？** A：吸收式：W_UK 折进 q（q_abs）、W_UV 折进输出——每 token
-  只读 fused 576 元素而非重建稠密 K/V；纯 int4/fp8 的 kv_b 无 float 视图时回退稠密兜底
-  （逐层整段缓存稠密化，正确性等价、带宽优势消失，eager）。
+  只读 fused 576 元素而非重建稠密 K/V；kv_b 对 int4/fp8 特意保留小型 `w_deq` 视图（约占参数
+  1%），因此纯 int4/fp8 可继续走吸收式路径；w8a8/sparse24 等无 float 视图的路径仍回退稠密兜底并强制 eager。
 
 **数字**：硬件锚点 TC 48.5 TFLOPS / 带宽 370 GB/s / 36 SM / SMEM 100KB；手写 MatMul 101%
 cuBLAS；int4 gate_up M=8 4.36×、lm_head 3.42×、down_proj 0.40×；fp8 权重 K=4096 M=8 4.22×、
@@ -462,13 +479,15 @@ TP 用 NCCL + 共享内存命令通道（weight_loader 分片 + all_reduce）；
 - **Q：transformers 5.15 的坑？** A：DeepseekV2 无缓存前向不传因果掩码（对照只能取末行/显式掩码）；
   experts 内存 3D 存盘 2D（`use_experts_implementation`）；**MoE grouped 路径的 `torch._grouped_mm`
   仅 sm_90**（CC 9.0）→ sm_120 无法 HF-GPU 直连做真权重对照（记录在案，用 nano fp16 稠密参考）。
-- **Q：TP 为什么没实测多卡？** A：单卡环境；实现完整（weight_loader 分片 + NCCL 命令通道 +
-  序列跨进程），multi-GPU 验证是已知空白。
+- **Q：TP 为什么没实测多卡？** A：当前开发环境只有单卡；TP 路径包含 weight_loader 分片、NCCL
+  命令通道和跨进程序列传递，但本机没有 multi-GPU 性能/稳定性数据。独立的 PD 路径已经实现为实验性
+  模式，仍只支持兼容配置下的本地双卡同步 KV 交接。
 
 **数字**：Qwen2.5-7B int4 峰值 10.66GB / Llama-3.1-8B 11.62GB / Mistral-7B 11.37GB；parity：
 qwen2.5-0.5B top-1 100%（mean 0.096）、mistral 100%（0.014）、gemma2 100%（0.022）；DeepSeek-V2
-4 层真权重切片引擎 vs 稠密参考 0 失配（§8 阶段 2）。**诚实结论**：PP/DP/EP 未实现；TP 未实测；
-CacheBlend、PD 分离只在文档里设计过（§8 阶段 5）。
+4 层真权重切片引擎 vs 稠密参考 0 失配（§8 阶段 2）。**诚实结论**：TP 有代码但当前单卡环境未做
+多卡验证；PP/DP/EP 模型并行未实现；CacheBlend 未实现。PD 已有本地实验性路径，但限 TP=1、双卡、
+KV dtype=auto、无 speculative/rolling cache，且主机内存 KV 交接与两阶段执行均为同步串行。
 
 ### 4.7 MoE（router + 循环专家 + grouped 后端 + 量化专家）——阶段 1.5
 
@@ -531,12 +550,17 @@ W_UK→q（q_abs）、W_UV→输出，每 token 只读 576 元素，重建不出
 5.15 同权重 top-1 100%（max 1e-6）；引擎 prefill/decode parity top-1 100%（mean 0.003-0.03）；
 真实 DeepSeek-V2-Lite 27 层流式 int4：启动 55s、权重 ~5GB 常驻（int4 + kv_b w_deq 113MB）、
 decode ~2.8 tok/s（3 并发、MoE eager、纯 int4）、中英连贯（§8 阶段 2b-ext 完整表）。
-**诚实边界**：fp8 KV×MLA 只在 toy 验证（真实 V2-Lite 未跑 fp8 KV）；ring+medusa/eagle 断言关；
-gemma2 split 仅 bf16/无投机/eager；KV swap×ring 未验证；MLA spec（投机 verify 吸收）未做。
+**诚实边界**：fp8 KV×MLA 的组合路径有 toy 覆盖，但真实 V2-Lite 尚未测 FP8 KV；ring+medusa/eagle
+断言关；Gemma-2 split 仅 auto KV/无投机/无 swap/eager；KV swap×rolling 尚未验证；MLA spec
+（投机 verify 的吸收式路径）未做。
 **追问应对**：被问"V3/V3.1 的 MLA 变体"→ 官方 576 口径推导、多 token 预测（MTP）未实现、EP 专家
 并行理论（§8 阶段 5）。
 
-## 5. 数字速查（全部带条件：RTX 5060 Ti 16GB / WSL2 / bf16 / 单卡；未注日期者为最近复测）
+## 5. 数字速查（归档实测；条件：RTX 5060 Ti 16GB / WSL2 / bf16 / 单卡）
+
+以下数值来自表中标明的旧 workload/日期，主要早于在线服务与新调度策略；它们仍可说明当时的内核和
+引擎形态，但不能代表 2026-10 当前代码，也不能用于宣称新策略带来收益。新策略请使用 §10.2 的
+`scheduling_ablation.py` 对相同请求 trace 做对照。
 
 | 项 | 数字 | 条件 |
 |---|---|---|
@@ -566,7 +590,6 @@ gemma2 split 仅 bf16/无投机/eager；KV swap×ring 未验证；MLA spec（投
 | 滚动环（2b） | 稳态 KV = 窗口+B/seq；真实 Mistral-7B 5050-token 环 vs 掩码 fp8 **逐位一致** | 环表 ≤ cap；滚动模型停用前缀缓存 |
 | split 双池（2b-ext） | gemma-2-2b-it 真实 split：环池 cap 18 封顶 vs full/掩码线性增长；30/30 稀疏步 | 仅 bf16/无投机/eager；softcap 层禁 fp8 KV |
 | 精度方法论 | 8-prompt KL 与 ppl 结论相反 → 用 3000+ token 困惑度；语料随机 → 只比同批 | 样本量决定结论方向 |
-| pytest | **57 passed**（2026-09-07） | 纯 Python（调度/块管理/投机/注册表） |
 
 ---
 
@@ -734,18 +757,24 @@ clamp±448、内核与稠密装配双路反量化）；② 投机(ngram)+环：B
 **顺带修复的真实 bug**：MLA decode 内核真实尺寸共享内存超限（BLOCK_T 32→16/warps 8）；int4
 内核 K 尾块漏算（10944=64×171 丢 64 列 → logits 漂移+NaN，掩码修复）；streaming 判定 meta
 实建数参数（旧通用公式漏 MoE/MLA 专家 → 曾把 33GB 当小模型直建 OOM）。
-**诚实边界（现行）**：gemma2 split 仅 bf16/无投机/eager decode（softcap 层禁 fp8 KV；双池
-CUDA graph 未实现）；ring+medusa/eagle 断言关；滚动模型停用前缀缓存（重复 prompt 代价）；
-KV swap×ring/split 未验证；fp8 KV×MLA 只在 toy 验证（真实模型未跑）；fp8 权重×MLA 与 kv_b
+**诚实边界（现行）**：Gemma-2 split 双池仅 auto KV、无投机/无 KV swap、decode eager（softcap 层禁
+fp8 KV；双池 CUDA graph 未实现）；ring+medusa/eagle 断言关；滚动模型停用前缀缓存（重复 prompt 代价）；
+KV swap×ring/split 未验证；fp8 KV×MLA 的组合路径有 toy 覆盖（真实 V2-Lite 尚未测 FP8 KV）；fp8 权重×MLA 与 kv_b
 同机制但无单独探针；真实模型对照的采样步一致性受"异内核数值差在近并列处翻转"限制（同内核
 位级、异内核 top-1 噪声带内，用稀疏步手工参考论证）；transformers 5.15 MoE `torch._grouped_mm`
 仅 sm_90 → 本机无 HF-GPU 直连真权重对照（nano fp16 稠密参考替代）。
 
-### 阶段 3：调度系统深读（vLLM V1 源码对照 + SLO + multi-step decode）——**第三**
-**为什么第三**：调度是 vLLM 面试核心话题；我们的实现是"V1-style 简化版"，逐行读 vLLM 找差距 =
-把概念钉死（不需要 GPU）。**具体动作**：①读 vLLM V1 scheduler/block_manager/preemption 源码，
-产出"vLLM vs nano"逐项差距表；②实现 SLO-aware 优先级调度（TTFT/TPOT 目标约束 + 优先级队列）；
-③multi-step decode（一次调度多步 decode，减少 kernel 启动与 CPU 空转）。
+### 阶段 3：在线服务与延迟感知调度——✅ 核心功能已实现；新 decode 策略待目标硬件测量
+**已交付**：OpenAI 风格 HTTP 服务、SSE 流式输出、断连取消、持续接收请求、进程内会话文本存储与
+token-budget 截断/可选摘要；Top-W cache-affinity admission、aging 公平性、recompute-aware 抢占；按
+TTFT slack 调整 prefill 分块与 decode/prefill 配额；request-level TPOT slack 排序与 decode 优先配额；
+纯非投机 decode 的 bounded multi-step burst（默认最多 4 轮，prefill 待处理时让出）。
+`benchmarks/scheduling_ablation.py` 使用共享请求 trace 做 baseline/all-on/逐项消融并输出 JSON，
+包含 `without_tpot_aware` 与 `without_multi_step_decode`。
+动态准入与背压也已实现：按 prompt token、请求最大输出 token 与已完成请求的全局输出长度 EWMA 估算 Prefill/Decode 工作量，并结合在线吞吐、队列和预计 KV 占用估算压力；低压力请求立即接收，超压请求进入有界 FIFO 等待，超时或达到硬上限时拒绝。KV 容量仍按最大输出 token 保守预留。`benchmarks/admission_ablation.py` 用相同到达 trace 对比准入开关，并输出接收/延迟/拒绝、TTFT、E2E 和吞吐 JSON。
+**待补**：把 multi-step 扩展到 mixed/spec decode 的安全调度边界；验证 multi-step 与 TPOT-aware 调度在
+WSL2/RTX 5060 Ti 上的 TTFT、TPOT、吞吐和公平性影响；增加前缀缓存感知及按模型校准的准入工作量模型。
+已有历史吞吐数字不能证明新增策略的收益，需运行当前 checkout 的消融脚本后再更新结论。
 
 ### 阶段 4：量化/稀疏算法层（GPTQ 误差补偿 + 剪枝感知）——**第四**
 **为什么第四**：现有量化是应用层，补算法层才能答"为什么 AWQ 有效、2:4 怎么不丢精度、GPTQ 和
@@ -764,89 +793,112 @@ RTN 差在哪"。**动作**：①GPTQ（Hessian 逆 + 逐列误差补偿）在 0
 - 论文：FlashAttention、MLA 原论文、PD 分离/Mooncake、GPTQ/AWQ/SmoothQuant、Megatron 1F1B/
   DeepSeek MoE。
 
-## 9. 代码地图（功能 → 文件 → 行号 + 运行链；行号为 2026-09-07 实测）
+## 9. 代码地图（功能 → 文件和核心符号 → 运行链；行号不作为稳定定位）
 
-### 9.1 文件地图（谁是谁，行号可直接跳转）
+### 9.1 文件地图（按核心符号定位）
 
-| 文件 | 职责 | 核心锚点（行号实测） |
+| 文件 | 职责 | 核心符号（行号不固定） |
 |---|---|---|
 | `nanovllm/llm.py` | 公共 API 入口 | `LLM`（纯别名，没逻辑） |
-| `nanovllm/config.py` | 引擎配置解析 | `Config` L7（字段注释 = 功能词典；`__post_init__` 断言合法性） |
+| `nanovllm/config.py` | 引擎配置解析 | `Config` （字段注释 = 功能词典；`__post_init__` 断言合法性） |
 | `nanovllm/sampling_params.py` | 采样参数 | `SamplingParams`（禁 greedy） |
-| `nanovllm/engine/llm_engine.py` | **引擎主循环** | `LLMEngine` L17：`add_request` L53 / `_verify` L61 / `_medusa_drafts` L100 / `_eagle_drafts` L145 / `step` L204 / `generate` L291 / `collect_metrics` L354 |
-| `nanovllm/engine/scheduler.py` | **调度器** | `Scheduler` L12：`schedule` L109 / `_compute_draft` L168 / `_schedule_mixed` L189 / `_spec_rows` L251 / `_schedule_spec` L294 / `_schedule_mixed_spec` L300 / `_schedule_prefill` L338 / `_schedule_decode` L384 / `preempt` L414 / `swap_out` L440 / `swap_in` L478 / `_try_swap_in` L488 / `_maybe_finish` L505 / `postprocess` L518 / `postprocess_spec` L532 |
-| `nanovllm/engine/sequence.py` | 序列状态（CPU 侧真源） | `SequenceStatus` L8、`Sequence` L15（`kv_table` 滚动/全池表；`__getstate__` L99） |
-| `nanovllm/engine/block_manager.py` | **KV 块池 + 前缀缓存 + COW + 滚动环** | `Block` L8、`BlockManager` L26：`_t` L63 / `ring_cap` L68 / `_evict_front` L79 / `compute_hash` L93 / `can_allocate` L118 / `allocate` L154 / `allocate_private` L184 / `deallocate` L214 / `can_append` L225 / `can_append_spec` L241 / `may_append_spec` L276 / `cow_block` L297 / `may_append` L319 / `hash_blocks` L330 |
-| `nanovllm/engine/model_runner.py` | **打包 + GPU 执行** | `ModelRunner` L16：`call` L169（TP）/ `cow_block` L177 / `swap_out` L190 / `swap_in` L203 / `warmup_model` L221 / `quantize_int4_weights` L286 / `quantize_fp8_weights` L296 / `prune_sparse24` L306 / `quantize_awq_weights` L311 / `_decide_streaming` L369（meta 计数 + `cache_clear`）/ `_streaming_quant_hook` L409 / `_finalize_streaming` L470 / `calibrate_fp8_kv` L492 / `_finalize_mla_mode` L521 / `_finalize_rolling` L547 / `allocate_kv_cache` L599 / `_ring_rows` L745 / `prepare_prefill` L783 / `prepare_mixed` L846 / `prepare_spec` L944 / `_prepare_mixed_spec` L1009 / `prepare_decode` L1086 / `run_model` L1140 / `_spec_graph_hidden` L1197 / `capture_spec_graph` L1226 / `run` L1284 / `capture_cudagraph` L1313 |
-| `nanovllm/engine/ngram.py` | n-gram 投机（纯函数） | `find_ngram_draft` L15、`verify_drafts` L54 |
-| `nanovllm/models/registry.py` | 按 model_type 选模型 | `get_model_class` L49；`_PLANNED_BLOCKERS` L38 |
-| `nanovllm/models/*.py` | 7 个模型族（同构模板） | qwen3 L14/107/139/185/212 · qwen2 L15/105/137/182/209 · llama3 L16/111/143/188/215 · mistral L18/97/126/168/192 · gemma2 L62/131/149/189/219 · qwen3_moe L35/51/100/119 · deepseek_v2 L40/59/90/137/158（Attention/MLP/DecoderLayer/Model/ForCausalLM）；`compute_logits` 各 ForCausalLM 末尾（qwen3.py:243） |
-| `nanovllm/layers/attention.py` | **注意力：写 KV + flash/自研内核路由** | `store_kvcache_kernel` L17 / `store_kvcache` L39 / fp8 decode 内核 L50 / `kv_rows_gather` L161 / `paged_decode_attention_fp8` L189 / `paged_decode_attention_bf16` L216 / fp8 varlen 内核 L241 / `paged_varlen_attention_fp8` L309 / `Attention` L333（`forward` L377、`_ring_varlen` L482、`_decode_rows` L510） |
-| `nanovllm/layers/attention_mla.py` | **MLA（DeepSeek）** | `mla_store` L69 / `mla_gather_dequant` L121 / `mla_decode_kernel` L154 / `mla_decode_attention` L212 / `MLAAttention` L249（`forward` L464、`_decode_rows` L554、`_decode_kernel` L580） |
-| `nanovllm/layers/linear.py` | **全部 GEMM + 量化** | int8 内核 L24 / w8a8 L74 / int4 内核 L98 / int4_gemm L160 / sparse24 内核 L193 / sparse24_gemm L258 / fp8 激活量化 L286 / fp8 内核 L308 / fp8_gemm L356 / `WeightQuantMixin` L382（quantize_int4 L396、_int4_forward L441、quantize_fp8 L458、quantize_sparse24 L508）/ `LinearBase` L540（quantize_w8a8 L567、forward L610）/ Column L639 / Merged L669 / QKV L689 / Row L724 |
-| `nanovllm/layers/moe.py` | **MoE（1.5）** | `ExpertFFN` L34 / `MoE` L51（`_route` L90、forward L134、`_forward_loop` L140、`_forward_grouped` L169、`reference` L217） |
-| `nanovllm/layers/medusa.py` / `eagle.py` | 投机草稿头 | `MedusaHeads` L39 / `EagleLayer` L46 |
-| `nanovllm/layers/layernorm.py` / `rotary_embedding.py` / `activation.py` / `sampler.py` | 基础算子 | `RMSNorm`（含 weight_offset 变体）/ `RotaryEmbedding` L69（build_cache L98、forward L121）/ `get_rope` L148（**@lru_cache(1) 共享实例——meta 污染教训 §6 故事 18**）/ `SiluAndMul` / `Sampler`（Gumbel） |
-| `nanovllm/layers/embed_head.py` | Embedding + LM Head | `VocabParallelEmbedding` L10 / `ParallelLMHead` L46（继承 WeightQuantMixin） |
-| `nanovllm/utils/context.py` | **每步张量契约** | `Context` L6 / `get_context` L45 / `set_context` L48（位置传参，**新字段必须追加末尾**）/ `reset_context` L68 |
-| `nanovllm/utils/loader.py` | 权重加载 | `default_weight_loader` L8 / `load_model` L42 / `_load_eager` L64 / `_materialize` L78 / `_load_streaming` L95 |
+| `nanovllm/engine/llm_engine.py` | **引擎主循环** | `LLMEngine` ：`add_request`  / `_verify`  / `_medusa_drafts`  / `_eagle_drafts`  / `step`  / `generate`  / `collect_metrics`  |
+| `nanovllm/engine/scheduler.py` | **调度器** | `Scheduler` ：`schedule`  / `_compute_draft`  / `_schedule_mixed`  / `_spec_rows`  / `_schedule_spec`  / `_schedule_mixed_spec`  / `_schedule_prefill`  / `_schedule_decode`  / `preempt`  / `swap_out`  / `swap_in`  / `_try_swap_in`  / `_maybe_finish`  / `postprocess`  / `postprocess_spec`  |
+| `nanovllm/engine/sequence.py` | 序列状态（CPU 侧真源） | `SequenceStatus` 、`Sequence` （`kv_table` 滚动/全池表；`__getstate__` ） |
+| `nanovllm/engine/block_manager.py` | **KV 块池 + 前缀缓存 + COW + 滚动环** | `Block` 、`BlockManager` ：`_t`  / `ring_cap`  / `_evict_front`  / `compute_hash`  / `can_allocate`  / `allocate`  / `allocate_private`  / `deallocate`  / `can_append`  / `can_append_spec`  / `may_append_spec`  / `cow_block`  / `may_append`  / `hash_blocks`  |
+| `nanovllm/engine/model_runner.py` | **打包 + GPU 执行** | `ModelRunner` ：`call` （TP）/ `cow_block`  / `swap_out`  / `swap_in`  / `warmup_model`  / `quantize_int4_weights`  / `quantize_fp8_weights`  / `prune_sparse24`  / `quantize_awq_weights`  / `_decide_streaming` （meta 计数 + `cache_clear`）/ `_streaming_quant_hook`  / `_finalize_streaming`  / `calibrate_fp8_kv`  / `_finalize_mla_mode`  / `_finalize_rolling`  / `allocate_kv_cache`  / `_ring_rows`  / `prepare_prefill`  / `prepare_mixed`  / `prepare_spec`  / `_prepare_mixed_spec`  / `prepare_decode`  / `run_model`  / `_spec_graph_hidden`  / `capture_spec_graph`  / `run`  / `capture_cudagraph`  |
+| `nanovllm/engine/ngram.py` | n-gram 投机（纯函数） | `find_ngram_draft` 、`verify_drafts`  |
+| `nanovllm/models/registry.py` | 按 model_type 选模型 | `get_model_class` ；`_PLANNED_BLOCKERS`  |
+| `nanovllm/models/*.py` | 7 个模型族（同构模板） | qwen3  · qwen2  · llama3  · mistral  · gemma2  · qwen3_moe  · deepseek_v2 （Attention/MLP/DecoderLayer/Model/ForCausalLM）；`compute_logits` 各 ForCausalLM 末尾（qwen3.py） |
+| `nanovllm/layers/attention.py` | **注意力：写 KV + flash/自研内核路由** | `store_kvcache_kernel`  / `store_kvcache`  / fp8 decode 内核  / `kv_rows_gather`  / `paged_decode_attention_fp8`  / `paged_decode_attention_bf16`  / fp8 varlen 内核  / `paged_varlen_attention_fp8`  / `Attention` （`forward` 、`_ring_varlen` 、`_decode_rows` ） |
+| `nanovllm/layers/attention_mla.py` | **MLA（DeepSeek）** | `mla_store`  / `mla_gather_dequant`  / `mla_decode_kernel`  / `mla_decode_attention`  / `MLAAttention` （`forward` 、`_decode_rows` 、`_decode_kernel` ） |
+| `nanovllm/layers/linear.py` | **全部 GEMM + 量化** | int8 内核  / w8a8  / int4 内核  / int4_gemm  / sparse24 内核  / sparse24_gemm  / fp8 激活量化  / fp8 内核  / fp8_gemm  / `WeightQuantMixin` （quantize_int4 、_int4_forward 、quantize_fp8 、quantize_sparse24 ）/ `LinearBase` （quantize_w8a8 、forward ）/ Column  / Merged  / QKV  / Row  |
+| `nanovllm/layers/moe.py` | **MoE（1.5）** | `ExpertFFN`  / `MoE` （`_route` 、forward 、`_forward_loop` 、`_forward_grouped` 、`reference` ） |
+| `nanovllm/layers/medusa.py` / `eagle.py` | 投机草稿头 | `MedusaHeads`  / `EagleLayer`  |
+| `nanovllm/layers/layernorm.py` / `rotary_embedding.py` / `activation.py` / `sampler.py` | 基础算子 | `RMSNorm`（含 weight_offset 变体）/ `RotaryEmbedding` （build_cache 、forward ）/ `get_rope` （**@lru_cache(1) 共享实例——meta 污染教训 §6 故事 18**）/ `SiluAndMul` / `Sampler`（Gumbel） |
+| `nanovllm/layers/embed_head.py` | Embedding + LM Head | `VocabParallelEmbedding`  / `ParallelLMHead` （继承 WeightQuantMixin） |
+| `nanovllm/utils/context.py` | **每步张量契约** | `Context`  / `get_context`  / `set_context` （位置传参，**新字段必须追加末尾**）/ `reset_context`  |
+| `nanovllm/utils/loader.py` | 权重加载 | `default_weight_loader`  / `load_model`  / `_load_eager`  / `_materialize`  / `_load_streaming`  |
+
+### 在线服务与新增调度组件
+
+| 文件 | 职责 | 主要入口 |
+|---|---|---|
+| `nanovllm/server.py` | HTTP/SSE、请求队列、会话上下文与压缩 | `create_app`、`GenerationManager`、`ConversationStore` |
+| `nanovllm/engine/kv_transfer.py` | Prefill/Decode 池之间的 KV 主机内存布局导出与导入 | `export_kv_cache`、`import_kv_cache` |
+| `nanovllm/engine/scheduler.py` | cache-affinity、aging、抢占成本与 TTFT 配额 | `schedule`、`_order_waiting`、`_slo_prefill_controls`、`preempt` |
+| `benchmarks/scheduling_ablation.py` | 连续请求 trace 下 baseline/all-on/逐策略消融 | `build_arrival_trace`、`run_arrival_trace` |
+| `benchmarks/context_concurrency.py` | 并发 × prompt 长度矩阵、TTFT/TPOT/E2E/吞吐、GPU 显存与实际 MHA/MLA KV 池容量账本 | `run_scenario`、`kv_capacity_report` |
+| `benchmarks/kv_fp8_calibrate.py` | 文本→校准 token-ID JSON、FP8 margin 扫描、held-out 首个 decode logits/range 对比 | `run_variant`、`compare_logits`、`range_utilization` |
 
 ### 9.2 运行链
 
 **链 A：进程启动（只跑一次）**
 ```
-LLM(...) → LLMEngine.__init__ [llm_engine.py:19]
- └─ ModelRunner.__init__ [model_runner.py:18]
+LLM(...) → LLMEngine.__init__ [llm_engine.py]
+ └─ ModelRunner.__init__ [model_runner.py]
      ├─ dist.init_process_group("nccl", ...)          # 无条件，TP=1 也初始化
-     ├─ get_model_class(model_type)                   # registry.py:49
-     ├─ _decide_streaming() [369] → load_model(...)   # meta 计数(cache_clear)→ 流式逐层物化+量化 / eager
-     ├─ eager 量化：quantize_int4/fp8/w8a8/awq/sparse24  # model_runner.py:286-311（streaming 走 chunk_hook）
-     ├─ _finalize_mla_mode() [521] / _finalize_rolling() [547]
-     ├─ warmup_model() [221]                           # 真实形状：JIT 编译 + 峰值显存
-     ├─ allocate_kv_cache() [599]                      # 大块 KV（MLA fused / ring / full 双池）绑层
-     ├─ capture_cudagraph() [1313]                     # decode 图族 [1,2,4,8,16..512]
-     └─ capture_spec_graph() [1226]                    # 投机：stride 家族 × 行容量家族（MLA/滚动跳过）
+     ├─ get_model_class(model_type)                   # registry.py
+     ├─ _decide_streaming()  → load_model(...)   # meta 计数(cache_clear)→ 流式逐层物化+量化 / eager
+     ├─ eager 量化：quantize_int4/fp8/w8a8/awq/sparse24  # model_runner.py（streaming 走 chunk_hook）
+     ├─ _finalize_mla_mode()  / _finalize_rolling()
+     ├─ warmup_model()                            # 真实形状：JIT 编译 + 峰值显存
+     ├─ allocate_kv_cache()                       # 大块 KV（MLA fused / ring / full 双池）绑层
+     ├─ capture_cudagraph()                      # decode 图族 [1,2,4,8,16..512]
+     └─ capture_spec_graph()                     # 投机：stride 家族 × 行容量家族（MLA/滚动跳过）
 ```
 
 **链 B：每步推理循环（`generate` 内 `while not is_finished()`）**
 ```
-step() [llm_engine.py:204]
- ├─ scheduler.schedule() → (seqs, kind)                # scheduler.py:109
- │   ├─ _try_swap_in() [488]                           # 先把换出的 KV 换回
- │   ├─ 投机：先给 running 全算草稿 (_compute_draft [168])
+step() [llm_engine.py]
+ ├─ scheduler.schedule() → (seqs, kind)                # scheduler.py
+ │   ├─ _try_swap_in()                            # 先把换出的 KV 换回
+ │   ├─ 投机：先给 running 全算草稿 (_compute_draft )
  │   └─ 分支：waiting+running→mixed | waiting→prefill | 其余→decode/spec
- ├─ COW 拷贝：cow_pairs → call("cow_block") [169/177]  # run() 之前
- ├─ swap 拷贝：swap_pairs → call("swap_out"/"swap_in") [190/203]
- ├─ model_runner.call("run", seqs, kind) [1284]
- │   ├─ prepare_prefill [783]/mixed [846]/decode [1086]/spec [944] → set_context() [context.py:48]
- │   ├─ run_model(input_ids, positions, kind) [1140]
- │   │   ├─ kind=spec → spec CUDA graph 重放（零长填充行）
+ ├─ COW 拷贝：cow_pairs → call("cow_block")   # run() 之前
+ ├─ swap 拷贝：swap_pairs → call("swap_out"/"swap_in")
+ ├─ model_runner.call("run", seqs, kind)
+ │   ├─ prepare_prefill /mixed /decode /spec  → set_context() [context.py]
+ │   ├─ run_model(input_ids, positions, kind)
+ │   │   ├─ kind=spec → 支持的纯批次走 spec CUDA graph；MLA/rolling/spec-mixed eager
+ │   │   ├─ kind=mixed → 普通 MHA 按精确形状懒捕获/重放 mixed CUDA Graph；不支持时 eager
  │   │   ├─ kind=decode 且 bs≤512 且非 eager → decode CUDA graph 重放
  │   │   └─ 否则 eager：model(input_ids, positions)
  │   ├─ model.compute_logits(hidden)                   # LM Head（图外）
  │   └─ Sampler(logits, temperatures) → token_ids      # Gumbel 采样
- │       └─ reset_context() [context.py:68]
- ├─ 投机：_verify() [llm_engine.py:61] → postprocess_spec() [scheduler.py:532]
- │         → _medusa_drafts [100]/_eagle_drafts [145]  # 用 hidden 生成下轮草稿
- ├─ 否则：postprocess() [518]                          # 追加 token/EOS/rehash
+ │       └─ reset_context() [context.py]
+ ├─ 投机：_verify() [llm_engine.py] → postprocess_spec() [scheduler.py]
+ │         → _medusa_drafts /_eagle_drafts   # 用 hidden 生成下轮草稿
+ ├─ 否则：postprocess()                           # 追加 token/EOS/rehash
  └─ 收集 finished 序列 → outputs
 ```
 
+**补充：PD 分离模式**
+```
+LLMEngine(execution_mode="pd")
+ ├─ Prefill runner/scheduler 处理等待请求（该角色禁用 KV swap）
+ ├─ prompt KV 经 `kv_transfer.py` 导出到主机内存
+ ├─ 释放 Prefill GPU 页，在 Decode pool 分配私有页并导入 KV
+ └─ 同一 engine step 内随后调度 Decode runner；两个阶段串行，无远端通信或异步重叠
+```
+
+**补充：在线服务**：HTTP route → 动态准入估算与接收/FIFO 延迟/拒绝 → 有界 `GenerationManager` 队列 → 单 engine worker 持续提交/step → SSE token events；`conversation_id` 绑定主机内存文本历史、会话 prompt token 预算与 prefix hit 计数，KV 不跨对话轮次固定驻留，但相同 token 前缀仍可通过全局前缀缓存复用。
+
 **链 C：单层前向（以 Qwen3 为例，锚点 = qwen3.py）**
 ```
-Qwen3ForCausalLM.forward [235]
- └─ Qwen3Model.forward [199]
+Qwen3ForCausalLM.forward
+ └─ Qwen3Model.forward
      ├─ embed_tokens(input_ids) → hidden
-     ├─ for layer: Qwen3DecoderLayer.forward [169]
-     │   ├─ Qwen3Attention.forward [80]
+     ├─ for layer: Qwen3DecoderLayer.forward
+     │   ├─ Qwen3Attention.forward
      │   │   ├─ qkv_proj(x) → q,k,v                    # QKVParallelLinear
      │   │   ├─ RotaryEmbedding(q,k)                   # 按 positions 旋转
-     │   │   ├─ Attention.forward [attention.py:377]   # 链 D
+     │   │   ├─ Attention.forward [attention.py]   # 链 D
      │   │   └─ o_proj(o)
-     │   ├─ Qwen3MLP.forward [132]（gate_up → SiluAndMul → down）
+     │   ├─ Qwen3MLP.forward （gate_up → SiluAndMul → down）
      │   └─ 残差相加（norm 走 add_rms_forward）
      ├─ norm(hidden, residual)                         # RMSNorm（残差融合）
-     └─ compute_logits [243] → ParallelLMHead          # 词表映射（TP>1 gather）
+     └─ compute_logits  → ParallelLMHead          # 词表映射（TP>1 gather）
 ```
 
 **链 D：Attention 数据流（Context 契约——本项目最核心的接口设计）**
@@ -855,7 +907,7 @@ prepare_* 构建 GPU 张量 ──set_context()──> Context（全局单例）
    [cu_seqlens_q/k, max_seqlen_q/k, slot_mapping, context_lens, block_tables,
     chunk_starts/ring_*, full_*（滚动/split 侧）, n_prefill_tokens, is_mixed, is_spec]
                     │
-Attention.forward [attention.py:377]  ← get_context()
+Attention.forward [attention.py]  ← get_context()
  ├─ store_kvcache(k, v, k_cache, v_cache, slot_mapping)  # 本步 K/V 散写分页缓存
  └─ 读路由（按批次形态 / 模型形态）：
      ├─ is_spec / is_mixed → varlen（分块序列用缓存形状 K/V；环序列走 _ring_varlen 装配）
@@ -867,29 +919,29 @@ Attention.forward [attention.py:377]  ← get_context()
 
 **链 E：量化路由决策（以 int4 为例）**
 ```
-LinearBase.forward [linear.py:610]
- └─ 已量化? → _int4_forward [441]
-     ├─ M≤128 且 N≥2048 → Triton int4_gemm [160]（group_size 可配 + 尾 K 掩码）
+LinearBase.forward [linear.py]
+ └─ 已量化? → _int4_forward
+     ├─ M≤128 且 N≥2048 → Triton int4_gemm （group_size 可配 + 尾 K 掩码）
      └─ 否则            → F.linear(x, w_deq)（bf16 反量化副本，cuBLAS）
- 权重来源：quantize_int4 [396] 在 warmup 前一次性打包（dual-path 存 q/scale + w_deq；
+ 权重来源：quantize_int4  在 warmup 前一次性打包（dual-path 存 q/scale + w_deq；
  纯 int4 不存 w_deq；MLA kv_b 恒存 w_deq）
 ```
 
 **链 F：投机解码完整链路**
 ```
-Scheduler._compute_draft [scheduler.py:168] ─每步 CPU─> 写 seq.draft_tokens
- → schedule() → kind="spec" / "mixed" [294/300]
- → prepare_spec/_prepare_mixed_spec [model_runner.py:944/1009]
+Scheduler._compute_draft [scheduler.py] ─每步 CPU─> 写 seq.draft_tokens
+ → schedule() → kind="spec" / "mixed"
+ → prepare_spec/_prepare_mixed_spec [model_runner.py]
      verify 行 = query=[last_token, 草稿...] 的 chunked prefill，num_cached = len-1
      （滚动环：key 集 [kv_j0·B, end) 装配，spec 表项 = 逻辑块 j0+i）
  → run_model：spec CUDA graph（stride×容量家族）或 eager varlen
- → LLMEngine._verify [llm_engine.py:61]：γ+1 行采样 s_i ↔ 草稿 d_i 逐个验收；末行 bonus
- → postprocess_spec [scheduler.py:532]
+ → LLMEngine._verify [llm_engine.py]：γ+1 行采样 s_i ↔ 草稿 d_i 逐个验收；末行 bonus
+ → postprocess_spec [scheduler.py]
      只提交接受 token；hash 范围 [num_tokens-n_acc-1, num_tokens-1)（被拒草稿不进前缀缓存）
- → medusa/eagle：_medusa_drafts/_eagle_drafts [llm_engine.py:100/145] 生成下轮草稿
+ → medusa/eagle：_medusa_drafts/_eagle_drafts [llm_engine.py] 生成下轮草稿
 ```
 
-## 10. 基准档案（指标口径 · 快速开始 · 实测结果（现行）· profiling）
+## 10. 基准档案（指标口径 · 快速开始 · 归档实测结果 · profiling）
 
 ### 10.1 指标口径与计时
 
@@ -899,14 +951,15 @@ Scheduler._compute_draft [scheduler.py:168] ─每步 CPU─> 写 seq.draft_toke
 | TTFT | 每个请求从提交（加入调度队列）到生成第一个 completion token 的时间 |
 | TPOT | 每个请求 (完成时间 − 首token时间) / (输出token数 − 1)，即稳态解码的单token延迟 |
 | E2E | 每个请求从提交到完成的端到端延迟 |
-| SLO 达成率 | TTFT < 500ms 与 TPOT < 10ms 的请求占比（阈值可用 `--slo-*` 调整） |
+| benchmark SLO 达成率 | TTFT ≤ `--slo-ttft-ms` 与 TPOT ≤ `--slo-tpot-ms` 的请求占比；TPOT 只统计至少输出 2 个 token、存在 token 间隔的请求；服务请求还可分别指定 `ttft_slo_ms` / `tpot_slo_ms` |
 | preemptions | KV cache 块不足时调度器抢占（swap/回退重算）的次数，0 表示容量充足 |
 
 计时插桩在引擎内部：`Sequence.t_submitted/t_first_token/t_completed`（driver 侧，不跨进程传输），
 由 `LLMEngine.collect_metrics()` 统一导出，`benchmarks/bench.py` 统计。
 **TTFT 语义注意**：`t_first_token` 在该序列 **prefill 完成的那次 postprocess** 记录，因此 TTFT ≈
-请求自身 prefill 完成时刻（含排队），整批 TTFT 呈阶梯分布。SLO 的 TTFT<500ms 在离线批处理下通常
-难达成。
+请求自身 prefill 完成时刻（含排队），整批 TTFT 呈阶梯分布。在线 scheduler 可使用 TTFT deadline
+slack 和 TPOT 目标；TPOT 控制依据请求级 token 间隔 EWMA， benchmark 达成率则按上面的请求平均
+TPOT 定义计算。离线批处理下 TTFT<500ms 通常难达成。
 
 ### 10.2 环境与快速开始
 
@@ -940,11 +993,54 @@ python benchmarks/bench.py --num-seqs 256 --quantization fp8
 python benchmarks/bench.py --num-seqs 256 --kv-cache-dtype fp8_e4m3
 # 8. 投机（草稿质量按内容类型变化大，见 §10.3.5）
 python benchmarks/spec_bench.py --speculative ngram
+# 9. 连续到达策略消融（同一随机 trace，baseline/all-on/单策略关闭）
+python benchmarks/scheduling_ablation.py --num-seqs 128 --arrival-rate 16 \
+    --arrival-mode poisson --variants baseline all_on
+# 10. 动态准入消融（同一请求到达 trace，对比预测准入开关）
+python benchmarks/admission_ablation.py --num-seqs 128 --arrival-rate 16 \
+    --arrival-mode poisson
+# 11. 在线 HTTP/SSE 服务
+nanovllm-serve ~/huggingface/Qwen3-0.6B --host 127.0.0.1 --port 8000
+# 12. 并发 × 上下文长度矩阵 + 实际 KV 池容量/显存账本（JSON + CSV）
+python benchmarks/context_concurrency.py --context-lengths 512,1024,2048,4096 \
+    --concurrency 1,2,4,8,16 --repeats 3 --max-output-tokens 32
+# 13. 真实文本 FP8 KV 校准、margin 扫描与 held-out 首个 decode logits 精度对比
+python benchmarks/kv_fp8_calibrate.py --calibration-file calibration.jsonl \
+    --eval-file heldout.jsonl --margins 0.9,1.0,1.1,1.25 --output results/kv_eval.json
+# FP8 KV 并发测试引用上一步生成的 token-ID 校准文件
+python benchmarks/context_concurrency.py --kv-cache-dtype fp8_e4m3 \
+    --kv-calibration-path results/kv_eval.tokens.json --context-lengths 512,1024,2048 \
+    --concurrency 1,2,4,8
 ```
 
-结果 JSON → `results/bench_<workload>_<ts>.json`；profiling → `profiles/{prefill,decode}.txt`。
+结果 JSON → `results/bench_<workload>_<ts>.json`；并发矩阵同时输出同 stem CSV；FP8 校准输出报告 JSON、摘要 CSV 和 `.tokens.json` 校准数据；profiling → `profiles/{prefill,decode}.txt`。
 
-### 10.3 实测结果（现行；每张表自带日期与 workload，跨表数字只作量级参考）
+混合 CUDA Graph 消融使用同一 workload 分别运行默认配置与 `--no-mixed-cudagraph`，例如：
+
+```bash
+python benchmarks/bench.py --num-seqs 256 --repeat-batches 2
+python benchmarks/bench.py --num-seqs 256 --repeat-batches 2 --no-mixed-cudagraph
+```
+
+逐批 JSON 会给出 graph captures/replays/eager fallbacks 与 prefix feature parse/reuse；首次遇到形状的 capture 会计入该批耗时，优先比较已预热的后续 batch，并确认 `replays > 0` 才表示 workload 实际走过 mixed graph。调度消融 JSON 另含 generation 失效重解析、缓存淘汰、deferred-free 引用排队/提交数和峰值待释放块数；CPU 用例覆盖对应的分配、释放、LRU 淘汰、swap release 和重复共享引用延迟释放边界。
+
+Multi-step Decode / TPOT 目标调度用同一到达 trace 消融：
+
+```bash
+python benchmarks/scheduling_ablation.py --variants baseline all_on without_tpot_aware without_multi_step_decode \
+  --num-seqs 128 --arrival-rate 16 --arrival-mode poisson --slo-tpot-ms 20 --max-decode-steps 4
+```
+
+每组保留 request TPOT 目标达成率、TPOT/TTFT/E2E 分位数、输出吞吐、decode forward 数和 burst 产生的 token 数；`without_*` 结果分别对比 baseline 和 all-on。单次吞吐基准可用 `benchmarks/bench.py --default-tpot-slo-ms 20` 启用默认 TPOT 目标，并用 `--no-tpot-aware-scheduling` 或 `--no-multi-step-decode` 关闭单项功能。Multi-step 只进入纯非投机 decode，因此应结合目标硬件运行和多种到达模式评估，不把历史数据外推为效果结论。
+
+并发矩阵每个点把一批请求同时交给在线 `GenerationManager`，默认关闭预测准入以测调度与 KV 容量；`--dynamic-admission` 可把接收/延迟/拒绝策略纳入压测。每个请求的输出长度固定，因此输出速率与 TPOT 分布可横向比较。JSON 保留逐请求结果，并汇总 TTFT/TPOT SLO 达成率、admission 估计与等待、吞吐、抢占、swap、prefix hit、KV pool 峰值和显存峰值；CSV 汇总每个矩阵点。容量账本直接从 MHA/MLA cache tensor 字节数和 BlockManager 页数计算：full-history 池按 `(prompt tokens + max output tokens)` 预留整块页数；rolling 池按 prefill 的完整 prompt 分配峰值与生成期 `ring_cap` 占用中的较大值估算，split rolling/full 模型分别报告两池容量。它不包含 CPU swap，也不代表同延迟服务能力。CUDA peak 包括 engine 初始化后当前分配基线和本次场景峰值，JSON 同时保留 peak delta。
+
+FP8 校准输入支持 JSONL 的 `prompt`/`text` 字段或纯文本；省略语料时使用脚本内置小语料，并把每条短 prompt 重复到 1024 token 以覆盖长一些的 KV 历史；用户语料默认保留原始长度，可用 `--calibration-context-length` / `--eval-context-length` 显式扩展。Gemma-2 的 attention logit soft-cap 当前不兼容 FP8 KV。报告的 range utilization 是 held-out 每层/每段 activation 最大绝对值除以 `448 × calibrated_scale`；大于 1 表示观测到的最大值被 clamp，不是逐元素饱和比例。logit 精度指标只纳入首 token 一致的 prompt，确保对比 decode 时两侧历史相同；实际部署评估应覆盖真实请求分布，并把校准与验证语料分开。
+
+### 10.3 归档实测结果（截至各表日期；每张表自带 workload，跨表数字只作量级参考）
+
+以下性能记录没有覆盖当前新增的在线服务、TTFT SLO 调度、Top-W/aging/recompute-aware 组合；请勿将
+旧数字当成新功能的 benchmark。当前策略的可比基线由 `benchmarks/scheduling_ablation.py` 生成。
 
 #### 10.3.1 与真实 vLLM 对比（2026-08-18，Qwen3-0.6B）
 
@@ -1016,6 +1112,11 @@ flash-attn 2.8.3.post1、无 FlashInfer、WSL `pin_memory=False`。
 自研 Triton paged 内核直接读 FP8(E4M3)：decode v6（直接 fp8 load + 硬件 cvt 反量化 + MMA，
 QPAD=16、GQA 融合、BLOCK_T=32/warps=1）、varlen v7（多查询扩展，逐列因果掩码 `<=`）；写路径
 warmup 校准每层 scale、**显式 clamp±448**（§6 故事 1）。
+
+当前实现新增真实 token-ID 校准输入与 scale-margin 参数：`kv_calibration_path` / `kv_fp8_scale_margin`；
+`benchmarks/kv_fp8_calibrate.py` 可从文本/JSONL 生成输入，扫描多个 margin，并用 held-out 首个
+decode logits、KL/top-k/logit 误差和 activation range utilization 比较。下面的 KL/吞吐数值是此前
+归档测试的结果，不是此次校准脚本在当前环境测得的数据。
 
 - 容量：421 → **802 块**（1.9×）；精度：**KL 0.0073、top-1 100%**（首个 decode 步对齐 logits）
 - 引擎级 decode 单步：long 32.2ms、clean 35.0ms（vs vLLM fp16 ~33/~56ms，§10.3.1）；吞吐以

@@ -1,6 +1,8 @@
 from copy import copy
+from dataclasses import dataclass
 from enum import Enum, auto
 from itertools import count
+from time import perf_counter
 
 from nanovllm.sampling_params import SamplingParams
 
@@ -10,6 +12,16 @@ class SequenceStatus(Enum):
     WAITING = auto() # 1
     RUNNING = auto() # 2
     FINISHED = auto() # 3
+
+
+@dataclass(slots=True)
+class PrefixFeatureContext:
+    """Lazily parsed scheduling features for one KV-cache generation."""
+
+    kv_generation: int
+    cached_tokens: int
+    cached_blocks: int
+    first_miss_block: int
 
 
 class Sequence:
@@ -26,6 +38,11 @@ class Sequence:
         self.num_prompt_tokens = len(token_ids) # prompt token总数
 
         self.num_cached_tokens = 0
+        self.num_prefix_cached_tokens = 0
+        # Computed only when this request enters the scheduler's Top-W window.
+        # It is deliberately omitted from __getstate__: worker processes must
+        # resolve features against their own BlockManager generation.
+        self.prefix_feature_context: PrefixFeatureContext | None = None
         self.num_scheduled_tokens = 0
         self.is_prefill = True
         self.block_table = []
@@ -42,8 +59,15 @@ class Sequence:
 
         # ---- 基准计时（仅driver侧使用，不随__getstate__跨进程传输） ----
         self.t_submitted: float | None = None      # 请求加入调度队列的时间（秒）
+        self.t_prefill_started: float | None = None  # 首次被调度做prefill的时间（秒）
         self.t_first_token: float | None = None    # 生成第一个completion token的时间（用于TTFT）
         self.t_completed: float | None = None      # 请求完成（FINISHED）的时间
+        self.ttft_slo_ms: float | None = None      # 每请求TTFT目标，由engine设置
+        self.tpot_slo_ms: float | None = None      # 每请求平均TPOT目标，由engine设置
+        self.t_last_token: float | None = None     # 最近completion token时间（在线TPOT估算）
+        self.tpot_ewma_ms: float | None = None     # 请求级观测TPOT，用于动态decode优先级
+        self.age_promoted = False                   # aging公平策略是否已提升过
+        self.preemption_count = 0                    # 用于避免反复抢占同一请求
 
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
@@ -95,6 +119,17 @@ class Sequence:
         self.last_token = token_ids[-1]
         self.num_tokens += len(token_ids)
 
+    def record_output_timing(self, num_new_tokens: int = 1) -> None:
+        """Record online per-token latency for TPOT-aware scheduling."""
+        now = perf_counter()
+        if self.t_first_token is None:
+            self.t_first_token = now
+        elif self.t_last_token is not None and num_new_tokens > 0:
+            observed_ms = (now - self.t_last_token) * 1000.0 / num_new_tokens
+            self.tpot_ewma_ms = (observed_ms if self.tpot_ewma_ms is None else
+                                 0.8 * self.tpot_ewma_ms + 0.2 * observed_ms)
+        self.t_last_token = now
+
     # 跨进程同步通信
     def __getstate__(self):
         last_state = self.last_token if not self.is_prefill else self.token_ids
@@ -112,3 +147,14 @@ class Sequence:
         else: # 如果是decode阶段传来的
             self.token_ids = []
             self.last_token = last_state
+        self.num_prefix_cached_tokens = 0
+        self.prefix_feature_context = None
+        self.t_submitted = None
+        self.t_prefill_started = None
+        self.t_first_token = None
+        self.t_completed = None
+        self.tpot_slo_ms = None
+        self.t_last_token = None
+        self.tpot_ewma_ms = None
+        self.age_promoted = False
+        self.preemption_count = 0

@@ -1,5 +1,7 @@
 # CUDA C 手写 GEMM 内核报告（阶段 1b：SMEM 显式编程 / SASS / split-K / persistent）
 
+> **阶段记录说明（2026-10-05）**：以下是独立 GEMM 微基准，不是引擎内的生产算子，也不代表当前在线调度吞吐。`benchmarks/_cuda_gemm_dev.cu` 的手写 CUDA C GEMM 尚未接入 `nanovllm/layers/linear.py`；现有推理路径仍使用 PyTorch/Triton/flash-attn。报告中“未做”的内核工作指该 CUDA C 实验范围，不等同于整个仓库没有相应 Triton/PyTorch 实现。
+
 > 条件：RTX 5060 Ti 16GB (sm_120, Blackwell) / WSL2 / CUDA 12.8 (nvcc 12.8.93, conda) /
 > torch 2.8.0+cu128 / fp16，row-major `C[M,N] = A[M,K]@B[K,N]`。
 > 对照基线：cuBLAS fp16（torch.matmul，实测 39-41 TFLOPS @ 4096³——远低于纸面 48.5，

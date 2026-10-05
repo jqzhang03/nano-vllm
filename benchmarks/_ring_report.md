@@ -1,5 +1,7 @@
 # 阶段 2b：SWA 滚动缓冲（滚动缓存）报告
 
+> **阶段快照说明（2026-10-05）**：这是 rolling-cache 初版记录。后续 [`_stage2b_ext_report.md`](_stage2b_ext_report.md) 已扩展 Mistral rolling 到 FP8 KV 和 n-gram verify，并加入 Gemma-2 split 双池。当前仍不支持 rolling+Medusa/EAGLE；Mistral rolling decode 可用 CUDA Graph，rolling verify 使用 eager；Gemma-2 split decode 仍 eager，且要求 `kv_cache_dtype="auto"`、关闭 speculative 与 KV swap。
+
 ## 1. 动机与机制
 
 flash-attn / vLLM 传统 SWA 只做"窗口掩码"：KV 缓存仍按全上下文线性增长，窗口
@@ -13,9 +15,9 @@ decode 期每序列只保留窗口内容，旧块越过窗口立即释放、新�
 |---|---|
 | per-seq 逻辑环 | `Sequence.kv_j0`：块表 = 窗口内容清单（第 i 项 = 第 kv_j0+i 个逻辑块）；`BlockManager` 驱逐：`(front+1)·B ≤ N−W−slack` 时表头整块释放（先释放再分配，净零 free 消耗）|
 | refcount 守卫 | 滚动块的 `_evict_front` 显式断言 ref_count==1 && hash==-1；环模型**不发布/不消费前缀缓存**（窗口内容过期 + decode 哈希链起点会被驱逐）→ 块恒私有，守卫恒真——若将来放开共享，断言就是守卫落点 |
-| 回读余量 | 驱逐阈值留 `slack = max_draft_len + 2`：未来 verify 行会回读窗口前 γ 个 key（本版组合未启用，纯解码 slack=2 保边界整数余量）|
+| 回读余量 | 驱逐阈值留 `slack = max_draft_len + 2`：本初版未启用 verify；后续 n-gram verify+ring 已实现并使用 γ+2 余量（见 2b-ext）|
 | 内核位置偏移 | flash-attn 从表下标推 key 位置 → 环表会错位；自研 bf16 paged decode 内核（fp8 内核源码泛化：`chunk_starts` 每行首块序号 j0；key_pos = (j0+b)·B+t；读块数 = ceil(seqlen/B) − j0）。bf16 走同一内核 scale=1（bf16→fp16 无精度损失）。CUDA-graph decode 同步支持（chunk_starts 静态缓冲）|
-| 前置校验 | mistral（全层统一窗口）/ bf16 KV / 无投机；fp8 KV、投机组合断言拒绝（诚实边界）|
+| 初版前置校验 | mistral（全层统一窗口）/ bf16 KV / 无投机；FP8 KV 与投机当时被断言拒绝，已由后续 2b-ext 扩展 |
 
 ## 3. 验证链
 

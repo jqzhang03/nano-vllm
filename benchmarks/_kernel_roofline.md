@@ -151,11 +151,12 @@ fp16，+28%**（decode bs=256 的 M>128 也走该分支，同样受益）。精�
   上限、占用掉到 1 block/SM；小 tile regs=128、2 blocks。落地后纯 int4 大 batch +28%。
   中间还学到：快速搜索的 +144% 是异常值，高迭代复测才可信。"
 
-## 9. 未做 / 已知空白（诚实的边界）
+## 9. 本报告的边界与后续进展
 
-- 没有做 SMEM 显式编程（Triton 自动管理）——手写 CUDA 内核的 SMEM/bank-conflict 控制
-  是下一步（或直接换 CUDA C 写一个对照内核）。
-- 没有做 SASS 级分析（Triton 的 cubin 可反汇编，但指令级优化未深入）。
+- 本报告聚焦 Triton roofline 与 tile 搜索；SMEM 显式编程、bank-conflict 消融和 CUDA C 的 SASS 分析已在后续 [`_cuda_gemm_report.md`](_cuda_gemm_report.md) 完成。该 CUDA C GEMM 仍是独立微基准，没有接入推理模型。
+- Triton kernel 的 SASS 逐指令优化仍未系统完成（与 CUDA C 报告里的手写内核分析不同）。
 - fp8 大 M 的 Triton 内核 +8.6% 未落地（引擎大 M 走硬件 `_scaled_mm`，Triton 路径仅
   decode 用，decode 已最优）。
 - 注意力内核只归因未优化（KV 块排序提 L2 命中是可做方向）。
+
+本报告记录的吞吐/TFLOPS 均为 2026-08-24 阶段的单核或单 GEMM 实测，不是当前请求调度/SLO 的端到端 benchmark。

@@ -1,4 +1,5 @@
 import os
+from math import isfinite
 from dataclasses import dataclass
 from transformers import AutoConfig
 
@@ -11,6 +12,10 @@ class Config:
     max_model_len: int = 4096 # 最大上下文长度
     gpu_memory_utilization: float = 0.9 # GPU内存利用率
     tensor_parallel_size: int = 1 # 张量并行使用的GPU数
+    execution_mode: str = "auto" # 执行模式：auto（单卡mixed，多卡可自动PD）| mixed | pd
+    pd_separation: bool | None = None # 兼容旧接口：True=PD、False=mixed；建议使用 execution_mode
+    prefill_device: int = 0 # PD分离时运行Prefill的CUDA设备序号
+    decode_device: int = 1 # PD分离时运行Decode的CUDA设备序号
     enforce_eager: bool = False # 允许使用框架自己的推理策略。
     # True：不使用图优化，优点(兼容性更好、调试方便、某些环境下稳定)，缺点(降低推理速度)
     hf_config: AutoConfig | None = None # hugging face模型配置对象
@@ -18,8 +23,29 @@ class Config:
     kvcache_block_size: int = 256 # 在PagedAttention中，一个KV缓存块(页)的大小，在vllm生产环境下一般是16，必须保持为16的倍数
     num_kvcache_blocks: int = -1 # KV Cache块的数量，-1表示GPU根据显存大小、模型大小、block size等自动计算
     kv_cache_dtype: str = "auto" # KV缓存数据类型："auto"（模型dtype，默认）或 "fp8_e4m3"（FP8 E4M3量化，容量翻倍，decode用自研Triton内核）
-    kv_swap: bool = True # KV swap 抢占：KV块不足时把序列的KV拷到CPU内存并释放GPU块，恢复时直接换回（bit-exact，免重新prefill）。仅TP=1且非fp8 KV时生效（fp8的float8_e4m3是CUDA-only，无法分配CPU缓冲）
+    kv_calibration_path: str = "" # FP8 KV校准token IDs JSON；为空时使用内置随机token校准
+    kv_fp8_scale_margin: float = 1.1 # 校准最大值对应E4M3量化上限的安全因子；<1会主动裁剪
+    kv_swap: bool = True # KV swap 抢占：KV块不足时把序列的KV拷到CPU内存并释放GPU块，恢复时直接换回（bit-exact，免重新prefill）。支持TP=1的auto/fp8 KV；TP>1仍回退recompute
     kv_swap_space_gb: float = 2.0 # KV swap 的 CPU 缓冲空间上限（GB，vLLM swap_space 同款）。换出缓冲累计超限时回落 recompute 抢占，防止 CPU RAM 耗尽（本机 WSL 内存有限，0.6B 单 KV 块 28MB）
+    latency_aware_scheduling: bool = True # 混合批次为等待prefill预留预算，并在候选窗口内优先预计prefill较短的请求
+    cache_affinity_admission: bool = True # Top-W准入：优先复用更多前缀KV的请求
+    prefix_feature_cache: bool = True # 缓存generation标记的Top-W前缀特征；False用于反复解析消融
+    admission_window: int = 16 # latency/cache admission候选窗口 W
+    aging_fairness: bool = True # 等待超过阈值后优先最老请求，防止长请求饿死
+    aging_timeout_ms: float = 2000.0 # aging提升阈值
+    prefill_reserve_tokens: int = 256 # 混合调度至少为一个等待prefill保留的token预算
+    slo_aware_scheduling: bool = True # 按请求TTFT目标、队列压力和实测prefill速度调整配额
+    default_ttft_slo_ms: float | None = 500.0 # 请求未单独设置时采用的TTFT目标；None表示不设默认目标
+    tpot_aware_scheduling: bool = True # 按活动请求TPOT slack动态降低prefill配额、优先decode
+    default_tpot_slo_ms: float | None = None # 请求未单独设置时使用的TPOT目标；None表示不设默认目标
+    tpot_decode_ms_fallback: float = 20.0 # 尚无该请求decode样本时用于TPOT slack估算的回退值
+    max_prefill_chunk_tokens: int = 4096 # 自适应调度单步prefill预算上限
+    queue_depth_for_full_prefill: int = 16 # 等待队列达到该长度时进入最高队列压力
+    multi_step_decode: bool = True # 纯decode时连续复用调度批次；prefill/spec/mixed路径仍单步
+    max_decode_steps: int = 4 # 每个decode调度窗口最多执行的模型前向轮数（含首轮）
+    recompute_aware_preemption: bool = True # 按估算swap往返成本与cache-aware recompute成本选择抢占方式
+    preempt_prefill_tokens_per_second: float = 10000.0 # 尚无在线样本时的recompute估算回退值
+    preempt_kv_transfer_gbps: float = 12.0 # 尚无在线样本时的KV swap带宽估算回退值
     rolling_cache: bool = False # SWA 滚动缓冲（阶段 2b）：解码期每序列 KV 只保留窗口内容（块数 ≤ 窗口/块大小 + 2），旧块到期自动释放——长生成序列的 KV 内存有界。支持：mistral（全层统一窗口，bf16/fp8 KV，可加 ngram 投机）；gemma2（**交替 local/global**，阶段 2b 扩展 split 模式：local 层走环池、global 层走独立 full 池普通分页永不驱逐，仅 bf16 KV、无投机、eager decode）。滚动模型不参与前缀缓存发布/消费（窗口内容过期，重复 prompt 有代价，见 block_manager.py 头注）；环语义需自研 paged 内核（flash-attn 无法表达环表位置偏移，vLLM 传统实现也只掩码不滚动）
     num_ring_kvcache_blocks: int = 0  # split 模式：环池块数（runner 分配后写回，scheduler 建 BM 用）
     num_full_kvcache_blocks: int = 0  # split 模式：full 池块数（同上）
@@ -36,11 +62,71 @@ class Config:
     medusa_path: str = "" # Medusa头权重文件（.pt，benchmarks/medusa_train.py训练产出）；speculative="medusa"时必须
     eagle_path: str = "" # EAGLE草稿层权重文件（.pt，benchmarks/eagle_train.py训练产出）；speculative="eagle"时必须
     medusa_hidden: int = 256 # Medusa头隐藏维（输出层256×vocab是主要参数，控制总规模）
+    prefix_cache_max_free_blocks: int = 0 # 空闲前缀缓存块上限；0表示不设上限，分配压力下按LRU回收
+    mixed_cudagraph: bool = True # 普通混合Prefill/Decode批次使用按形状惰性捕获的CUDA Graph
+    mixed_cudagraph_max_graphs: int = 4 # 混合图形状缓存上限，超限淘汰最久未使用图
+    mixed_cudagraph_max_tokens: int = 4096 # 超过该批次token数时走eager，限制图捕获峰值显存
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
         assert self.kvcache_block_size % 256 == 0
         assert 1 <= self.tensor_parallel_size <= 8
+        assert self.kv_swap_space_gb >= 0, "kv_swap_space_gb 必须非负"
+        assert self.prefix_cache_max_free_blocks >= 0, \
+            "prefix_cache_max_free_blocks 必须非负"
+        assert self.mixed_cudagraph_max_graphs >= 1, \
+            "mixed_cudagraph_max_graphs 必须至少为1"
+        assert self.mixed_cudagraph_max_tokens >= 1, \
+            "mixed_cudagraph_max_tokens 必须至少为1"
+        assert isfinite(self.kv_fp8_scale_margin) and self.kv_fp8_scale_margin > 0, \
+            "kv_fp8_scale_margin 必须是有限正数"
+        if self.kv_calibration_path:
+            assert self.kv_cache_dtype == "fp8_e4m3", \
+                "kv_calibration_path 仅适用于 kv_cache_dtype='fp8_e4m3'"
+            assert os.path.isfile(self.kv_calibration_path), \
+                f"FP8 KV校准文件不存在: {self.kv_calibration_path}"
+        assert self.admission_window >= 1, "admission_window 必须至少为1"
+        assert self.aging_timeout_ms >= 0, "aging_timeout_ms 必须非负"
+        assert self.prefill_reserve_tokens >= 1, "prefill_reserve_tokens 必须至少为1"
+        assert self.default_ttft_slo_ms is None or (isfinite(self.default_ttft_slo_ms)
+                                                    and self.default_ttft_slo_ms > 0), \
+            "default_ttft_slo_ms 必须为正数或 None"
+        assert self.default_tpot_slo_ms is None or (isfinite(self.default_tpot_slo_ms)
+                                                    and self.default_tpot_slo_ms > 0), \
+            "default_tpot_slo_ms 必须为正数或 None"
+        assert isfinite(self.tpot_decode_ms_fallback) and self.tpot_decode_ms_fallback > 0, \
+            "tpot_decode_ms_fallback 必须为有限正数"
+        assert 1 <= self.max_decode_steps <= 16, \
+            "max_decode_steps 必须在1到16之间"
+        assert self.max_prefill_chunk_tokens >= 1, \
+            "max_prefill_chunk_tokens 必须至少为1"
+        assert self.queue_depth_for_full_prefill >= 1, \
+            "queue_depth_for_full_prefill 必须至少为1"
+        assert self.preempt_prefill_tokens_per_second > 0, \
+            "preempt_prefill_tokens_per_second 必须为正数"
+        assert self.preempt_kv_transfer_gbps > 0, "preempt_kv_transfer_gbps 必须为正数"
+        assert self.execution_mode in ("auto", "mixed", "pd"), \
+            f"unknown execution_mode: {self.execution_mode!r}"
+        if self.pd_separation is not None:
+            legacy_mode = "pd" if self.pd_separation else "mixed"
+            if self.execution_mode == "auto":
+                self.execution_mode = legacy_mode
+            else:
+                assert self.execution_mode == legacy_mode, \
+                    "pd_separation 与 execution_mode 指定了不同的执行模式"
+        if self.execution_mode == "pd":
+            assert self.tensor_parallel_size == 1, \
+                "当前 PD 分离版本每个角色使用一张 GPU，tensor_parallel_size 必须为 1"
+            assert self.prefill_device >= 0 and self.decode_device >= 0, \
+                "prefill_device/decode_device 必须是非负 CUDA 设备序号"
+            assert self.prefill_device != self.decode_device, \
+                "PD 分离需要为 Prefill 和 Decode 指定不同 GPU"
+            assert self.speculative == "none", \
+                "当前 PD 分离版本暂不支持投机解码"
+            assert not self.rolling_cache, \
+                "当前 PD 分离版本暂不支持 rolling_cache"
+            assert self.kv_cache_dtype == "auto", \
+                "当前 PD KV 传输暂要求 kv_cache_dtype='auto'"
         assert self.speculative in ("none", "ngram", "medusa", "eagle"), \
             f"unknown speculative: {self.speculative}"
         assert self.quantization in ("none", "w8a8", "int4", "awq", "sparse24", "fp8"), \
@@ -51,3 +137,15 @@ class Config:
             assert self.eagle_path, "speculative=eagle requires eagle_path"
         self.hf_config = AutoConfig.from_pretrained(self.model)
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)
+
+    def pd_mode_incompatibility(self) -> str | None:
+        """Return why PD mode cannot run with this configuration, if applicable."""
+        if self.tensor_parallel_size != 1:
+            return "PD separation requires tensor_parallel_size=1"
+        if self.speculative != "none":
+            return "PD separation does not support speculative decoding"
+        if self.rolling_cache:
+            return "PD separation does not support rolling_cache"
+        if self.kv_cache_dtype != "auto":
+            return "PD KV transfer currently requires kv_cache_dtype='auto'"
+        return None

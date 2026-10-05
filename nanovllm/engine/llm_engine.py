@@ -1,4 +1,7 @@
 import atexit
+import logging
+from math import isfinite
+from copy import copy
 from dataclasses import fields
 from time import perf_counter
 from tqdm.auto import tqdm
@@ -9,9 +12,11 @@ import torch.multiprocessing as mp
 
 from nanovllm.config import Config
 from nanovllm.sampling_params import SamplingParams
-from nanovllm.engine.sequence import Sequence
+from nanovllm.engine.sequence import Sequence, SequenceStatus
 from nanovllm.engine.scheduler import Scheduler
 from nanovllm.engine.model_runner import ModelRunner
+
+logger = logging.getLogger(__name__)
 
 
 class LLMEngine:
@@ -20,43 +25,190 @@ class LLMEngine:
         config_fields = {field.name for field in fields(Config)}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         config = Config(model, **config_kwargs)
+        requested_mode = config.execution_mode
+        cuda_available = torch.cuda.is_available()
+        n_devices = torch.cuda.device_count() if cuda_available else 0
+        pd_incompatibility = config.pd_mode_incompatibility()
+        if requested_mode == "auto":
+            if n_devices <= 1:
+                execution_mode = "mixed"
+                reason = "one or fewer visible CUDA devices"
+            elif pd_incompatibility:
+                execution_mode = "mixed"
+                reason = pd_incompatibility
+            elif min(config.prefill_device, config.decode_device) < 0 \
+                    or max(config.prefill_device, config.decode_device) >= n_devices \
+                    or config.prefill_device == config.decode_device:
+                execution_mode = "mixed"
+                reason = "configured PD devices are not a valid distinct visible pair"
+            else:
+                execution_mode = "pd"
+                reason = f"{n_devices} visible CUDA devices and PD-compatible settings"
+            logger.info("execution_mode=auto selected %s: %s", execution_mode, reason)
+        else:
+            execution_mode = requested_mode
+        if execution_mode == "pd":
+            if not cuda_available:
+                raise RuntimeError("PD separation requires CUDA")
+            if n_devices < 2:
+                raise ValueError(
+                    f"PD separation requires two visible CUDA devices, found {n_devices}")
+            if pd_incompatibility:
+                raise ValueError(pd_incompatibility)
+            if min(config.prefill_device, config.decode_device) < 0 \
+                    or max(config.prefill_device, config.decode_device) >= n_devices:
+                raise ValueError(
+                    f"PD separation requested CUDA devices {config.prefill_device} and "
+                    f"{config.decode_device}, but only {n_devices} device(s) are visible")
+            if config.prefill_device == config.decode_device:
+                raise ValueError("PD separation requires distinct prefill/decode devices")
+        config.execution_mode = execution_mode
+        config.pd_separation = execution_mode == "pd"
         self.config = config
+        self.execution_mode = execution_mode
         Sequence.block_size = config.kvcache_block_size
         self.ps = []
         self.events = []
-        ctx = mp.get_context("spawn")
-        for i in range(1, config.tensor_parallel_size):
-            event = ctx.Event()
-            process = ctx.Process(target=ModelRunner, args=(config, i, event))
-            process.start()
-            self.ps.append(process)
-            self.events.append(event)
-        self.model_runner = ModelRunner(config, 0, self.events)
+        self._pd = execution_mode == "pd"
+        if self._pd:
+            # Each role owns an independent model and KV pool. Copy Config because
+            # ModelRunner writes the per-device KV block count back into it.
+            self.prefill_config = copy(config)
+            self.prefill_config.kv_swap = False
+            self.prefill_config.enforce_eager = True
+            self.decode_config = copy(config)
+            try:
+                self.prefill_runner = ModelRunner(
+                    self.prefill_config, 0, [], device=config.prefill_device)
+                self.decode_runner = ModelRunner(
+                    self.decode_config, 0, [], device=config.decode_device)
+            except Exception:
+                if hasattr(self, "prefill_runner"):
+                    self.prefill_runner.call("exit")
+                raise
+            self.model_runner = self.decode_runner
+        else:
+            ctx = mp.get_context("spawn")
+            for i in range(1, config.tensor_parallel_size):
+                event = ctx.Event()
+                process = ctx.Process(target=ModelRunner, args=(config, i, event))
+                process.start()
+                self.ps.append(process)
+                self.events.append(event)
+            self.model_runner = ModelRunner(config, 0, self.events)
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
-        self.scheduler = Scheduler(config)
+        if self._pd:
+            self.prefill_config.eos = config.eos
+            self.decode_config.eos = config.eos
+            self.prefill_scheduler = Scheduler(self.prefill_config)
+            self.decode_scheduler = Scheduler(self.decode_config)
+            # Keep the familiar attribute for metrics and downstream inspection.
+            self.scheduler = self.decode_scheduler
+        else:
+            self.scheduler = Scheduler(config)
         # 基准计时数据：已结束请求的per-request时间戳快照 + 逐step聚合统计
         self._req_metrics: list[dict] = []
-        self._step_stats: dict[str, float | int] = {}
+        self._step_stats: dict[str, float | int] = self._empty_step_stats()
+        self._collect_logits = False
+        self._collect_decode_logits_only = False
+        self.collected_logits = []
+        self._last_step_tokens: dict[int, list[int]] = {}
+        self._last_step_prefix_hits: dict[int, int] = {}
+        self._last_step_decode_iterations = 0
+        self._last_step_multistep_tokens = 0
         atexit.register(self.exit)
+
+    @staticmethod
+    def _empty_step_stats() -> dict[str, float | int]:
+        return dict(prefill_steps=0, decode_steps=0, prefill_tokens=0, decode_tokens=0,
+                    prefill_time=0.0, decode_time=0.0, decode_iterations=0,
+                    multi_step_decode_steps=0, multi_step_decode_tokens=0,
+                    spec_steps=0, spec_rows=0,
+                    spec_verify_tokens=0, spec_draft_tokens=0, spec_accepted_drafts=0)
 
     def exit(self):
         # 幂等：显式调用与atexit可能都触发，且同一进程可能先后创建多个引擎（如精度对比）
         if getattr(self, "_exited", False):
             return
         self._exited = True
-        self.model_runner.call("exit")
-        del self.model_runner
+        if self._pd:
+            self.decode_runner.call("exit")
+            self.prefill_runner.call("exit")
+            del self.model_runner, self.decode_runner, self.prefill_runner
+        else:
+            self.model_runner.call("exit")
+            del self.model_runner
         for p in self.ps:
             p.join()
 
-    def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
+    def add_request(self, prompt: str | list[int], sampling_params: SamplingParams,
+                    submitted_at: float | None = None,
+                    ttft_slo_ms: float | None = None,
+                    tpot_slo_ms: float | None = None) -> int:
         # isinstance(a, b)：检查a是不是b类型的对象
         if isinstance(prompt, str):
             prompt = self.tokenizer.encode(prompt)
+        if not prompt:
+            raise ValueError("prompt must contain at least one token")
+        if ttft_slo_ms is not None and (not isfinite(ttft_slo_ms) or ttft_slo_ms <= 0):
+            raise ValueError("ttft_slo_ms must be a finite positive number")
+        if tpot_slo_ms is not None and (not isfinite(tpot_slo_ms) or tpot_slo_ms <= 0):
+            raise ValueError("tpot_slo_ms must be a finite positive number")
         seq = Sequence(prompt, sampling_params)
-        seq.t_submitted = perf_counter()  # 记录请求入队时间（基准计时）
-        self.scheduler.add(seq)
+        seq.ttft_slo_ms = (self.config.default_ttft_slo_ms
+                            if ttft_slo_ms is None else ttft_slo_ms)
+        seq.tpot_slo_ms = (self.config.default_tpot_slo_ms
+                            if tpot_slo_ms is None else tpot_slo_ms)
+        schedulers = ((self.prefill_scheduler, self.decode_scheduler) if self._pd
+                      else (self.scheduler,))
+        prompt_blocks = seq.num_blocks
+        capacity = min(
+            len(scheduler.block_manager.blocks)
+            for scheduler in schedulers
+        )
+        for scheduler in schedulers:
+            if scheduler.full_block_manager is not None:
+                capacity = min(capacity, len(scheduler.full_block_manager.blocks))
+        if prompt_blocks > capacity:
+            raise ValueError(
+                f"prompt needs {prompt_blocks} KV blocks, but the active pool can hold "
+                f"at most {capacity}; reduce prompt length or increase KV cache capacity"
+            )
+        seq.t_submitted = perf_counter() if submitted_at is None else submitted_at
+        schedulers[0].add(seq)
+        return seq.seq_id
+
+    def cancel_request(self, seq_id: int) -> bool:
+        """Remove a queued/running request and release its KV blocks."""
+        schedulers = ((self.prefill_scheduler, self.decode_scheduler) if self._pd
+                      else (self.scheduler,))
+        for scheduler in schedulers:
+            for queue in (scheduler.waiting, scheduler.running, scheduler.swapped):
+                seq = next((item for item in queue if item.seq_id == seq_id), None)
+                if seq is None:
+                    continue
+                queue.remove(seq)
+                if seq.swapped:
+                    buf = scheduler._swap_buffers.pop(seq.seq_id, None)
+                    if buf is not None:
+                        scheduler._swap_bytes -= buf.numel() * buf.element_size()
+                    seq.swapped = False
+                if seq.block_table:
+                    scheduler.block_manager.deallocate(seq)
+                if scheduler.full_block_manager is not None and seq.kv_table:
+                    scheduler.full_block_manager.deallocate(seq)
+                seq.status = SequenceStatus.FINISHED
+                seq.t_completed = perf_counter()
+                return True
+        return False
+
+    def _record_step_tokens(self, seqs: list[Sequence], before: dict[int, int]) -> None:
+        for seq in seqs:
+            start = before.get(seq.seq_id, seq.num_completion_tokens)
+            new_tokens = seq.completion_token_ids[start:]
+            if new_tokens:
+                self._last_step_tokens.setdefault(seq.seq_id, []).extend(new_tokens)
 
     def _verify(self, seqs: list[Sequence], token_ids: list[int]):
         """投机验收：把逐行样本与草稿比对，返回每序列已接受token列表。
@@ -201,8 +353,221 @@ class LLMEngine:
         for s, _ in items:
             s.draft_tokens = drafts[id(s)]
 
+    def _pd_transfer_sequence(self, seq: Sequence) -> None:
+        """Move a completed prefill sequence and its prompt KV into the decode pool."""
+        cached_tokens = seq.num_cached_tokens
+        assert cached_tokens == seq.num_prompt_tokens, (
+            f"prefill handoff has {cached_tokens}/{seq.num_prompt_tokens} cached tokens")
+        source_blocks = list(seq.block_table)
+        host_kv = self.prefill_runner.call("export_kv", source_blocks, cached_tokens)
+
+        self.prefill_scheduler.running.remove(seq)
+        self.prefill_scheduler.block_manager.deallocate(seq)
+        seq.num_cached_tokens = cached_tokens
+        seq.is_prefill = False
+        seq.draft_tokens = None
+        self.decode_scheduler.block_manager.allocate_private(seq)
+        try:
+            self.decode_runner.call("import_kv", list(seq.block_table),
+                                    cached_tokens, host_kv)
+        except Exception:
+            self.decode_scheduler.block_manager.deallocate(seq)
+            raise
+        self.decode_scheduler.running.append(seq)
+
+    def _step_pd_prefill(self) -> tuple[list[Sequence], int, bool]:
+        scheduler = self.prefill_scheduler
+        if not scheduler.waiting:
+            return [], 0, False
+
+        scheduler._order_waiting()
+        seqs, kind = scheduler._schedule_prefill()
+        self._last_step_prefix_hits.update(
+            (seq.seq_id, seq.num_prefix_cached_tokens) for seq in seqs)
+        if kind != "prefill":
+            raise RuntimeError("PD prefill scheduler produced a non-prefill batch")
+        before = {seq.seq_id: seq.num_completion_tokens for seq in seqs}
+        n_tokens = sum(seq.num_scheduled_tokens for seq in seqs)
+        for old_id, new_id in scheduler.cow_pairs:
+            self.prefill_runner.call("cow_block", old_id, new_id)
+
+        run_started = perf_counter()
+        collect_logits = (self._collect_logits
+                          and not self._collect_decode_logits_only)
+        result = self.prefill_runner.call(
+            "run", seqs, "prefill", collect_logits, False)
+        scheduler.observe_prefill(n_tokens, perf_counter() - run_started)
+        if collect_logits:
+            token_ids, logits = result
+            self.collected_logits.append(("prefill", logits))
+        else:
+            token_ids = result
+        scheduler.postprocess(seqs, token_ids)
+        self._record_step_tokens(seqs, before)
+
+        finished = []
+        for seq in seqs:
+            if seq.is_finished:
+                finished.append(seq)
+            elif (seq.status == SequenceStatus.RUNNING
+                  and seq.num_completion_tokens > 0
+                  and seq.num_cached_tokens == seq.num_prompt_tokens):
+                self._pd_transfer_sequence(seq)
+        return finished, n_tokens, True
+
+    def _run_decode_burst(self, scheduler: Scheduler, runner: ModelRunner,
+                          initial_decode_tokens: int, *, collect_logits: bool,
+                          yield_for_prefill: bool = False) -> int:
+        """Run bounded follow-up decode forwards before yielding to the outer loop.
+
+        The first decode batch was prepared by ``schedule`` and has already run.
+        Follow-up rounds use the same scheduler state and normal KV append/COW/swap
+        accounting. Prefill, PD prefill handoff, and speculative paths never enter
+        this helper, so each returned engine step remains streamable.
+        """
+        total_decode_tokens = initial_decode_tokens
+        if (not self.config.multi_step_decode or self.config.max_decode_steps <= 1
+                or self.config.speculative != "none" or scheduler.waiting
+                or scheduler.swapped or yield_for_prefill):
+            return total_decode_tokens
+
+        for _ in range(1, self.config.max_decode_steps):
+            if not scheduler.running or scheduler.waiting or scheduler.swapped:
+                break
+            scheduler._order_running_by_tpot()
+            scheduler.cow_pairs = []
+            scheduler.swap_pairs = []
+            seqs, kind = scheduler._schedule_decode()
+            if kind != "decode" or not seqs:
+                break
+            for old_id, new_id in scheduler.cow_pairs:
+                runner.call("cow_block", old_id, new_id)
+            for seq, block_ids, buf, direction in scheduler.swap_pairs:
+                transfer_bytes = buf.numel() * buf.element_size()
+                transfer_started = perf_counter()
+                if direction == "out":
+                    runner.call("swap_out", block_ids, buf)
+                    scheduler.finish_swap_out(seq, block_ids)
+                else:
+                    runner.call("swap_in", block_ids, buf)
+                    scheduler.finish_swap_in(seq)
+                scheduler.observe_kv_transfer(
+                    transfer_bytes, perf_counter() - transfer_started)
+
+            before = {seq.seq_id: seq.num_completion_tokens for seq in seqs}
+            result = runner.call("run", seqs, "decode", collect_logits, False)
+            if collect_logits:
+                token_ids, logits = result
+                self.collected_logits.append(("decode", logits))
+            else:
+                token_ids = result
+            scheduler.postprocess(seqs, token_ids)
+            self._record_step_tokens(seqs, before)
+            total_decode_tokens += len(token_ids)
+            self._last_step_multistep_tokens += len(token_ids)
+            self._last_step_decode_iterations += 1
+        return total_decode_tokens
+
+    def _step_pd_decode(self) -> tuple[list[Sequence], int, int, bool]:
+        scheduler = self.decode_scheduler
+        if not (scheduler.waiting or scheduler.running or scheduler.swapped):
+            return [], 0, 0, False
+
+        seqs, kind = scheduler.schedule()
+        self._last_step_prefix_hits.update(
+            (seq.seq_id, seq.num_prefix_cached_tokens) for seq in seqs)
+        before = {seq.seq_id: seq.num_completion_tokens for seq in seqs}
+        n_prefill = sum(seq.num_scheduled_tokens for seq in seqs if seq.is_prefill)
+        n_decode = sum(1 for seq in seqs if not seq.is_prefill)
+        for old_id, new_id in scheduler.cow_pairs:
+            self.decode_runner.call("cow_block", old_id, new_id)
+        for seq, block_ids, buf, direction in scheduler.swap_pairs:
+            transfer_bytes = buf.numel() * buf.element_size()
+            transfer_started = perf_counter()
+            if direction == "out":
+                self.decode_runner.call("swap_out", block_ids, buf)
+                scheduler.finish_swap_out(seq, block_ids)
+            else:
+                self.decode_runner.call("swap_in", block_ids, buf)
+                scheduler.finish_swap_in(seq)
+            scheduler.observe_kv_transfer(
+                transfer_bytes, perf_counter() - transfer_started)
+
+        prefill_tokens = sum(seq.num_scheduled_tokens for seq in seqs if seq.is_prefill)
+        run_started = perf_counter()
+        collect_logits = (self._collect_logits
+                          and (not self._collect_decode_logits_only or kind == "decode"))
+        result = self.decode_runner.call(
+            "run", seqs, kind, collect_logits, False)
+        if kind == "prefill":
+            scheduler.observe_prefill(prefill_tokens, perf_counter() - run_started)
+        if collect_logits:
+            token_ids, logits = result
+            self.collected_logits.append((kind, logits))
+        else:
+            token_ids = result
+        scheduler.postprocess(seqs, token_ids)
+        self._record_step_tokens(seqs, before)
+        if kind in ("decode", "mixed", "spec") and n_decode:
+            self._last_step_decode_iterations = 1
+        if kind == "decode":
+            n_decode = self._run_decode_burst(
+                scheduler, self.decode_runner, n_decode,
+                collect_logits=self._collect_logits,
+                yield_for_prefill=bool(self.prefill_scheduler.waiting))
+        return [seq for seq in seqs if seq.is_finished], n_prefill, n_decode, True
+
+    def _step_pd(self):
+        """Run separate prefill/decode batches and hand prompt KV between GPU pools."""
+        self._last_step_prefix_hits = {}
+        self.prefill_scheduler.external_tpot_target_active = (
+            self.decode_scheduler._has_active_tpot_target())
+        self.prefill_scheduler.external_tpot_pressure = (
+            self.decode_scheduler._tpot_decode_pressure())
+        prefill_done, n_prefill, _ = self._step_pd_prefill()
+        decode_done, decode_prefill, n_decode, did_decode = self._step_pd_decode()
+        n_prefill += decode_prefill
+        finished = prefill_done + decode_done
+        for seq in finished:
+            self._req_metrics.append({
+                "seq_id": seq.seq_id,
+                "prompt_tokens": seq.num_prompt_tokens,
+                "completion_tokens": len(seq.completion_token_ids),
+                "t_submitted": seq.t_submitted,
+                "t_prefill_started": seq.t_prefill_started,
+                "t_first_token": seq.t_first_token,
+                "t_completed": seq.t_completed,
+                "prefix_cached_tokens": seq.num_prefix_cached_tokens,
+                "ttft_slo_ms": seq.ttft_slo_ms,
+                "ttft_slo_met": self._ttft_slo_met(seq),
+                "tpot_slo_ms": seq.tpot_slo_ms,
+                "tpot_slo_met": self._tpot_slo_met(seq),
+            })
+        outputs = [(seq.seq_id, seq.completion_token_ids) for seq in finished]
+        if n_prefill and n_decode:
+            kind = "mixed"  # separate prefill/decode batches ran during this engine step
+        elif n_prefill:
+            kind = "prefill"
+        elif did_decode:
+            kind = "decode"
+        else:
+            raise RuntimeError("PD engine has pending requests but neither stage made progress")
+        return outputs, kind, n_prefill, n_decode
+
     def step(self):
+        self._last_step_tokens = {}
+        self._last_step_prefix_hits = {}
+        self._last_step_decode_iterations = 0
+        self._last_step_multistep_tokens = 0
+        if self._pd:
+            return self._step_pd()
         seqs, kind = self.scheduler.schedule()  # kind ∈ {"prefill", "decode", "mixed", "spec"}
+        self._last_step_prefix_hits.update(
+            (seq.seq_id, seq.num_prefix_cached_tokens) for seq in seqs)
+        before = {seq.seq_id: seq.num_completion_tokens for seq in seqs}
+        scheduled_prefill_tokens = sum(
+            seq.num_scheduled_tokens for seq in seqs if seq.is_prefill)
+        scheduled_decode_rows = sum(1 for seq in seqs if not seq.is_prefill)
         # 本步是否含verify行（投机）：任一行带draft_tokens（[]也算，表示γ=0的verify行）
         has_spec = any(seq.draft_tokens is not None for seq in seqs)
         # Medusa/EAGLE模式：spec步需要最后一层hidden（下轮草稿输入）
@@ -213,17 +578,37 @@ class LLMEngine:
             self.model_runner.call("cow_block", old_id, new_id)
         # KV swap 拷贝（同 COW 时机）：换出 GPU→CPU、换入 CPU→GPU（新私有块，run 前填好）。
         # 换出对在拷贝完成后释放块（finish_swap_out）——块在拷贝前保持占用，
-        # 避免本步内被重分配覆盖内容。TP=1 且非 fp8 KV 时启用（见 Scheduler.kv_swap）
+        # 避免本步内被重分配覆盖内容。TP=1 时启用；FP8 在 CPU 端按 uint8 原始字节暂存。
         for seq, block_ids, buf, direction in self.scheduler.swap_pairs:
+            transfer_bytes = buf.numel() * buf.element_size()
+            transfer_started = perf_counter()
             if direction == "out":
                 self.model_runner.call("swap_out", block_ids, buf)
                 self.scheduler.finish_swap_out(seq, block_ids)
             else:
                 self.model_runner.call("swap_in", block_ids, buf)
+                self.scheduler.finish_swap_in(seq)
+            self.scheduler.observe_kv_transfer(
+                transfer_bytes, perf_counter() - transfer_started)
         # 运行模型，返回采样出的token（精度检查模式下同时返回本步logits）
-        result = self.model_runner.call("run", seqs, kind, self._collect_logits, return_hidden)
+        run_started = perf_counter()
+        collect_logits = (self._collect_logits
+                          and (not self._collect_decode_logits_only or kind == "decode"))
+        result = self.model_runner.call("run", seqs, kind, collect_logits, return_hidden)
+        run_elapsed = perf_counter() - run_started
+        if kind == "prefill":
+            self.scheduler.observe_prefill(
+                scheduled_prefill_tokens, run_elapsed)
+        elif kind == "mixed" and scheduled_prefill_tokens:
+            # Continuous-arrival batches are often mixed for long stretches. Use
+            # the same proportional attribution as benchmark metrics so the
+            # recompute-cost EWMA does not stay at its fallback forever.
+            estimated_prefill_elapsed = run_elapsed * scheduled_prefill_tokens / (
+                scheduled_prefill_tokens + scheduled_decode_rows)
+            self.scheduler.observe_prefill(
+                scheduled_prefill_tokens, estimated_prefill_elapsed)
         hidden = None
-        if self._collect_logits:
+        if collect_logits:
             if return_hidden:
                 token_ids, logits, hidden = result
             else:
@@ -257,18 +642,25 @@ class LLMEngine:
                 self._eagle_drafts(seqs, hidden, n_acc_list, n_rows_list)
             else:
                 self._medusa_drafts(seqs, hidden, n_acc_list, n_rows_list)
+        self._record_step_tokens(seqs, before)
+        if kind in ("decode", "mixed", "spec") and scheduled_decode_rows:
+            self._last_step_decode_iterations = 1
+        if kind == "decode":
+            n_decode = self._run_decode_burst(
+                self.scheduler, self.model_runner, scheduled_decode_rows,
+                collect_logits=self._collect_logits)
         # 统计用token数：prefill步为正（prefill token数），decode步为负（序列数），
         # mixed步拆分返回prefill/decode各自的数量
         if kind == "prefill":
-            n_prefill, n_decode = sum(seq.num_scheduled_tokens for seq in seqs), 0
+            n_prefill, n_decode = scheduled_prefill_tokens, 0
         elif kind == "decode":
-            n_prefill, n_decode = 0, len(seqs)
+            n_prefill = 0
         elif kind == "spec":
             n_prefill = 0  # n_decode 已在验收中按实际接受数统计
         else:  # mixed
-            n_prefill = sum(seq.num_scheduled_tokens for seq in seqs if seq.is_prefill)
+            n_prefill = scheduled_prefill_tokens
             if not has_spec:
-                n_decode = sum(1 for seq in seqs if not seq.is_prefill)
+                n_decode = scheduled_decode_rows
         # 调度器完成后处理，如追加token、更新缓存、判断是否结束等
         # 快照已结束请求的计时信息（基准测试使用；driver侧数据完整）
         for seq in seqs:
@@ -278,15 +670,40 @@ class LLMEngine:
                     "prompt_tokens": seq.num_prompt_tokens,
                     "completion_tokens": len(seq.completion_token_ids),
                     "t_submitted": seq.t_submitted,
+                    "t_prefill_started": seq.t_prefill_started,
                     "t_first_token": seq.t_first_token,
                     "t_completed": seq.t_completed,
+                    "prefix_cached_tokens": seq.num_prefix_cached_tokens,
+                    "ttft_slo_ms": seq.ttft_slo_ms,
+                    "ttft_slo_met": self._ttft_slo_met(seq),
+                    "tpot_slo_ms": seq.tpot_slo_ms,
+                    "tpot_slo_met": self._tpot_slo_met(seq),
                 })
         # 收集已经完成的请求
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
         return outputs, kind, n_prefill, n_decode
 
     def is_finished(self):
+        if self._pd:
+            return (self.prefill_scheduler.is_finished()
+                    and self.decode_scheduler.is_finished())
         return self.scheduler.is_finished()
+
+    @staticmethod
+    def _ttft_slo_met(seq: Sequence) -> bool | None:
+        if (seq.ttft_slo_ms is None or seq.t_submitted is None
+                or seq.t_first_token is None):
+            return None
+        return (seq.t_first_token - seq.t_submitted) * 1000 <= seq.ttft_slo_ms
+
+    @staticmethod
+    def _tpot_slo_met(seq: Sequence) -> bool | None:
+        if (seq.tpot_slo_ms is None or seq.t_first_token is None
+                or seq.t_completed is None or seq.num_completion_tokens <= 1):
+            return None
+        tpot_ms = ((seq.t_completed - seq.t_first_token) * 1000.0
+                   / (seq.num_completion_tokens - 1))
+        return tpot_ms <= seq.tpot_slo_ms
 
     def generate(
         self,
@@ -294,6 +711,7 @@ class LLMEngine:
         sampling_params: SamplingParams | list[SamplingParams],
         use_tqdm: bool = True, # use_tqdm:是否显示进度条
         collect_logits: bool = False, # 精度检查：逐step收集logits到self.collected_logits
+        collect_decode_logits_only: bool = False,
     ) -> list[str]:
         # 创建一个进度条，总共有len(prompts)个任务，进度条前缀显示"Generating",
         # dynamic_ncols=True：让进度条自适应终端宽度，disabel：是否禁用进度条
@@ -306,16 +724,28 @@ class LLMEngine:
         prefill_throughput = decode_throughput = 0.
         # 重置基准计时统计
         self._req_metrics = []
-        self._step_stats = dict(prefill_steps=0, decode_steps=0, prefill_tokens=0, decode_tokens=0,
-                                prefill_time=0.0, decode_time=0.0,
-                                spec_steps=0, spec_rows=0, spec_verify_tokens=0, spec_draft_tokens=0,
-                                spec_accepted_drafts=0)
+        self._step_stats = self._empty_step_stats()
+        for scheduler in ((self.prefill_scheduler, self.decode_scheduler) if self._pd
+                          else (self.scheduler,)):
+            scheduler.reset_metrics()
+        graph_runners = ([self.prefill_runner, self.decode_runner] if self._pd
+                         else [self.model_runner])
+        for runner in graph_runners:
+            runner.mixed_cudagraph_capture_count = 0
+            runner.mixed_cudagraph_replay_count = 0
+            runner.mixed_cudagraph_eager_fallbacks = 0
         self._collect_logits = collect_logits
+        self._collect_decode_logits_only = collect_decode_logits_only
         self.collected_logits = []
         while not self.is_finished():
             t = perf_counter()
             output, kind, n_prefill, n_decode = self.step()
             dt = perf_counter() - t
+            self._step_stats["decode_iterations"] += self._last_step_decode_iterations
+            self._step_stats["multi_step_decode_tokens"] += (
+                self._last_step_multistep_tokens)
+            if self._last_step_decode_iterations > 1:
+                self._step_stats["multi_step_decode_steps"] += 1
             # 累计逐step统计（基准测试使用）；mixed步按token比例拆分时间归属
             if kind == "prefill":
                 self._step_stats["prefill_steps"] += 1
@@ -362,7 +792,89 @@ class LLMEngine:
           {spec_steps, spec_verify_tokens, spec_draft_tokens, spec_accepted_drafts}
           （α = spec_accepted_drafts / spec_draft_tokens）。
         - num_preemptions: 本次generate中的KV cache抢占次数。
+        - prefix feature/cache lifecycle: parse/reuse由scheduler统计；generation失效、KV
+          mutation、LRU eviction与deferred-free refs/flush/peak由BlockManager统计。
         """
-        return {"per_request": list(self._req_metrics), "step_stats": dict(self._step_stats),
-                "num_preemptions": self.scheduler.num_preemptions,
-                "num_swaps": self.scheduler.num_swaps}
+        schedulers = ((self.prefill_scheduler, self.decode_scheduler) if self._pd
+                      else (self.scheduler,))
+        block_managers = [s.block_manager for s in schedulers]
+        block_managers.extend(
+            s.full_block_manager for s in schedulers
+            if s.full_block_manager is not None)
+        slo_steps = sum(s.num_slo_prefill_steps for s in schedulers)
+        tpot_steps = sum(s.num_tpot_prefill_steps for s in schedulers)
+        graph_runner = self.decode_runner if self._pd else self.model_runner
+        return {
+            "per_request": list(self._req_metrics),
+            "step_stats": dict(self._step_stats),
+            "num_preemptions": sum(s.num_preemptions for s in schedulers),
+            "num_swaps": sum(s.num_swaps for s in schedulers),
+            "num_recompute_preemptions": sum(
+                s.num_recompute_preemptions for s in schedulers),
+            "recompute_tokens": sum(s.recompute_tokens for s in schedulers),
+            "estimated_recompute_seconds": sum(
+                s.estimated_recompute_seconds for s in schedulers),
+            "estimated_swap_seconds": sum(s.estimated_swap_seconds for s in schedulers),
+            "num_affinity_probes": sum(s.num_affinity_probes for s in schedulers),
+            "num_prefix_feature_parses": sum(
+                s.num_prefix_feature_parses for s in schedulers),
+            "num_prefix_feature_reuses": sum(
+                s.num_prefix_feature_reuses for s in schedulers),
+            "prefix_cache_hit_tokens": sum(s.prefix_cache_hit_tokens for s in schedulers),
+            "prefix_cache_hit_requests": sum(
+                s.prefix_cache_hit_requests for s in schedulers),
+            "prefix_cache_evictions": sum(
+                manager.prefix_cache_evictions for manager in block_managers),
+            "prefix_cache_lru_entries": sum(
+                len(manager.prefix_lru) for manager in block_managers),
+            "prefix_cache_generation": sum(
+                manager.kv_generation for manager in block_managers),
+            "kv_generation_mutations": sum(
+                manager.kv_generation_mutations for manager in block_managers),
+            "prefix_feature_invalidations": sum(
+                manager.prefix_feature_invalidations for manager in block_managers),
+            "deferred_free_refs_queued": sum(
+                manager.deferred_free_refs_queued for manager in block_managers),
+            "deferred_free_refs_committed": sum(
+                manager.deferred_free_refs_committed for manager in block_managers),
+            "deferred_free_flushes": sum(
+                manager.deferred_free_flushes for manager in block_managers),
+            "deferred_free_peak_blocks": max(
+                (manager.deferred_free_peak_blocks for manager in block_managers),
+                default=0),
+            "deferred_free_peak_refs": max(
+                (manager.deferred_free_peak_refs for manager in block_managers),
+                default=0),
+            "deferred_free_pending_blocks": sum(
+                len(set(manager.deferred_free_block_ids))
+                for manager in block_managers),
+            "deferred_free_pending_refs": sum(
+                len(manager.deferred_free_block_ids) for manager in block_managers),
+            "mixed_cudagraph": {
+                "enabled": self.config.mixed_cudagraph and not self.config.enforce_eager,
+                "max_graphs": self.config.mixed_cudagraph_max_graphs,
+                "max_tokens": self.config.mixed_cudagraph_max_tokens,
+                "cached_shapes": len(getattr(graph_runner, "mixed_graphs", {})),
+                "captures": graph_runner.mixed_cudagraph_capture_count,
+                "replays": graph_runner.mixed_cudagraph_replay_count,
+                "eager_fallbacks": graph_runner.mixed_cudagraph_eager_fallbacks,
+            },
+            "num_aging_promotions": sum(s.num_aging_promotions for s in schedulers),
+            "slo_prefill_steps": slo_steps,
+            "adaptive_prefill_tokens_avg": (
+                sum(s.slo_prefill_budget_sum for s in schedulers) / slo_steps
+                if slo_steps else 0.0),
+            "adaptive_prefill_tokens_max": max(
+                (s.slo_prefill_budget_max for s in schedulers), default=0),
+            "adaptive_prefill_rows_avg": (
+                sum(s.slo_prefill_rows_sum for s in schedulers) / slo_steps
+                if slo_steps else 0.0),
+            "tpot_prefill_steps": tpot_steps,
+            "tpot_priority_steps": sum(s.num_tpot_priority_steps for s in schedulers),
+            "tpot_adaptive_prefill_tokens_avg": (
+                sum(s.tpot_prefill_budget_sum for s in schedulers) / tpot_steps
+                if tpot_steps else 0.0),
+            "multi_step_decode_tokens": self._step_stats["multi_step_decode_tokens"],
+            "multi_step_decode_enabled": self.config.multi_step_decode,
+            "max_decode_steps": self.config.max_decode_steps,
+        }

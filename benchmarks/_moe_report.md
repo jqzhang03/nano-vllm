@@ -1,5 +1,7 @@
 # MoE 支持报告（阶段 1.5：router + 循环专家 + 量化 + 引擎验证）
 
+> **阶段快照说明（2026-10-05）**：本报告中的“本机无 MoE 真实模型”和真实模型显存估算是阶段 1.5 当时的记录，不是当前状态。后续阶段已完成 DeepSeek-V2-Lite 的 4 层真权重 parity 和全量流式 int4 推理；见 [`_stage2b_ext_report.md`](_stage2b_ext_report.md)。本报告仍保留随机 Qwen3-MoE toy 的机制验证结果，不能把 toy 精度/吞吐外推到真实模型。
+>
 > 条件：RTX 5060 Ti 16GB (sm_120) / WSL2 / torch 2.8.0+cu128 / transformers 5.15 /
 > 本机无 MoE 真实模型 → 验证用**随机 toy 模型**（Qwen3-MoE 结构、4 层 = 2 dense + 2 MoE
 > 混合、E=8/k=2、tie 词表、bf16）——机制正确性金标准 = 与 transformers 同权重同 dtype
@@ -119,13 +121,15 @@ mean diff 0.0031**（与 bmm 后端一致）。
 toy decode 单次 2588 tok/s（此前 loop 档 927-1110）；fp16/fp8 仍在时钟噪声带——见
 §4b 层级基准（可靠证据）。
 
-## 6. 真实模型边界（诚实标注：本机无 MoE 真权重；hub 网络本轮不可达 → 离线估算待核对）
+## 6. 真实模型边界（阶段 1.5 的历史记录；后续状态见阶段 2b-ext）
+
+下表里的体积均为当时基于 config 的下载前估算，不能代替后续实测。DeepSeek-V2-Lite 后续已下载并跑过真实权重，详见阶段 2b-ext 报告。
 
 | 模型 | 结构线索（config） | int4 权重估算 | 16GB 卡 | 下载（bf16） |
 |---|---|---|---|---|
 | Qwen3-30B-A3B | 128 experts/top-8?（以真实 config 为准） | ~15.5GB | **✗ 超可用显存**（~14GB） | ~60GB，需核对 |
 | Qwen1.5-MoE-A2.7B | 老架构（per-expert 文件） | ~7.5GB | ✓ 可跑 | ~28GB+，需核对权重格式 |
-| DeepSeek-V2-Lite | MLA+MoE（阶段 2 目标） | ~8GB | ✓ 可跑 | ~30GB，需核对格式 |
+| DeepSeek-V2-Lite | MLA+MoE（当时的阶段 2 目标） | ~8GB（旧估算） | 旧估算为可跑 | 后续实际验证：4 层 parity；全量 27 层流式 int4 常驻权重约 5GB |
 
 所有"需核对"项 = 下载前用 config.json/safetensors 清单确认（本机 hub 连接不稳定，
 联网后跑 `benchmarks/_moe_model_probe.py` 一次拿准）。
@@ -143,7 +147,7 @@ toy decode 单次 2588 tok/s（此前 loop 档 927-1110）；fp16/fp8 仍在时�
   是 MoE 分布式正题，未做（单卡）。
 - **shared expert**：transformers 5.15 的 qwen3_moe 已无 shared；如需（Qwen3-235B 类）
   在 MoE 上加回（设计已留空）。
-- 真实模型：下载/显存边界见 §6；DeepSeek-V2-Lite 的 MLA+MoE 端到端是阶段 2。
+- 真实模型：阶段 1.5 时未做真实 MoE 权重精度/性能验证；DeepSeek-V2-Lite 的后续验证已完成部分 parity 与全量流式 int4 运行，但不能替代完整 MoE workload/量化矩阵测试，见阶段 2b-ext。
 
 ## 8. 面试要点
 
@@ -155,4 +159,4 @@ toy decode 单次 2588 tok/s（此前 loop 档 927-1110）；fp16/fp8 仍在时�
 - **能讲 grouped 后端演进**：组织税实测 3.8ms/层 → sort+padded bmm（fused gate_up）
   后 0.7ms（-80%），小 T 快 4-5×；padded 批量在均衡路由下近 1× 计算、不均衡时放大
   到 E·max_n（真段式是下一步）；int4 dual-path 因 w_deq 自动获益（引擎 ~2.4-2.8× 观察）。
-- 诚实边界：无真实模型精度数字；引擎绝对吞吐受 WSL 时钟噪声（以层级/同刻对比为准）。
+- 诚实边界：本报告的随机 Qwen3-MoE toy 没有真实模型精度数字；后续 DeepSeek-V2-Lite 只验证了特定层切片 parity 和流式 int4 运行，并未覆盖完整 MoE workload/量化矩阵。引擎绝对吞吐受 WSL 时钟噪声（以层级/同刻对比为准）。

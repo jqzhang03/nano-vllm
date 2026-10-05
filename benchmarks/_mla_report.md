@@ -1,5 +1,7 @@
 # 阶段 2a：MLA（Multi-head Latent Attention）报告
 
+> **阶段快照说明（2026-10-05）**：本报告记录 MLA 首次接入时的状态；其中“尚未实现/未验证”只描述阶段 2a。后续阶段已实现 FP8 KV×MLA toy 路径、保留 MLA `kv_b` 的小型反量化视图以支持流式纯 int4/FP8 吸收式 decode，并完成 DeepSeek-V2-Lite 4 层 parity 与全量流式 int4 运行。后续证据见 [`_stage2b_ext_report.md`](_stage2b_ext_report.md)。真实 V2-Lite 的 FP8 KV 端到端仍未验证。
+
 ## 1. 交付物
 
 | 文件 | 内容 |
@@ -55,7 +57,7 @@
 ## 6. 设计决策与诚实边界
 
 - **吸收式解码**：W_UK 吸收进 q（每步每头一次 128×512）、W_UV 吸收进输出（kernel 内只累加 [h, kv_lora] 潜在加权和，出内核一次 v 投影）→ 每 token 每层只读 576 元素；
-- decode 快路径要求 kv_b 有 float 视图（未量化 / int4 dual-path w_deq）；纯 int4/fp8（streaming 强制）→ **稠密兜底解码**（整段缓存逐层稠密化 + varlen），正确性等价、带宽优势消失（自动强制 eager）——真模型 int4 8GB 可跑但 decode 走兜底，性能预期差，诚实标注；
+- decode 快路径要求 kv_b 有 float 视图。当前 MLA `kv_b` 对 int4/fp8 特别保留约 1% 参数量的 `w_deq`，所以流式纯 int4/fp8 仍可走吸收式 decode；没有 float 视图的其他量化路径仍使用稠密兜底并强制 eager。该行为在本报告之后的 2b-ext 阶段加入；
 - cache-shaped 行（spec verify / 分块续写 / 前缀复用）→ 缓存前缀 gather + kv_b 稠密化 + 行主序组装（每层一次性）；spec 步 MLA 保持 eager（组装动态形状不可入图）；
-- fp8 KV + MLA fused cache 未实现（断言报错）；MLA cache 每层 576 元素/token，容量账本见上；
-- 未做：真实 DeepSeek-V2-Lite checkpoint 验证（bf16 ≈30GB 下载；hub 从 WSL 当前超时，`_ds_probe.py` 就绪）；decode 带宽实测（需真实模型或长序列 toy 基准，见阶段 2b 报告）；量化段式等。
+- FP8 KV + MLA fused cache 已在后续实现并通过 toy 路径检查；真实 V2-Lite 的 FP8 KV 尚未测。MLA cache 每层 576 元素/token，容量账本见上；
+- 本阶段未做的真实 DeepSeek-V2-Lite 验证已在 2b-ext 后续完成：4 层切片 parity 与全量流式 int4 推理。该模型 FP8 KV 与独立 decode 带宽微基准仍未验证；更完整的量化/真模型结果见阶段 2b-ext 报告。

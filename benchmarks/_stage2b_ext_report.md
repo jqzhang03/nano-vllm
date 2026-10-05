@@ -2,6 +2,8 @@
 
 日期/硬件：RTX 5060 Ti 16GB（sm_120）/ WSL2（RAM 11GB+4GB swap，前 7GB 反复 OOM 后调大）
 
+> **当前状态说明（2026-10-05）**：本报告记录 MLA/rolling-cache 的组合验证，不含后续 HTTP 服务、会话管理或在线调度策略的性能数据。本文的 Gemma-2 split 是单个 ModelRunner/GPU 内的 local/global 两个 KV 池，**不是** Prefill/Decode 双 GPU 分离。当前系统状态和 PD 限制见仓库根目录 `README.md` / `INTERVIEW.md`。
+
 ## 1. 新增能力（相对 2b 的断言关）
 
 | 能力 | 落点 | 说明 |
@@ -9,7 +11,7 @@
 | fp8 KV + 环 | `attention.py` fp8 decode 传 `chunk_starts` | fp8 内核按行首块号 j0 还原位置（store 带 scale 不变） |
 | fp8 KV + MLA | `attention_mla.py` fused 行两段独立 scale | e4m3 存储 1B/元素；写时 [c\|k̃] 各自量化、读时（内核/稠密装配/吸收式）各自反量化；`_mla_check` 的 gather+dequant 内核 |
 | 投机（ngram）+ 环 | BlockManager 环 spec 账本修正 + `_ring_rows` 装配 | verify 行 key 集 = 环内现存行 [j0·B, end) 稠密装配喂 flash（段内相对下标使窗口掩码精确）；ring slack = γ+2 |
-| 非统一窗口（gemma2 split） | 双池：环池（local 层）+ full 池（global 层） | 双 BlockManager（full=no_share 普通分页）、双 GPU cache、Context full_* 侧、内核 softcap（cap·tanh） |
+| 非统一窗口（gemma2 split） | 双池：环池（local 层）+ full 池（global 层） | 单卡上两个独立 KV cache / BlockManager（full=no_share 普通分页）、Context full_* 侧、内核 softcap（cap·tanh） |
 | 纯 int4/fp8 MLA decode | kv_b 反量化副本保留（`is_mla_kv_b` → w_deq） | 流式纯 int4/fp8 不再落稠密兜底/不再强制 eager（占参 ~1%，V2-Lite 实测 113MB） |
 | int4 组大小可配 + 尾 K 掩码 | `int4_group_size` Config + 内核 GROUP 展开 | DeepSeek-V2-Lite dense 中间维 10944=64×171 不能被 128 整除（官方社区 int4 同约束） |
 
@@ -54,7 +56,7 @@
 | ring + bf16/fp8 KV + decode + graph | ✅（fp8 真机逐位证据） |
 | ring + ngram spec（bf16/fp8 KV） | ✅（eager verify，α=0 路径验证） |
 | ring + medusa/eagle spec | ❌ 断言关 |
-| gemma2 交替窗口 ring（split, bf16, no-spec, eager） | ✅ |
+| gemma2 交替窗口 ring（split, auto KV；本实测为 bf16；no-spec, eager） | ✅ |
 | split + fp8 KV / spec / graph / swap | ❌ 断言关（fp8 与 softcap 冲突等） |
 | MLA fp8 KV（decode 内核/稠密装配/吸收式） | ✅ toy；真实模型未跑（fp8 KV 与真实 V2-Lite 时间成本未覆盖） |
 | MLA 纯 int4/fp8 权重 decode | ✅（kv_b 反量化副本；稠密兜底仅剩 w8a8/sparse24 情形） |
