@@ -246,6 +246,7 @@ def make_summary(metrics):
         "decode_iterations": stats.get("decode_iterations", stats["decode_steps"]),
         "multi_step_decode_steps": stats.get("multi_step_decode_steps", 0),
         "multi_step_decode_tokens": stats.get("multi_step_decode_tokens", 0),
+        "decode_burst_pressure_yields": stats.get("decode_burst_pressure_yields", 0),
         "prefill_tokens": stats["prefill_tokens"],
         "decode_tokens": stats["decode_tokens"],
         "num_preemptions": metrics.get("num_preemptions", 0),
@@ -331,7 +332,8 @@ def print_report(args, wall, metrics, kv_info, vllm_res=None, out_path=None):
                     + (f" ({s['decode_throughput_tok_per_s']:.0f} tok/s)" if s["decode_throughput_tok_per_s"] else "")))
     line("decode forwards", (f"{s['decode_iterations']} total; "
                               f"{s['multi_step_decode_steps']} multi-step engine steps; "
-                              f"{s['multi_step_decode_tokens']} extra tokens"))
+                              f"{s['multi_step_decode_tokens']} extra tokens; "
+                              f"{s['decode_burst_pressure_yields']} pressure yields"))
     line("preemptions", f"{s['num_preemptions']} (KV cache 不足导致的抢占；0 表示容量充足)")
     line("kv swaps", f"{s['num_swaps']} (KV 换出到 CPU 的次数；swap 免重新prefill)")
     line("recompute preempts", f"{s['num_recompute_preemptions']} ({s['recompute_tokens']} estimated tokens)")

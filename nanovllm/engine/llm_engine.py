@@ -1,9 +1,11 @@
 import atexit
 import logging
+import threading
 from math import isfinite
 from copy import copy
 from dataclasses import fields
 from time import perf_counter
+from typing import Callable
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
 import torch
@@ -117,6 +119,9 @@ class LLMEngine:
         self._last_step_prefix_hits: dict[int, int] = {}
         self._last_step_decode_iterations = 0
         self._last_step_multistep_tokens = 0
+        self._last_step_decode_burst_yielded = False
+        self._decode_burst_yield_signal = threading.Event()
+        self._decode_burst_yield_callback: Callable[[], bool] | None = None
         atexit.register(self.exit)
 
     @staticmethod
@@ -211,6 +216,26 @@ class LLMEngine:
             new_tokens = seq.completion_token_ids[start:]
             if new_tokens:
                 self._last_step_tokens.setdefault(seq.seq_id, []).extend(new_tokens)
+
+    def request_decode_burst_yield(self) -> None:
+        """Ask the current decode burst to stop after its active forward."""
+        self._decode_burst_yield_signal.set()
+
+    def clear_decode_burst_yield(self) -> None:
+        """Clear service pressure after queued requests reach the engine."""
+        self._decode_burst_yield_signal.clear()
+
+    def set_decode_burst_yield_callback(
+        self, callback: Callable[[], bool] | None,
+    ) -> None:
+        """Install an optional arrival-pressure probe, primarily for trace replay."""
+        self._decode_burst_yield_callback = callback
+
+    def _decode_burst_pressure_active(self) -> bool:
+        if self._decode_burst_yield_signal.is_set():
+            return True
+        callback = self._decode_burst_yield_callback
+        return bool(callback is not None and callback())
 
     def _verify(self, seqs: list[Sequence], token_ids: list[int]):
         """投机验收：把逐行样本与草稿比对，返回每序列已接受token列表。
@@ -417,9 +442,15 @@ class LLMEngine:
                 self._pd_transfer_sequence(seq)
         return finished, n_tokens, True
 
-    def _run_decode_burst(self, scheduler: Scheduler, runner: ModelRunner,
-                          initial_decode_tokens: int, *, collect_logits: bool,
-                          yield_for_prefill: bool = False) -> int:
+    def _run_decode_burst(
+        self,
+        scheduler: Scheduler,
+        runner: ModelRunner,
+        initial_decode_tokens: int,
+        *,
+        collect_logits: bool,
+        yield_for_prefill: bool = False,
+    ) -> tuple[int, list[Sequence]]:
         """Run bounded follow-up decode forwards before yielding to the outer loop.
 
         The first decode batch was prepared by ``schedule`` and has already run.
@@ -434,6 +465,7 @@ class LLMEngine:
         TTFT 的取舍）。
         """
         total_decode_tokens = initial_decode_tokens
+        finished: list[Sequence] = []
         if (not self.config.multi_step_decode or self.config.max_decode_steps <= 1
                 or self.config.speculative != "none" or scheduler.waiting
                 or scheduler.swapped or yield_for_prefill):
@@ -452,6 +484,10 @@ class LLMEngine:
                     self._step_stats["decode_burst_skipped_slots"] += (
                         (self.config.max_decode_steps - rounds_done)
                         * len(scheduler.running))
+                break
+            if (self.config.decode_burst_yield_on_arrival
+                    and self._decode_burst_pressure_active()):
+                self._last_step_decode_burst_yielded = True
                 break
             scheduler._order_running_by_tpot()
             scheduler.cow_pairs = []
@@ -482,6 +518,7 @@ class LLMEngine:
                 token_ids = result
             scheduler.postprocess(seqs, token_ids)
             self._record_step_tokens(seqs, before)
+            finished.extend(seq for seq in seqs if seq.is_finished)
             total_decode_tokens += len(token_ids)
             self._last_step_multistep_tokens += len(token_ids)
             self._last_step_decode_iterations += 1
@@ -532,11 +569,15 @@ class LLMEngine:
         if kind in ("decode", "mixed", "spec") and n_decode:
             self._last_step_decode_iterations = 1
         if kind == "decode":
-            n_decode = self._run_decode_burst(
+            n_decode, burst_finished = self._run_decode_burst(
                 scheduler, self.decode_runner, n_decode,
                 collect_logits=self._collect_logits,
                 yield_for_prefill=bool(self.prefill_scheduler.waiting))
-        return [seq for seq in seqs if seq.is_finished], n_prefill, n_decode, True
+        else:
+            burst_finished = []
+        finished = [seq for seq in seqs if seq.is_finished]
+        finished.extend(burst_finished)
+        return finished, n_prefill, n_decode, True
 
     def _step_pd(self):
         """Run separate prefill/decode batches and hand prompt KV between GPU pools."""
@@ -580,6 +621,7 @@ class LLMEngine:
         self._last_step_prefix_hits = {}
         self._last_step_decode_iterations = 0
         self._last_step_multistep_tokens = 0
+        self._last_step_decode_burst_yielded = False
         if self._pd:
             return self._step_pd()
         seqs, kind = self.scheduler.schedule()  # kind ∈ {"prefill", "decode", "mixed", "spec"}
@@ -667,9 +709,11 @@ class LLMEngine:
         if kind in ("decode", "mixed", "spec") and scheduled_decode_rows:
             self._last_step_decode_iterations = 1
         if kind == "decode":
-            n_decode = self._run_decode_burst(
+            n_decode, burst_finished = self._run_decode_burst(
                 self.scheduler, self.model_runner, scheduled_decode_rows,
                 collect_logits=self._collect_logits)
+        else:
+            burst_finished = []
         # 统计用token数：prefill步为正（prefill token数），decode步为负（序列数），
         # mixed步拆分返回prefill/decode各自的数量
         if kind == "prefill":
@@ -684,7 +728,8 @@ class LLMEngine:
                 n_decode = scheduled_decode_rows
         # 调度器完成后处理，如追加token、更新缓存、判断是否结束等
         # 快照已结束请求的计时信息（基准测试使用；driver侧数据完整）
-        for seq in seqs:
+        finished_seqs = seqs + burst_finished
+        for seq in finished_seqs:
             if seq.is_finished:
                 self._req_metrics.append({
                     "seq_id": seq.seq_id,
@@ -701,7 +746,8 @@ class LLMEngine:
                     "tpot_slo_met": self._tpot_slo_met(seq),
                 })
         # 收集已经完成的请求
-        outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
+        outputs = [(seq.seq_id, seq.completion_token_ids)
+                   for seq in finished_seqs if seq.is_finished]
         return outputs, kind, n_prefill, n_decode
 
     def is_finished(self):
@@ -765,6 +811,8 @@ class LLMEngine:
             self._step_stats["decode_iterations"] += self._last_step_decode_iterations
             self._step_stats["multi_step_decode_tokens"] += (
                 self._last_step_multistep_tokens)
+            self._step_stats["decode_burst_pressure_yields"] += int(
+                self._last_step_decode_burst_yielded)
             if self._last_step_decode_iterations > 1:
                 self._step_stats["multi_step_decode_steps"] += 1
             # 累计逐step统计（基准测试使用）；mixed步按token比例拆分时间归属
@@ -809,7 +857,8 @@ class LLMEngine:
           t_submitted, t_first_token, t_completed}，时间为秒（perf_counter基准）；
           t_first_token/t_completed 为None表示请求未生成token/未完成。
         - step_stats: 逐step聚合 {prefill_steps, decode_steps, prefill_tokens,
-          decode_tokens, prefill_time, decode_time}；投机解码时另有
+          decode_tokens, prefill_time, decode_time, decode_iterations,
+          multi_step_decode_tokens, decode_burst_pressure_yields}；投机解码时另有
           {spec_steps, spec_verify_tokens, spec_draft_tokens, spec_accepted_drafts}
           （α = spec_accepted_drafts / spec_draft_tokens）。
         - num_preemptions: 本次generate中的KV cache抢占次数。

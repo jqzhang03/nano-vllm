@@ -1,9 +1,12 @@
-"""Compare predictive admission on/off against the same online request trace.
+"""Compare predictive admission and prefix-cache awareness on one request trace.
 
 Run in the WSL inference environment::
 
     python benchmarks/admission_ablation.py --num-seqs 128 --arrival-mode poisson \
-        --arrival-rate 16 --max-admission-wait-ms 2000
+        --arrival-rate 16 --shared-prefix-len 512 --max-admission-wait-ms 2000
+
+The report compares admission off, admission with cache-hit estimation disabled,
+and the default cache-aware admission policy.
 """
 from __future__ import annotations
 
@@ -109,6 +112,7 @@ async def run_variant(args, prompts, sampling_params, arrival_times,
         manager = GenerationManager(
             engine, executor, args.max_queued_requests,
             dynamic_admission=dynamic_admission,
+            prefix_cache_aware_admission=prefix_cache_aware_admission,
             max_deferred_requests=args.max_deferred_requests,
             max_admission_wait_ms=args.max_admission_wait_ms,
             admission_work_budget_ms=args.admission_work_budget_ms,
@@ -129,8 +133,19 @@ async def run_variant(args, prompts, sampling_params, arrival_times,
                 handle = await manager.submit(
                     prompts[index], sampling_params[index], submitted_at=arrival)
             except HTTPException as exc:
-                return {"index": index, "status": "rejected",
-                        "status_code": exc.status_code, "error": str(exc.detail)}
+                detail = exc.detail if isinstance(exc.detail, dict) else {}
+                return {
+                    "index": index,
+                    "status": "rejected",
+                    "status_code": exc.status_code,
+                    "predicted_ttft_ms": detail.get("predicted_ttft_ms"),
+                    "queue_pressure": detail.get("queue_pressure"),
+                    "estimated_output_tokens": detail.get("estimated_output_tokens"),
+                    "estimated_prefill_tokens": detail.get("estimated_prefill_tokens"),
+                    "estimated_prefix_cached_tokens": detail.get(
+                        "estimated_prefix_cached_tokens"),
+                    "error": str(exc.detail),
+                }
             result = await handle.result
             return {
                 "index": index,
@@ -156,6 +171,14 @@ async def run_variant(args, prompts, sampling_params, arrival_times,
         admission = manager.admission_snapshot()
         await manager.close()
         accepted = [row for row in rows if row["status"] == "accepted"]
+        rows_with_estimates = [
+            row for row in rows if row.get("estimated_prefix_cached_tokens") is not None]
+        accepted_estimates = [
+            row for row in accepted
+            if row.get("estimated_prefix_cached_tokens") is not None]
+        estimated_prefix_tokens = sum(
+            row["estimated_prefix_cached_tokens"] for row in rows_with_estimates)
+        actual_prefix_tokens = sum(row["prefix_cache_hit_tokens"] for row in accepted)
         total_output_tokens = sum(row["completion_tokens"] for row in accepted)
         ttfts = [row["ttft_ms"] for row in accepted if row["ttft_ms"] is not None]
         e2es = [row["e2e_ms"] for row in accepted if row["e2e_ms"] is not None]

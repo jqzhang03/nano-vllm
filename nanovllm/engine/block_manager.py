@@ -590,7 +590,14 @@ class BlockManager:
             else:
                 start, end = seq.num_tokens - 1, seq.num_tokens
         start_blk = start // self.block_size
-        end_blk = (end + self.block_size - 1) // self.block_size
+        # During chunked prefill, seq.token_ids already contains the whole prompt,
+        # but KV beyond `end` has not been computed. Publish only blocks covered
+        # completely by this progress boundary; the final partial block is safe
+        # once the entire prompt has been prefetched.
+        if is_prefill and end < seq.num_tokens:
+            end_blk = end // self.block_size
+        else:
+            end_blk = (end + self.block_size - 1) // self.block_size
         if start_blk == end_blk: return
         h = self.blocks[t[start_blk - 1]].hash if start_blk > 0 else -1
         changed = False

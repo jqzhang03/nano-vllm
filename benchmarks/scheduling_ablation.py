@@ -177,6 +177,9 @@ def run_arrival_trace(args, prompts, sampling_params, arrival_times,
         step_stats = _step_stats_empty()
         torch.cuda.synchronize()
         start = time.perf_counter()
+        engine.set_decode_burst_yield_callback(
+            lambda: (next_request < len(arrival_times)
+                     and arrival_times[next_request] <= time.perf_counter() - start))
 
         while completed < len(prompts):
             now = time.perf_counter()
@@ -204,6 +207,8 @@ def run_arrival_trace(args, prompts, sampling_params, arrival_times,
             step_stats["decode_iterations"] += engine._last_step_decode_iterations
             step_stats["multi_step_decode_tokens"] += (
                 engine._last_step_multistep_tokens)
+            step_stats["decode_burst_pressure_yields"] += int(
+                engine._last_step_decode_burst_yielded)
             if engine._last_step_decode_iterations > 1:
                 step_stats["multi_step_decode_steps"] += 1
             for burst_key in ("decode_bursts", "decode_burst_rounds",
@@ -393,6 +398,9 @@ def comparison_delta(summary: dict, baseline: dict) -> dict[str, float | None]:
         summary["request_tpot_slo_percent"] - baseline["request_tpot_slo_percent"]
         if summary["request_tpot_slo_percent"] is not None
         and baseline["request_tpot_slo_percent"] is not None else None)
+    result["decode_burst_pressure_yields"] = (
+        summary["decode_burst_pressure_yields"]
+        - baseline["decode_burst_pressure_yields"])
     lifecycle = {}
     for metric in (
         "prefix_feature_parses", "prefix_feature_reuses",
@@ -491,7 +499,9 @@ def main():
               f"request SLO {summary['request_ttft_slo_percent']:.1f}% | "
               f"request TPOT target {request_tpot_text} | "
               f"TPOT p50 {tpot_p50_text} | "
-              f"E2E p99 {summary['e2e']['p99'] * 1000:.1f} ms", flush=True)
+              f"E2E p99 {summary['e2e']['p99'] * 1000:.1f} ms | "
+              f"burst pressure yields {summary['decode_burst_pressure_yields']}",
+              flush=True)
 
     baseline = runs.get("baseline")
     if baseline:
@@ -533,6 +543,7 @@ def main():
             "request_ttft_slo_max_ms": args.max_request_ttft_slo_ms,
             "slo_tpot_ms": args.slo_tpot_ms,
             "max_decode_steps": args.max_decode_steps,
+            "decode_burst_yield_on_arrival_default": True,
             "warmup_seqs": args.warmup_seqs,
         },
         "variants": {name: dict(options) for name, options in variants.items()},
@@ -614,9 +625,11 @@ def main():
             throughput_delta = delta.get("throughput_output_tok_per_s")
             ttft_delta = delta.get("ttft_p99")
             slo_delta = delta.get("request_ttft_slo_percent_points")
+            burst_yield_delta = delta.get("decode_burst_pressure_yields")
             fmt = lambda value, unit="%": "n/a" if value is None else f"{value:+.1f}{unit}"
             print(f"  {name:<38} throughput {fmt(throughput_delta)} | "
-                  f"TTFT p99 {fmt(ttft_delta)} | request SLO {fmt(slo_delta, ' pp')}")
+                  f"TTFT p99 {fmt(ttft_delta)} | request SLO {fmt(slo_delta, ' pp')} | "
+                  f"burst-yield count Δ {fmt(burst_yield_delta, ' yields')}")
     print(f"\nfull per-request results -> {output_path}")
 
 

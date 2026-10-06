@@ -171,8 +171,11 @@ request to preserve progress. With work in flight, requests below the soft-press
 limits are accepted immediately; others wait in a FIFO deferral queue for up to 2 seconds by
 default. The deferred queue is capped at 64 requests, and the overall hard limit remains 256.
 If pressure does not fall in time, the server rejects the request with HTTP 429 and
-`Retry-After`. An explicit `ttft_slo_ms` is also used as the admission target; the default
-admission target is 2000 ms.
+`Retry-After`; its error body includes that request's final prefill and prefix-hit estimates.
+An explicit `ttft_slo_ms` is also used as the admission target; the default admission target is
+2000 ms. `/health` reports accepted-request prefix-hit estimates, actual hit counters, and the
+last estimate. Non-streaming replies include estimate and actual-hit fields in `admission`; SSE
+headers include the estimates and the final chunk includes the completed admission metadata.
 The scheduler enables these policies by default:
 
 * **Latency-aware scheduling** reserves a decode row and a configurable minimum prefill
@@ -236,8 +239,11 @@ Admission can be tuned with `--max-queued-requests`,
 `--max-deferred-requests`, `--max-admission-wait-ms`, `--admission-work-budget-ms`,
 `--admission-target-ttft-ms`, and `--admission-soft-pressure`. Use
 `--no-dynamic-admission` to disable predictive defer/reject decisions while retaining the
-hard queue limit. `/health` reports current estimates and accept/defer/reject counters;
-successful responses report the admission decision and estimate.
+hard queue limit. Use `--no-admission-prefix-cache-awareness` to keep predictive admission
+while estimating every prompt as a cache miss. `/health` reports accept/defer/reject counts,
+accepted-request estimates, and actual prefix-hit counters. Successful JSON replies include the
+admission decision, estimated prefill/cached tokens, and actual prefix-hit tokens. SSE replies
+put the estimates in response headers and the same metadata in the final event.
 
 Run a continuous-arrival ablation with one identical request trace for each variant:
 
@@ -255,7 +261,7 @@ Use `--variants baseline all_on` for a quick A/B run,
 or `--arrival-mode burst` to compare burst admission with continuously offered load. Set
 `--min-request-ttft-slo-ms` and `--max-request-ttft-slo-ms` to give requests reproducible
 individual TTFT targets. The report compares throughput, TTFT p50/p99, queue wait, TPOT,
-E2E, fixed and per-request SLO attainment, adaptive prefill quotas, prefix-cache hits,
+E2E, fixed and per-request SLO attainment, adaptive prefill quotas, actual prefix-cache hits,
 aging promotions, recompute/swap counts, and estimated preemption cost. It also records
 lazy-feature parses/reuses, stale-generation reparses, KV-generation mutations, LRU
 evictions, deferred-free references queued/committed with peak unique-block and reference

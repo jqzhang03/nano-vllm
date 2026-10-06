@@ -24,7 +24,7 @@ python benchmarks/context_concurrency.py --context-lengths 512,1024,2048,4096 --
 python benchmarks/kv_fp8_calibrate.py --calibration-file calibration.jsonl --eval-file heldout.jsonl --output results/kv_eval.json
 python benchmarks/profiler.py --num-seqs 64 --max-input-len 512 --max-output-len 64  # prefill/decode breakdown
 python benchmarks/scheduling_ablation.py --num-seqs 128 --arrival-rate 16 --arrival-mode poisson
-python benchmarks/admission_ablation.py --num-seqs 128 --arrival-rate 16 --arrival-mode poisson
+python benchmarks/admission_ablation.py --num-seqs 128 --arrival-rate 16 --arrival-mode poisson --shared-prefix-len 512
 nanovllm-serve /path/to/model --host 127.0.0.1 --port 8000         # OpenAI-style HTTP/SSE service
 ```
 

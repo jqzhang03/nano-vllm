@@ -12,7 +12,7 @@
 > conda `nano-vllm`（torch 2.8.0+cu128、triton 3.4.0、flash-attn 2.8.3.post1）/ bf16 /
 > Qwen3-0.6B 为主，除非另注模型。WSL 内存 11GB + 4GB swap（`C:\Users\admin\.wslconfig`）。
 >
-> **实现状态快照（2026-10-05）**：代码已包含 OpenAI 风格在线服务与 SSE、进程内会话文本/截断/可选摘要、每会话 prompt token 预算和累计前缀命中统计、持续请求接收、动态准入与背压、Top-W cache-affinity、aging、recompute-aware 抢占、TTFT SLO 感知调度与自适应 prefill 配额、TP=1 的 auto/FP8 KV CPU swap，以及实验性本机 PD 分离。Prefix feature context 只为 Top-W 排序/配额候选懒解析，并按 BlockManager 的 `kv_generation` 失效；`prefix_feature_cache=False` 可保留亲和策略但改为每次解析，作为独立消融。CPU 生命周期测试覆盖特征失效、LRU/容量淘汰、swap 释放、共享 deferred-free 提交与计数重置；benchmark 记录 parse/reuse、stale reparse、generation mutation、eviction 和 deferred-free 排队/提交引用数及峰值唯一块数/引用数。缓存回收优先消耗未缓存空闲块，再按真实缓存复用 LRU 淘汰空闲前缀块，完成批次的 deferred-free 在 postprocess 结束后统一提交。普通 MHA mixed Prefill/Decode batch 增加了按形状惰性捕获、有限 LRU 图缓存的 CUDA Graph，MLA、rolling/split 和 spec-mixed 路径继续 eager。新增 `benchmarks/context_concurrency.py` 提供并发 × 上下文长度压测和实际 KV 池容量账本；`benchmarks/kv_fp8_calibrate.py` 生成真实文本校准 token，并按 scale margin 对比 FP8 与 auto KV 的 held-out decode logits。准入估算 prompt 工作量、按最大输出长度和已完成请求的全局输出长度比例估算 decode 工作量，并结合实测 Prefill/Decode 速率、队列与 KV 压力；过载时有限时 FIFO 延迟，超时/硬上限时返回 429。KV 容量预测仍按最大输出上限保守预留。单卡 `auto` 选择 mixed；多卡只有在配置兼容时才选 PD。PD 仍是单进程、双模型/KV 池、主机内存交接和串行阶段执行。
+> **实现状态快照（2026-10-06）**：代码已包含 OpenAI 风格在线服务与 SSE、进程内会话文本/截断/可选摘要、每会话 prompt token 预算和累计前缀命中统计、持续请求接收、动态准入与背压、Top-W cache-affinity、aging、recompute-aware 抢占、TTFT SLO 感知调度与自适应 prefill 配额、TP=1 的 auto/FP8 KV CPU swap，以及实验性本机 PD 分离。Prefix feature context 只为 Top-W 排序/配额候选懒解析，并按 BlockManager 的 `kv_generation` 失效；`prefix_feature_cache=False` 可保留亲和策略但改为每次解析，作为独立消融。CPU 生命周期测试覆盖特征失效、LRU/容量淘汰、swap 释放、共享 deferred-free 提交与计数重置；benchmark 记录 parse/reuse、stale reparse、generation mutation、eviction 和 deferred-free 排队/提交引用数及峰值唯一块数/引用数。缓存回收优先消耗未缓存空闲块，再按真实缓存复用 LRU 淘汰空闲前缀块，完成批次的 deferred-free 在 postprocess 结束后统一提交。普通 MHA mixed Prefill/Decode batch 增加了按形状惰性捕获、有限 LRU 图缓存的 CUDA Graph，MLA、rolling/split 和 spec-mixed 路径继续 eager。新增 `benchmarks/context_concurrency.py` 提供并发 × 上下文长度压测和实际 KV 池容量账本；`benchmarks/kv_fp8_calibrate.py` 生成真实文本校准 token，并按 scale margin 对比 FP8 与 auto KV 的 held-out decode logits。动态准入通过引擎空闲时的不可变 prefix-cache 快照估算命中 token、prefill 工作量与增量 KV 块，并结合输出长度全局 EWMA、实测 Prefill/Decode 速率、队列压力；过载时有限时 FIFO 延迟，超时/硬上限时返回 429。KV 容量预测仍按最大输出上限保守预留。单卡 `auto` 选择 mixed；多卡只有在配置兼容时才选 PD。PD 仍是单进程、双模型/KV 池、主机内存交接和串行阶段执行。
 >
 > **本轮实测（2026-10-06，RTX 5060 Ti / WSL2，Qwen3-0.6B，mixed 单卡）**：①**前缀命中估算已与实测对齐**——准入现在按 `BlockManager.prefix_snapshot()`（engine 空闲时物化的不可变哈希表副本 + `prefix_map_version()` 失效）用候选请求的链式块哈希估算可复用 token，`cache_affinity_admission=False` 时恒为 0（"不感知缓存"消融）。进程内探针 `benchmarks/prefix_cache_probe.py` 10/10 请求估算==实际（0/256/512 三档，绝对误差 0，全部块对齐）；HTTP `benchmarks/prefix_cache_verify.py` 8/8 请求 `admission.estimated_cache_hit_tokens == context.prefix_cache_hit_tokens`（冷启动服务：首发 0/0、复用 512/512，Δ=0）。②**准入消融**（`admission_ablation.py` 三档：关闭 / 开但不感知缓存 / 开且感知缓存，同一到达 trace）：1 req/s、32 请求、共享前缀 512 时三档吞吐 264.9/264.5/264.6 tok/s、**0 拒绝 0 延迟**——低费率下准入根本不触发，缓存感知只把命中估算误差从 -496 token 修正到 0。4/8/16 req/s poisson、64 请求下：**缓存感知在 4-8 req/s 稳定有用**（比不感知多接受 4~13 个请求、吞吐 +4.9%~+51%，估算误差 -490 → -10~0 token），但**默认准入阈值整体是净损失**——相对关闭准入吞吐 -12.4%（4 req/s）、-12.2%~-54.0%（8 req/s，3 seed）、-45.0%（16 req/s），越忙越亏；16 req/s 饱和点上感知与不感知打平（接受数相同）。费率带宽、多种子重复与逐请求命中对照见 `results/admission_ablation_*.json`。③**decode burst 让出**：`decode_burst_yield`（默认开）新增为独立消融项 `without_decode_burst_yield`（关掉后 burst 即使有新 prefill 到达也跑满 `max_decode_steps`），并新增 `decode_bursts/rounds/yields/skipped_slots` 计数。④**修掉两处"跑不通"**：`Qwen3/Qwen2/Llama3Attention` 直接用 `dist.get_world_size()`，TP=1 时进程组未初始化 → 模型构造即崩（服务与离线路径都受影响，改用 `tp_size()` 回退）；`admission_ablation.py` 未在变体之间 `gc.collect()+empty_cache()` → 第二个变体 KV 分配断言失败。新实现尚未在 RTX 5060 Ti/WSL2 上验证收益，不作为性能结论。
 >
@@ -997,9 +997,9 @@ python benchmarks/spec_bench.py --speculative ngram
 # 9. 连续到达策略消融（同一随机 trace，baseline/all-on/单策略关闭）
 python benchmarks/scheduling_ablation.py --num-seqs 128 --arrival-rate 16 \
     --arrival-mode poisson --variants baseline all_on
-# 10. 动态准入消融（同一请求到达 trace，对比预测准入开关）
+# 10. 动态准入/前缀缓存感知消融（同一到达 trace，三种模式）
 python benchmarks/admission_ablation.py --num-seqs 128 --arrival-rate 16 \
-    --arrival-mode poisson
+    --arrival-mode poisson --shared-prefix-len 512
 # 11. 在线 HTTP/SSE 服务
 nanovllm-serve ~/huggingface/Qwen3-0.6B --host 127.0.0.1 --port 8000
 # 12. 并发 × 上下文长度矩阵 + 实际 KV 池容量/显存账本（JSON + CSV）
@@ -1015,6 +1015,9 @@ python benchmarks/context_concurrency.py --kv-cache-dtype fp8_e4m3 \
 ```
 
 结果 JSON → `results/bench_<workload>_<ts>.json`；并发矩阵同时输出同 stem CSV；FP8 校准输出报告 JSON、摘要 CSV 和 `.tokens.json` 校准数据；profiling → `profiles/{prefill,decode}.txt`。
+
+`admission_ablation.py` 运行 `dynamic_off`、`dynamic_on_prefix_cache_unaware`、`dynamic_on` 三组；
+第三组启用 prefix-cache 命中估算，并逐请求对比估算与实际命中 token。
 
 混合 CUDA Graph 消融使用同一 workload 分别运行默认配置与 `--no-mixed-cudagraph`，例如：
 
@@ -1088,7 +1091,8 @@ fp8 已达 vLLM fp16 水平**。
 上无法跑 fp8 KV：V1 不支持 `kv_cache_dtype`（回退 V0），V0 fp8 路径选 XFormers → xformers 0.0.32
 把 fp8 派发到 FA3（Hopper sm_90 专属）→ `CUDA error: invalid argument`；vLLM 0.11-0.13 V1 fp8
 也是 FA3 路线（`flash_attn_supports_fp8()` 要求 capability.major==9）——**nano 自研 fp8 KV 是
-这张卡上唯一可跑的实现**；③所有数字条件：单卡 WSL2、vLLM 0.10.2 V1（fp16）/V0（不可达）、
+这张卡上唯一可跑的实现**；③所有数字条件：单卡 WSL2；表内 vLLM 数字来自 0.10.2 V1（fp16），
+V0 的 FP8 回退路径在本卡无法完成推理，因此没有 V0 性能数据；
 flash-attn 2.8.3.post1、无 FlashInfer、WSL `pin_memory=False`。
 
 #### 10.3.2 混合调度 + 前缀缓存 + batch 缩放（Qwen3-0.6B）

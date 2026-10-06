@@ -90,6 +90,7 @@ class GenerationManager:
     def __init__(self, engine: LLM, executor: ThreadPoolExecutor,
                  max_queued_requests: int = 256, *,
                  dynamic_admission: bool = True,
+                 prefix_cache_aware_admission: bool = True,
                  max_deferred_requests: int = 64,
                  max_admission_wait_ms: float = 2000.0,
                  admission_work_budget_ms: float = 10000.0,
@@ -117,6 +118,7 @@ class GenerationManager:
         self.executor = executor
         self.max_queued_requests = max_queued_requests
         self.dynamic_admission = dynamic_admission
+        self.prefix_cache_aware_admission = prefix_cache_aware_admission
         self.max_deferred_requests = max_deferred_requests
         self.max_admission_wait_ms = max_admission_wait_ms
         self.admission_work_budget_ms = admission_work_budget_ms
@@ -143,10 +145,22 @@ class GenerationManager:
         self.deferred: OrderedDict[str, GenerationHandle] = OrderedDict()
         self._admission_condition = asyncio.Condition()
         self._admission_counts = {"accepted": 0, "deferred_total": 0, "rejected": 0,
-                                  "deferred_timeouts": 0}
+                                  "deferred_timeouts": 0,
+                                  "prefix_cache_estimated_requests": 0,
+                                  "prefix_cache_estimated_tokens": 0,
+                                  "prefix_cache_actual_requests": 0,
+                                  "prefix_cache_actual_tokens": 0}
         self._last_admission_estimate: dict[str, float] = {}
         self._kv_pool_stats: list[tuple[int, int]] = []
         self._kv_pool_peak_used: list[int] = []
+        self._prefix_cache_snapshots_by_manager: dict[
+            BlockManager,
+            tuple[int, dict[int, tuple[tuple[int, ...], int, bool]]],
+        ] = {}
+        self._prefix_cache_snapshots: tuple[
+            tuple[BlockManager, dict[int, tuple[tuple[int, ...], int, bool]]], ...
+        ] = ()
+        self._engine_busy = False
         self.step_stats = {"steps": 0, "prefill_tokens": 0, "decode_tokens": 0,
                            "prefill_seconds": 0.0, "decode_seconds": 0.0,
                            "decode_iterations": 0, "multi_step_decode_steps": 0,
@@ -218,6 +232,7 @@ class GenerationManager:
                                 estimate["estimated_cache_hit_tokens"])
                         self.pending[handle.request_id] = handle
                         self.incoming.put_nowait(handle)
+                        self._sync_decode_burst_pressure()
                         self._admission_counts["accepted"] += 1
                         self._admission_condition.notify_all()
                         return handle
@@ -233,6 +248,7 @@ class GenerationManager:
                         deferred_at = time.perf_counter()
                         handle.admission_decision = "deferred"
                         self.deferred[handle.request_id] = handle
+                        self._sync_decode_burst_pressure()
                         self._admission_counts["deferred_total"] += 1
 
                     elapsed_ms = (time.perf_counter() - deferred_at) * 1000.0
@@ -255,6 +271,7 @@ class GenerationManager:
             async with self._admission_condition:
                 if self.deferred.pop(handle.request_id, None) is not None:
                     self._admission_condition.notify_all()
+                self._sync_decode_burst_pressure()
 
     def _validate_prompt_capacity(self, handle: GenerationHandle) -> None:
         block_size = self.engine.config.kvcache_block_size
@@ -283,13 +300,48 @@ class GenerationManager:
                 managers.append(scheduler.full_block_manager)
         return managers
 
+    def _prefix_cache_managers(self) -> list[BlockManager]:
+        if not self.prefix_cache_aware_admission:
+            return []
+        # PD currently constructs no_share managers for both pools, so it has no
+        # reusable prefixes to estimate. If PD-side sharing is added later, only
+        # the prefill pool can predict prompt work; decode imports private KV.
+        schedulers = ((self.engine.prefill_scheduler,)
+                      if self.engine._pd else (self.engine.scheduler,))
+        managers = []
+        for scheduler in schedulers:
+            for manager in (scheduler.block_manager, scheduler.full_block_manager):
+                if (manager is not None and not manager.rolling and not manager.no_share):
+                    managers.append(manager)
+        return managers
+
     def _refresh_kv_pool_stats(self) -> None:
         # Only refresh while the inference worker is idle, avoiding concurrent reads
         # of BlockManager state while engine.step() mutates it in the worker thread.
+        managers = self._block_managers()
         self._kv_pool_stats = [
             (len(manager.blocks), len(manager.free_block_ids))
-            for manager in self._block_managers()
+            for manager in managers
         ]
+        snapshots_by_manager = {}
+        snapshots = []
+        for manager in self._prefix_cache_managers():
+            cached = self._prefix_cache_snapshots_by_manager.get(manager)
+            if cached is not None and cached[0] == manager.kv_generation:
+                snapshot = cached[1]
+            else:
+                snapshot: dict[int, tuple[tuple[int, ...], int, bool]] = {}
+                free_ids = set(manager.free_block_ids)
+                for prefix_hash, block_id in manager.hash_to_block_id.items():
+                    block = manager.blocks[block_id]
+                    if block.hash == prefix_hash and not block.pending_free:
+                        snapshot[prefix_hash] = (
+                            tuple(block.token_ids), block_id, block_id in free_ids)
+                cached = (manager.kv_generation, snapshot)
+            snapshots_by_manager[manager] = cached
+            snapshots.append((manager, cached[1]))
+        self._prefix_cache_snapshots_by_manager = snapshots_by_manager
+        self._prefix_cache_snapshots = tuple(snapshots)
         if len(self._kv_pool_peak_used) != len(self._kv_pool_stats):
             self._kv_pool_peak_used = [0] * len(self._kv_pool_stats)
         for index, (total, free) in enumerate(self._kv_pool_stats):
@@ -332,18 +384,48 @@ class GenerationManager:
         decode_tokens = 0
         block_size = self.engine.config.kvcache_block_size
         pending_blocks = 0
-        for handle in self.pending.values():
-            prefill_tokens += len(handle.prompt_token_ids)
-            decode_tokens += self._expected_output_tokens(handle.sampling_params.max_tokens)
-            pending_blocks += (len(handle.prompt_token_ids)
-                               + handle.sampling_params.max_tokens + block_size - 1) // block_size
+        prefix_matches: dict[
+            tuple[int, ...], tuple[int, tuple[tuple[BlockManager, int, bool], ...]]
+        ] = {}
+        reserved_free_prefix_blocks: set[tuple[BlockManager, int]] = set()
+
+        def prefix_match(
+            handle: GenerationHandle,
+        ) -> tuple[int, tuple[tuple[BlockManager, int, bool], ...]]:
+            key = tuple(handle.prompt_token_ids)
+            match = prefix_matches.get(key)
+            if match is None:
+                match = self._estimate_prefix_cache_match(handle.prompt_token_ids)
+                prefix_matches[key] = match
+            return match
+
+        projected_prefix_cached_tokens = 0
         for handle in self.active.values():
-            prefill_tokens += max(
+            remaining_prefill = max(
                 0, len(handle.prompt_token_ids) - handle.prefill_tokens_done)
+            if handle.prefill_tokens_done == 0:
+                match = prefix_match(handle)
+                cached_tokens = min(remaining_prefill, match[0])
+                projected_prefix_cached_tokens += cached_tokens
+                remaining_prefill -= cached_tokens
+            prefill_tokens += remaining_prefill
             decode_tokens += max(
                 0, handle.sampling_params.max_tokens - handle.generated_tokens)
-            pending_blocks += (max(0, handle.sampling_params.max_tokens
-                                   - handle.generated_tokens) + block_size - 1) // block_size
+            if handle.prefill_tokens_done == 0 and handle.generated_tokens == 0:
+                # The engine accepted the sequence, but no prefill progress has
+                # been reported yet; its prompt blocks are not in current KV use.
+                pending_blocks += self._projected_kv_blocks(
+                    handle, prefix_match(handle), reserved_free_prefix_blocks)
+            else:
+                pending_blocks += (max(0, handle.sampling_params.max_tokens
+                                       - handle.generated_tokens) + block_size - 1) // block_size
+        for handle in self.pending.values():
+            match = prefix_match(handle)
+            projected_prefix_cached_tokens += match[0]
+            prefill_tokens += max(0, len(handle.prompt_token_ids) - match[0])
+            decode_tokens += self._expected_output_tokens(handle.sampling_params.max_tokens)
+            pending_blocks += self._projected_kv_blocks(
+                handle, match, reserved_free_prefix_blocks)
 
         candidate_output_tokens = self._expected_output_tokens(
             candidate.sampling_params.max_tokens)
@@ -366,8 +448,10 @@ class GenerationManager:
         target_ms = (candidate.ttft_slo_ms if candidate.ttft_slo_ms is not None
                      else self.admission_target_ttft_ms)
         request_age_ms = max(0.0, time.perf_counter() - candidate.submitted_at) * 1000.0
+        first_decode_seconds = 1.0 / decode_rate if candidate_output_tokens > 0 else 0.0
         predicted_ttft_ms = 1000.0 * (
             prefill_seconds
+            + first_decode_seconds
             + min(prior_decode_seconds * 0.25, target_ms / 2000.0)
         ) + request_age_ms
         projected_work_ms = 1000.0 * (prefill_seconds + decode_seconds)
@@ -385,6 +469,9 @@ class GenerationManager:
             "target_ttft_ms": target_ms,
             "projected_work_ms": projected_work_ms,
             "projected_prefill_tokens": float(prefill_tokens),
+            "candidate_prefill_tokens": float(candidate_prefill_tokens),
+            "candidate_prefix_cached_tokens": float(candidate_prefix_cached_tokens),
+            "projected_prefix_cached_tokens": float(projected_prefix_cached_tokens),
             "projected_output_tokens": float(decode_tokens),
             "candidate_output_tokens": candidate_output_tokens,
             "candidate_prompt_tokens": float(len(candidate.prompt_token_ids)),
@@ -416,6 +503,10 @@ class GenerationManager:
                     "predicted_ttft_ms": round(estimate.get("predicted_ttft_ms", 0.0), 1),
                     "estimated_output_tokens": round(
                         estimate.get("candidate_output_tokens", 0.0), 1),
+                    "estimated_prefill_tokens": int(round(
+                        estimate.get("candidate_prefill_tokens", 0.0))),
+                    "estimated_prefix_cached_tokens": int(round(
+                        estimate.get("candidate_prefix_cached_tokens", 0.0))),
                     "queue_pressure": round(estimate.get("queue_pressure", 1.0), 3)},
             headers={"Retry-After": str(retry_after)},
         )
@@ -424,6 +515,7 @@ class GenerationManager:
         return {
             **self._admission_counts,
             "dynamic_enabled": self.dynamic_admission,
+            "prefix_cache_aware": self.prefix_cache_aware_admission,
             "active": len(self.active),
             "queued": len(self.pending),
             "deferred": len(self.deferred),
@@ -470,6 +562,7 @@ class GenerationManager:
         async with self._admission_condition:
             self.accepting = False
             self._admission_condition.notify_all()
+        self.engine.request_decode_burst_yield()
         await self.incoming.put(None)
         await self.task
 
@@ -512,9 +605,11 @@ class GenerationManager:
             try:
                 handle = self.incoming.get_nowait()
             except asyncio.QueueEmpty:
+                self._sync_decode_burst_pressure()
                 return
             if handle is None:
                 self.stopping = True
+                self._sync_decode_burst_pressure()
                 return
             await self._admit_one(handle)
 
@@ -547,11 +642,17 @@ class GenerationManager:
     async def _cancel_requests(self) -> None:
         cancelled = [(seq_id, handle) for seq_id, handle in self.active.items()
                      if handle.cancelled]
-        for seq_id, handle in cancelled:
-            await asyncio.get_running_loop().run_in_executor(
-                self.executor, self.engine.cancel_request, seq_id)
-            self.active.pop(seq_id, None)
-            self._finish(handle, {"error": "request cancelled"})
+        if cancelled:
+            self._engine_busy = True
+            try:
+                for seq_id, handle in cancelled:
+                    await asyncio.get_running_loop().run_in_executor(
+                        self.executor, self.engine.cancel_request, seq_id)
+                    self.active.pop(seq_id, None)
+                    self._finish(handle, {"error": "request cancelled"})
+            finally:
+                self._engine_busy = False
+            self._refresh_kv_pool_stats()
 
     async def _run(self) -> None:
         loop = asyncio.get_running_loop()
@@ -573,8 +674,12 @@ class GenerationManager:
                 continue
             try:
                 step_started = time.perf_counter()
-                finished, kind, n_prefill, n_decode = await loop.run_in_executor(
-                    self.executor, self.engine.step)
+                self._engine_busy = True
+                try:
+                    finished, kind, n_prefill, n_decode = await loop.run_in_executor(
+                        self.executor, self.engine.step)
+                finally:
+                    self._engine_busy = False
                 step_elapsed = time.perf_counter() - step_started
                 self._observe_rates(n_prefill, n_decode, step_elapsed)
                 self.step_stats["steps"] += 1
@@ -584,6 +689,8 @@ class GenerationManager:
                     self.engine._last_step_decode_iterations > 1)
                 self.step_stats["multi_step_decode_tokens"] += (
                     self.engine._last_step_multistep_tokens)
+                self.step_stats["decode_burst_pressure_yields"] += int(
+                    self.engine._last_step_decode_burst_yielded)
                 self.step_stats["prefill_tokens"] += n_prefill
                 self.step_stats["decode_tokens"] += n_decode
                 self.step_stats["engine_seconds"] += step_elapsed
@@ -963,6 +1070,7 @@ def create_app(model: str, *, engine_kwargs: dict[str, Any] | None = None,
                session_token_budget: int | None = None,
                context_compaction: Literal["truncate", "summarize"] = "truncate",
                dynamic_admission: bool = True,
+               prefix_cache_aware_admission: bool = True,
                max_deferred_requests: int = 64,
                max_admission_wait_ms: float = 2000.0,
                admission_work_budget_ms: float = 10000.0,
@@ -1013,6 +1121,7 @@ def create_app(model: str, *, engine_kwargs: dict[str, Any] | None = None,
             manager = GenerationManager(
                 engine, executor, max_queued_requests,
                 dynamic_admission=dynamic_admission,
+                prefix_cache_aware_admission=prefix_cache_aware_admission,
                 max_deferred_requests=max_deferred_requests,
                 max_admission_wait_ms=max_admission_wait_ms,
                 admission_work_budget_ms=admission_work_budget_ms,
@@ -1121,7 +1230,8 @@ def create_app(model: str, *, engine_kwargs: dict[str, Any] | None = None,
                     result = event["result"]
                     if "error" in result:
                         payload = {"error": {"message": result["error"],
-                                              "type": "server_error"}}
+                                              "type": "server_error"},
+                                   "admission": GenerationManager.admission_metadata(handle)}
                         yield _sse(payload)
                         completed = True
                         break
@@ -1140,6 +1250,7 @@ def create_app(model: str, *, engine_kwargs: dict[str, Any] | None = None,
                                    "created": created, "model": model_name,
                                    "choices": [{"index": 0, "text": tail,
                                                 "finish_reason": finish_reason}]}
+                    payload["admission"] = GenerationManager.admission_metadata(handle)
                     yield _sse(payload)
                     completed = True
                     break
@@ -1289,6 +1400,14 @@ def create_app(model: str, *, engine_kwargs: dict[str, Any] | None = None,
             return StreamingResponse(session_stream(), media_type="text/event-stream", headers={
                 "Cache-Control": "no-cache", "Connection": "keep-alive",
                 "X-Accel-Buffering": "no",
+                "X-Admission-Decision": handle.admission_decision,
+                "X-Admission-Wait-Ms": f"{handle.admission_wait_ms:.1f}",
+                "X-Predicted-TTFT-Ms": f"{handle.predicted_ttft_ms:.1f}",
+                "X-Queue-Pressure": f"{handle.queue_pressure:.3f}",
+                "X-Estimated-Output-Tokens": f"{handle.estimated_output_tokens:.1f}",
+                "X-Estimated-Prefill-Tokens": str(handle.estimated_prefill_tokens),
+                "X-Estimated-Prefix-Cached-Tokens": str(
+                    handle.estimated_prefix_cached_tokens),
             })
         try:
             result = await _wait_for_result(handle)
@@ -1383,6 +1502,8 @@ def main() -> None:
     parser.add_argument("--max-queued-requests", type=int, default=256)
     parser.add_argument("--no-dynamic-admission", action="store_true",
                         help="disable predictive accept/defer admission; keep the hard queue cap")
+    parser.add_argument("--no-admission-prefix-cache-awareness", action="store_true",
+                        help="ignore reusable prompt prefixes in admission estimates (ablation)")
     parser.add_argument("--max-deferred-requests", type=int, default=64)
     parser.add_argument("--max-admission-wait-ms", type=float, default=2000.0)
     parser.add_argument("--admission-work-budget-ms", type=float, default=10000.0)
@@ -1465,6 +1586,8 @@ def main() -> None:
         session_token_budget=args.session_token_budget,
         context_compaction=args.context_compaction,
         dynamic_admission=not args.no_dynamic_admission,
+        prefix_cache_aware_admission=(
+            not args.no_admission_prefix_cache_awareness),
         max_deferred_requests=args.max_deferred_requests,
         max_admission_wait_ms=args.max_admission_wait_ms,
         admission_work_budget_ms=args.admission_work_budget_ms,
