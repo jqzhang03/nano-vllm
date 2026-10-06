@@ -60,6 +60,9 @@ class BlockManager:
         # probes never touch this order; only an actual cache allocation does.
         self.prefix_lru: OrderedDict[int, None] = OrderedDict()
         self.kv_generation = 0
+        # 前缀哈希表内容的版本号（只被 hash_blocks 的发布/撤销与逐出推进）：
+        # 服务侧用它判断跨线程快照是否过期，见 prefix_snapshot。
+        self._prefix_map_version = 0
         self.prefix_feature_cache = prefix_feature_cache
         # Per-workload counters. Resetting these never rewinds kv_generation,
         # which is part of the cache-validity contract for live sequences.
@@ -178,6 +181,52 @@ class BlockManager:
         self.kv_generation += 1
         self.kv_generation_mutations += 1
 
+    def _bump_prefix_map_version(self) -> None:
+        """前缀哈希表快照的失效信号：表内容或 pending_free 标记变化时调用。"""
+        self._prefix_map_version += 1
+
+    def prefix_map_version(self) -> int:
+        """单调版本号：只在 prefix 哈希表内容变化时 +1（见 hash_blocks / 逐出）。"""
+        return self._prefix_map_version
+
+    def prefix_snapshot(self) -> dict[int, tuple[int, bool, tuple]]:
+        """不可变前缀缓存快照 {hash: (block_id, pending_free, token_ids)}。
+
+        供服务准入线程做**跨线程只读**的命中估算：准入在事件循环里跑，engine step 在
+        worker 线程里改 ``hash_to_block_id``，直接读取那个 dict 不安全（见
+        server.py 的 ``_refresh_kv_pool_stats`` 注释）。这里物化一份不可变副本，
+        调用方按版本号决定是否重建。语义与 ``can_allocate`` 一致：哈希命中 +
+        token_ids 完全相等 + 未 deferred-free 才算可复用。
+        """
+        return {
+            h: (block_id, self.blocks[block_id].pending_free,
+                tuple(self.blocks[block_id].token_ids))
+            for h, block_id in self.hash_to_block_id.items()
+        }
+
+    def estimate_cached_tokens(self, seq: Sequence,
+                               snapshot: dict[int, tuple[int, bool, tuple]]) -> int:
+        """按快照估算 seq 能复用的前缀 token 数（不分配、不改状态）。
+
+        与 ``get_prefix_cached_tokens`` / ``can_allocate`` 同链式哈希口径，但读快照
+        而非活表——准入可以先算"这个请求大概能命中多少"，再决定收不收。
+        """
+        if self.rolling or self.no_share:
+            return 0
+        h = -1
+        cached_tokens = 0
+        for i in range(seq.num_blocks):
+            token_ids = seq.block(i)
+            h = self.compute_hash(token_ids, h)
+            entry = snapshot.get(h)
+            if entry is None:
+                break
+            _, pending_free, cached_ids = entry
+            if pending_free or cached_ids != tuple(token_ids):
+                break
+            cached_tokens += len(token_ids)
+        return cached_tokens
+
     def reset_metrics(self) -> None:
         """Reset observability counters without changing live cache state."""
         self.kv_generation_mutations = 0
@@ -197,6 +246,7 @@ class BlockManager:
         removed = False
         if block.hash != -1 and self.hash_to_block_id.get(block.hash) == block.block_id:
             del self.hash_to_block_id[block.hash]
+            self._prefix_map_version += 1
             removed = True
         self.prefix_lru.pop(block.block_id, None)
         return removed
@@ -371,6 +421,7 @@ class BlockManager:
             for block_id in reversed(t):
                 self.blocks[block_id].pending_free = True
                 self.deferred_free_block_ids.append(block_id)
+            self._bump_prefix_map_version()
             self.deferred_free_refs_queued += len(t)
             self.deferred_free_peak_blocks = max(
                 self.deferred_free_peak_blocks,
@@ -405,8 +456,10 @@ class BlockManager:
             block.ref_count -= 1
             touched.add(block_id)
         for block_id in touched:
+            self.blocks[block_id].pending_free = False
+        self._bump_prefix_map_version()
+        for block_id in touched:
             block = self.blocks[block_id]
-            block.pending_free = False
             if block.ref_count == 0:
                 self._deallocate_block(block_id)
             else:
@@ -553,6 +606,7 @@ class BlockManager:
             if block.hash != -1 and block.hash != h:
                 if self.hash_to_block_id.get(block.hash) == block.block_id:
                     del self.hash_to_block_id[block.hash]
+                    self._prefix_map_version += 1
                 self.prefix_lru.pop(block.block_id, None)
                 changed = True
             old_tokens = block.token_ids
@@ -562,6 +616,7 @@ class BlockManager:
             if previous_id is not None and previous_id != block.block_id:
                 self.prefix_lru.pop(previous_id, None)
             self.hash_to_block_id[h] = block.block_id
+            self._prefix_map_version += 1
             # A newly published block is the coldest entry. Feature probes do
             # not change recency; allocate() records actual cache reuse.
             if not was_indexed:

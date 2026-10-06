@@ -14,9 +14,9 @@
 >
 > **实现状态快照（2026-10-05）**：代码已包含 OpenAI 风格在线服务与 SSE、进程内会话文本/截断/可选摘要、每会话 prompt token 预算和累计前缀命中统计、持续请求接收、动态准入与背压、Top-W cache-affinity、aging、recompute-aware 抢占、TTFT SLO 感知调度与自适应 prefill 配额、TP=1 的 auto/FP8 KV CPU swap，以及实验性本机 PD 分离。Prefix feature context 只为 Top-W 排序/配额候选懒解析，并按 BlockManager 的 `kv_generation` 失效；`prefix_feature_cache=False` 可保留亲和策略但改为每次解析，作为独立消融。CPU 生命周期测试覆盖特征失效、LRU/容量淘汰、swap 释放、共享 deferred-free 提交与计数重置；benchmark 记录 parse/reuse、stale reparse、generation mutation、eviction 和 deferred-free 排队/提交引用数及峰值唯一块数/引用数。缓存回收优先消耗未缓存空闲块，再按真实缓存复用 LRU 淘汰空闲前缀块，完成批次的 deferred-free 在 postprocess 结束后统一提交。普通 MHA mixed Prefill/Decode batch 增加了按形状惰性捕获、有限 LRU 图缓存的 CUDA Graph，MLA、rolling/split 和 spec-mixed 路径继续 eager。新增 `benchmarks/context_concurrency.py` 提供并发 × 上下文长度压测和实际 KV 池容量账本；`benchmarks/kv_fp8_calibrate.py` 生成真实文本校准 token，并按 scale margin 对比 FP8 与 auto KV 的 held-out decode logits。准入估算 prompt 工作量、按最大输出长度和已完成请求的全局输出长度比例估算 decode 工作量，并结合实测 Prefill/Decode 速率、队列与 KV 压力；过载时有限时 FIFO 延迟，超时/硬上限时返回 429。KV 容量预测仍按最大输出上限保守预留。单卡 `auto` 选择 mixed；多卡只有在配置兼容时才选 PD。PD 仍是单进程、双模型/KV 池、主机内存交接和串行阶段执行。
 >
-> **本轮补充（2026-10-05）**：纯非投机 decode 可在一个 engine step 内连续执行最多 `max_decode_steps` 轮（默认 4），复用正常 KV 追加、COW、抢占及 CUDA Graph decode 路径；有 prefill 待处理时结束 burst。PD decode 同样支持 burst，并在独立 prefill 队列有剩余工作时让出。HTTP 请求和 `LLMEngine.add_request` 支持 `tpot_slo_ms`，也可设置 `default_tpot_slo_ms`；调度按请求观测的 token 间隔 EWMA 排 decode 优先级，并在 TPOT 压力升高时压低 prefill 配额。benchmark 记录 request TPOT 目标达成率、decode forward 数和 burst token 数；`benchmarks/scheduling_ablation.py` 增加了两个功能的单项消融。新实现尚未在 RTX 5060 Ti/WSL2 上验证收益，不作为性能结论。
+> **本轮实测（2026-10-06，RTX 5060 Ti / WSL2，Qwen3-0.6B，mixed 单卡）**：①**前缀命中估算已与实测对齐**——准入现在按 `BlockManager.prefix_snapshot()`（engine 空闲时物化的不可变哈希表副本 + `prefix_map_version()` 失效）用候选请求的链式块哈希估算可复用 token，`cache_affinity_admission=False` 时恒为 0（"不感知缓存"消融）。进程内探针 `benchmarks/prefix_cache_probe.py` 10/10 请求估算==实际（0/256/512 三档，绝对误差 0，全部块对齐）；HTTP `benchmarks/prefix_cache_verify.py` 8/8 请求 `admission.estimated_cache_hit_tokens == context.prefix_cache_hit_tokens`（冷启动服务：首发 0/0、复用 512/512，Δ=0）。②**准入消融**（`admission_ablation.py` 三档：关闭 / 开但不感知缓存 / 开且感知缓存，同一到达 trace）：1 req/s、32 请求、共享前缀 512 时三档吞吐 264.9/264.5/264.6 tok/s、**0 拒绝 0 延迟**——低费率下准入根本不触发，缓存感知只把命中估算误差从 -496 token 修正到 0。4/8/16 req/s poisson、64 请求下：**缓存感知在 4-8 req/s 稳定有用**（比不感知多接受 4~13 个请求、吞吐 +4.9%~+51%，估算误差 -490 → -10~0 token），但**默认准入阈值整体是净损失**——相对关闭准入吞吐 -12.4%（4 req/s）、-12.2%~-54.0%（8 req/s，3 seed）、-45.0%（16 req/s），越忙越亏；16 req/s 饱和点上感知与不感知打平（接受数相同）。费率带宽、多种子重复与逐请求命中对照见 `results/admission_ablation_*.json`。③**decode burst 让出**：`decode_burst_yield`（默认开）新增为独立消融项 `without_decode_burst_yield`（关掉后 burst 即使有新 prefill 到达也跑满 `max_decode_steps`），并新增 `decode_bursts/rounds/yields/skipped_slots` 计数。④**修掉两处"跑不通"**：`Qwen3/Qwen2/Llama3Attention` 直接用 `dist.get_world_size()`，TP=1 时进程组未初始化 → 模型构造即崩（服务与离线路径都受影响，改用 `tp_size()` 回退）；`admission_ablation.py` 未在变体之间 `gc.collect()+empty_cache()` → 第二个变体 KV 分配断言失败。新实现尚未在 RTX 5060 Ti/WSL2 上验证收益，不作为性能结论。
 >
-> **当前限制**：混合 CUDA Graph、multi-step decode 与 TPOT 调度尚未在 RTX 5060 Ti/WSL2 上运行 benchmark；CUDA Graph 首次遇到每种形状会额外执行一次 eager warmup 和 capture，最多保留 `mixed_cudagraph_max_graphs` 种形状，超过 `mixed_cudagraph_max_tokens`（默认 4096）则 eager 回退。Multi-step 只覆盖纯非投机 decode，默认最多 4 轮；在线服务在 burst 结束后发送这段时间产生的 token，因此可能合并为一个 SSE 文本块。TPOT 调度是基于请求级 token 间隔 EWMA 的启发式目标，不保证硬 deadline。服务准入的输出长度比例是跨请求的全局 EWMA，未按请求类型区分；工作量预测尚未纳入前缀命中预测或按模型自动校准；Mixtral 未实现。PD 缺少异步 P/D 重叠、远端 worker/RDMA，且本机单卡环境不能验证多卡收益。历史性能表不作为新增策略的效果证明。
+> **当前限制**：混合 CUDA Graph、multi-step decode 与 TPOT 调度尚未在 RTX 5060 Ti/WSL2 上运行 benchmark；CUDA Graph 首次遇到每种形状会额外执行一次 eager warmup 和 capture，最多保留 `mixed_cudagraph_max_graphs` 种形状，超过 `mixed_cudagraph_max_tokens`（默认 4096）则 eager 回退。Multi-step 只覆盖纯非投机 decode，默认最多 4 轮；在线服务在 burst 结束后发送这段时间产生的 token，因此可能合并为一个 SSE 文本块。TPOT 调度是基于请求级 token 间隔 EWMA 的启发式目标，不保证硬 deadline。服务准入的输出长度比例是跨请求的全局 EWMA，未按请求类型区分；**前缀命中预测已实现且与实测一致，但准入阈值本身未校准**——2026-10-06 实测 8 req/s 下默认参数（work budget 10s / soft pressure 0.85）会拒绝约一半请求并损失 31~36% 吞吐（详见 §10.3.9），说明"估算准"不等于"准入策略对"；Mixtral 未实现。PD 缺少异步 P/D 重叠、远端 worker/RDMA，且本机单卡环境不能验证多卡收益。历史性能表不作为新增策略的效果证明。
 >
 > **串讲三原则**：①先讲成本模型与上界，再讲实现；②主动交代"哪里亏、为什么"（比吹嘘可信）；
 > ③所有结论要么有探针证据、要么明确标注"未验证"。方法学信条：**跑通 ≠ 写对**。
@@ -167,8 +167,8 @@
 | MLA（2a） | `layers/attention_mla.py` + `models/deepseek_v2.py`（fused [c_kv\|k̃_pe] 缓存、吸收式 decode 内核、共享 rope key） | **已实现**：decode 内核 vs 稠密参考位级 0 误差；引擎 parity top-1 100% |
 | 滚动环 / split（2b/2b-ext） | `config.py` `rolling_cache`；`block_manager.py` 环驱逐；双池（gemma2 交替窗口） | **已实现**：真实 Mistral-7B/gemma-2-2b-it/DeepSeek-V2-Lite 验证（§8 阶段 2） |
 | 在线服务 / 会话上下文 | `server.py`：OpenAI 风格 completions/chat、SSE、断连取消、会话 GET/DELETE、截断/摘要压缩 | **已实现**：文本会话默认最多 256 个、空闲 24h 过期；重启不持久化，摘要有损；KV 不跨轮保留 |
-| 动态准入与背压 | `server.py` `GenerationManager`：prompt 工作量、全局输出长度比例 EWMA、Prefill/Decode 吞吐 EWMA、队列/KV 压力；FIFO defer、超时 429 | **已实现，默认开启**：空闲时接收一个请求保证进展；硬队列上限 256、defer 上限 64、等待 2s；KV 预测按请求最大输出上限预留；`/health` 与响应暴露估算；`--no-dynamic-admission` 可消融；估算不含 prefix-cache 命中预测 |
-| 持续请求与调度策略 | `server.py` 单 engine worker；`scheduler.py` Top-W、aging、recompute-aware、TTFT/TPOT SLO、自适应分块/配额；`llm_engine.py` bounded multi-step decode；`block_manager.py` generation 失效与 deferred-free | **已实现，有消融脚本**：`benchmarks/scheduling_ablation.py` 对齐同一到达 trace，记录服务指标、request TPOT 目标达成、decode forward/burst token 数，以及 lazy-feature parse/reuse、stale reparse、generation mutation、LRU eviction、deferred-free queued/committed/peak；包含 `without_tpot_aware` 与 `without_multi_step_decode`。当前 checkout 尚无新策略的目标硬件实测结论；TPOT 是软目标启发式，不保证 deadline |
+| 动态准入与背压 | `server.py` `GenerationManager`：prompt 工作量（已扣除前缀命中预测）、全局输出长度比例 EWMA、Prefill/Decode 吞吐 EWMA、队列/KV 压力；FIFO defer、超时 429 | **已实现，默认开启**：空闲时接收一个请求保证进展；硬队列上限 256、defer 上限 64、等待 2s；KV 预测按请求最大输出上限预留；前缀命中预测用 idle 期快照的 `prefix_snapshot()`+`estimate_cached_tokens`（估算与实测逐请求一致，见 §10.3.9）；`/health` 与响应暴露估算与实际命中；`--no-dynamic-admission`（开关消融）与 `--no-cache-affinity-admission`（不感知缓存消融）。**诚实结论**：默认阈值在 8 req/s 下过度拒绝、净损吞吐，阈值待校准 |
+| 持续请求与调度策略 | `server.py` 单 engine worker；`scheduler.py` Top-W、aging、recompute-aware、TTFT/TPOT SLO、自适应分块/配额；`llm_engine.py` bounded multi-step decode（含 `decode_burst_yield`）；`block_manager.py` generation 失效、prefix 快照版本与 deferred-free | **已实现，有消融脚本**：`benchmarks/scheduling_ablation.py` 对齐同一到达 trace，记录服务指标、request TPOT 目标达成、decode forward/burst token 数、burst 轮数与提前让出次数/放弃槽位，以及 lazy-feature parse/reuse、stale reparse、generation mutation、LRU eviction、deferred-free queued/committed/peak；包含 `without_tpot_aware`、`without_multi_step_decode` 与 `without_decode_burst_yield`。当前 checkout 尚无新策略的目标硬件实测结论；TPOT 是软目标启发式，不保证 deadline |
 | KV CPU swap / FP8 | `scheduler.py` 缓冲与抢占；`model_runner.py` 拷贝；`kv_transfer.py` P/D KV 布局交接 | **已实现**：TP=1 的 MHA/MLA、auto/FP8 KV；同步普通 CPU 内存，预算受限；TP>1 回退 recompute |
 | 执行模式自动选择 / PD | `config.py` / `llm_engine.py`：`auto|mixed|pd` | **已实现，PD 为实验性**：单卡 auto=mixed；兼容的多卡 auto=PD；TP>1、spec、rolling cache、非 auto KV 时 auto 回退 mixed；手动 PD 对不兼容配置报错 |
 | 按层流式加载 + 即时量化 | `loader.py` `load_model(streaming=True)`；`model_runner.py` `_decide_streaming`/`_streaming_quant_hook`/`_finalize_streaming` | **已实现**：Qwen2.5-7B 峰值 10.66GB / Llama-3.1-8B 11.62GB / Mistral-7B 11.37GB；自动触发 = fp16 估重 > 空闲显存 45% 且启用量化 |
@@ -181,8 +181,8 @@
 | **rope_scaling 其余变体** | YaRN / linear / dynamic | 已支持：无操作（default）+ llama3 变体（波长分段，单元对照 HF 0 误差）；其余构造时报错 |
 | **滚动环 × KV swap / ring × medusa/eagle** | 组合验证与记账 | 断言关（§8 阶段 2 诚实边界）；KV swap × ring/split 未验证 |
 | **split 双池 CUDA graph** | gemma2 split 模式 decode 入图 | 现为 eager（动态 python 路径烘焙即错）；softcap 层禁 fp8 KV |
-| **准入估算校准** | 按模型/批大小拟合 service rate、识别前缀缓存命中、减少误拒和漏控 | 当前使用 token 数、全局输出长度 EWMA 和在线吞吐 EWMA 做启发式预测；需 `admission_ablation.py` 在目标 GPU 上校准 |
-| **multi-step decode / TPOT 调度** | 扩大支持到 mixed/spec decode、改善目标硬件效果 | 纯非投机 decode burst 与 request-level TPOT 排序/配额已实现；burst 上限默认 4、prefill 到来时让出；mixed/spec 仍单步。RTX 5060 Ti/WSL2 效果尚未实测，TPOT 是启发式软目标 |
+| **准入估算校准** | 按模型/批大小拟合 service rate、减少误拒和漏控 | 前缀命中预测已完成并与实测逐请求一致（§10.3.9）；仍未按模型/批大小校准 `admission_work_budget_ms`/`admission_soft_pressure`，2026-10-06 扫描显示关闭准入反而更快（4 req/s -12%、8 req/s -12~-54%、16 req/s -45%） |
+| **multi-step decode / TPOT 调度** | 扩大支持到 mixed/spec decode、改善目标硬件效果 | 纯非投机 decode burst 与 request-level TPOT 排序/配额已实现；burst 上限默认 4；`decode_burst_yield` 默认开（有 prefill 等待即提前收尾），`without_decode_burst_yield` 为独立消融；mixed/spec 仍单步。RTX 5060 Ti/WSL2 效果尚未实测，TPOT 是启发式软目标 |
 | **PD 生产化** | 异步重叠、远端 worker、网络/RDMA KV 传输、多卡基准 | 当前仅本地两卡、同步主机内存交接和串行阶段；单卡环境无法验证 |
 
 **流式加载的坑（阶段 7 特有，详见 §6 故事 9/10/18）**：①meta 物化必须 `to_empty`（torch 2.8 禁止 `.to()` 与 `set_data` 跨 meta）；②`to_empty` 替换 Parameter → 丢 `weight_loader`，须按模块重挂；③**计算型 buffer（RoPE `cos_sin_cache`）meta 上无数据 → `_finalize_streaming` 必须重建**；④tie 词表文件通常不含 `lm_head.weight` → 加载后重绑（先物化再 `weight.data =` 共享存储）；⑤**meta 计数构造会污染 `get_rope` 的共享实例 → 必须 `cache_clear()`**（2026-09 修复，§6 故事 18）。
@@ -311,7 +311,7 @@ KV 块不足时抢占（decode/spec 序列优先 swap_out / 其余 recompute 回
 
 **数字**：混合调度吞吐全档 +7.2%~+21.3%；抢占 384 档 31→20、512 档 141→71；256 档峰值
 5840 tok/s（fp16，§10.3.2，早期基准）。后续加入的在线调度策略有 `benchmarks/scheduling_ablation.py`
-做同 trace 消融，但尚无本 checkout 的实测结果。**诚实边界**：TTFT 按 deadline slack 排序；TPOT 按已观测 token 间隔 EWMA 排序，并在压力升高时压低 prefill 配额，但只是软目标启发式。Multi-step decode 默认最多连续 4 轮，只在纯非投机 decode 窗口运行，prefill 到来时让出；该窗口内 SSE token 会成组交付。服务准入用 token 数、在线吞吐和 KV/队列压力估算后接收或 FIFO 延迟，达到等待预算或硬上限时返回 429，预测尚未感知前缀缓存命中。两项新调度策略尚无目标硬件实测结果。**追问应对**：用相同到达 trace 对比 baseline、all-on 和各单项移除结果，并检查 TPOT 目标达成率、TTFT、吞吐及 burst forward 数。
+做同 trace 消融。**诚实边界**：TTFT 按 deadline slack 排序；TPOT 按已观测 token 间隔 EWMA 排序，并在压力升高时压低 prefill 配额，但只是软目标启发式。Multi-step decode 默认最多连续 4 轮，只在纯非投机 decode 窗口运行，`decode_burst_yield`（默认开）在 burst 期间有新 prefill 到达时提前收尾；该窗口内 SSE token 会成组交付。服务准入用 token 数（**已扣除前缀命中预测**）、在线吞吐和 KV/队列压力估算后接收或 FIFO 延迟，达到等待预算或硬上限时返回 429；2026-10-06 实测：命中估算与引擎实际复用逐请求一致，但默认准入阈值在 8 req/s 下过度拒绝、净损 31~36% 吞吐（§10.3.9）。**追问应对**：用相同到达 trace 对比 baseline、all-on 和各单项移除结果，并检查 TPOT 目标达成率、TTFT、吞吐、burst forward 数以及 burst 提前让出次数。
 
 ### 4.2 KV cache 与内存管理（paged / 前缀缓存 / COW / 分块 prefill / KV swap / 滚动环）
 
@@ -768,12 +768,13 @@ KV swap×ring/split 未验证；fp8 KV×MLA 的组合路径有 toy 覆盖（真�
 **已交付**：OpenAI 风格 HTTP 服务、SSE 流式输出、断连取消、持续接收请求、进程内会话文本存储与
 token-budget 截断/可选摘要；Top-W cache-affinity admission、aging 公平性、recompute-aware 抢占；按
 TTFT slack 调整 prefill 分块与 decode/prefill 配额；request-level TPOT slack 排序与 decode 优先配额；
-纯非投机 decode 的 bounded multi-step burst（默认最多 4 轮，prefill 待处理时让出）。
+纯非投机 decode 的 bounded multi-step burst（默认最多 4 轮，`decode_burst_yield` 默认开：有新 prefill 等待即提前收尾；`--no-decode-burst-yield` 为消融）。
 `benchmarks/scheduling_ablation.py` 使用共享请求 trace 做 baseline/all-on/逐项消融并输出 JSON，
-包含 `without_tpot_aware` 与 `without_multi_step_decode`。
-动态准入与背压也已实现：按 prompt token、请求最大输出 token 与已完成请求的全局输出长度 EWMA 估算 Prefill/Decode 工作量，并结合在线吞吐、队列和预计 KV 占用估算压力；低压力请求立即接收，超压请求进入有界 FIFO 等待，超时或达到硬上限时拒绝。KV 容量仍按最大输出 token 保守预留。`benchmarks/admission_ablation.py` 用相同到达 trace 对比准入开关，并输出接收/延迟/拒绝、TTFT、E2E 和吞吐 JSON。
+包含 `without_tpot_aware`、`without_multi_step_decode` 与 `without_decode_burst_yield`，并单列 burst 轮数/提前让出次数/放弃槽位。
+动态准入与背压也已实现：按 prompt token（扣除前缀命中预测）、请求最大输出 token 与已完成请求的全局输出长度 EWMA 估算 Prefill/Decode 工作量，并结合在线吞吐、队列和预计 KV 占用估算压力；低压力请求立即接收，超压请求进入有界 FIFO 等待，超时或达到硬上限时拒绝。前缀命中预测用 engine 空闲期物化的 `BlockManager.prefix_snapshot()`（按 `prefix_map_version()` 失效）做链式哈希估算，逐请求与实测一致（§10.3.9）。KV 容量仍按最大输出 token 保守预留。`benchmarks/admission_ablation.py` 用相同到达 trace 对比三档（关闭 / 开但不感知缓存 / 开且感知缓存），输出接收/延迟/拒绝、TTFT、E2E、吞吐与命中估算误差 JSON。
 **待补**：把 multi-step 扩展到 mixed/spec decode 的安全调度边界；验证 multi-step 与 TPOT-aware 调度在
-WSL2/RTX 5060 Ti 上的 TTFT、TPOT、吞吐和公平性影响；增加前缀缓存感知及按模型校准的准入工作量模型。
+WSL2/RTX 5060 Ti 上的 TTFT、TPOT、吞吐和公平性影响（burst 让出已实现并有计数，收益仍待实测）；
+**按模型/费率校准准入阈值**——命中估算已验证准确，但 §10.3.9 实测默认阈值在高费率下过度拒绝。
 已有历史吞吐数字不能证明新增策略的收益，需运行当前 checkout 的消融脚本后再更新结论。
 
 ### 阶段 4：量化/稀疏算法层（GPTQ 误差补偿 + 剪枝感知）——**第四**
@@ -1024,14 +1025,27 @@ python benchmarks/bench.py --num-seqs 256 --repeat-batches 2 --no-mixed-cudagrap
 
 逐批 JSON 会给出 graph captures/replays/eager fallbacks 与 prefix feature parse/reuse；首次遇到形状的 capture 会计入该批耗时，优先比较已预热的后续 batch，并确认 `replays > 0` 才表示 workload 实际走过 mixed graph。调度消融 JSON 另含 generation 失效重解析、缓存淘汰、deferred-free 引用排队/提交数和峰值待释放块数；CPU 用例覆盖对应的分配、释放、LRU 淘汰、swap release 和重复共享引用延迟释放边界。
 
-Multi-step Decode / TPOT 目标调度用同一到达 trace 消融：
+Multi-step Decode / TPOT 目标调度 / burst 提前让出用同一到达 trace 消融：
 
 ```bash
-python benchmarks/scheduling_ablation.py --variants baseline all_on without_tpot_aware without_multi_step_decode \
+python benchmarks/scheduling_ablation.py \
+  --variants baseline all_on without_multi_step_decode without_decode_burst_yield \
   --num-seqs 128 --arrival-rate 16 --arrival-mode poisson --slo-tpot-ms 20 --max-decode-steps 4
 ```
 
-每组保留 request TPOT 目标达成率、TPOT/TTFT/E2E 分位数、输出吞吐、decode forward 数和 burst 产生的 token 数；`without_*` 结果分别对比 baseline 和 all-on。单次吞吐基准可用 `benchmarks/bench.py --default-tpot-slo-ms 20` 启用默认 TPOT 目标，并用 `--no-tpot-aware-scheduling` 或 `--no-multi-step-decode` 关闭单项功能。Multi-step 只进入纯非投机 decode，因此应结合目标硬件运行和多种到达模式评估，不把历史数据外推为效果结论。
+每组保留 request TPOT 目标达成率、TPOT/TTFT/E2E 分位数、输出吞吐、decode forward 数和 burst 产生的 token 数，以及新增的 burst 轮数/提前让出次数/放弃的 decode 槽位；`without_*` 结果分别对比 baseline 和 all-on。单次吞吐基准可用 `benchmarks/bench.py --default-tpot-slo-ms 20` 启用默认 TPOT 目标，并用 `--no-tpot-aware-scheduling`、`--no-multi-step-decode` 或 `--no-decode-burst-yield` 关闭单项功能。Multi-step 只进入纯非投机 decode，因此应结合目标硬件运行和多种到达模式评估，不把历史数据外推为效果结论。
+
+准入与前缀命中估算用两个口径交叉验证（估算在响应里，实测在引擎里）：
+
+```bash
+python benchmarks/admission_ablation.py --num-seqs 32 --arrival-mode constant --arrival-rate 1 \
+  --shared-prefix-len 512          # 低费率：观察估算法是否正确
+python benchmarks/admission_ablation.py --num-seqs 64 --arrival-mode poisson --arrival-rate 8 \
+  --shared-prefix-len 512          # 高费率：观察拒绝/延迟与吞吐代价
+python benchmarks/prefix_cache_probe.py --prefix-len 512       # 进程内：scheduler 估算 vs 提交复用
+python benchmarks/prefix_cache_verify.py --base-url http://127.0.0.1:8000   # HTTP：估算 vs 实测
+python benchmarks/prefix_estimate_check.py                     # 三条最小对，直接读响应字段
+```
 
 并发矩阵每个点把一批请求同时交给在线 `GenerationManager`，默认关闭预测准入以测调度与 KV 容量；`--dynamic-admission` 可把接收/延迟/拒绝策略纳入压测。每个请求的输出长度固定，因此输出速率与 TPOT 分布可横向比较。JSON 保留逐请求结果，并汇总 TTFT/TPOT SLO 达成率、admission 估计与等待、吞吐、抢占、swap、prefix hit、KV pool 峰值和显存峰值；CSV 汇总每个矩阵点。容量账本直接从 MHA/MLA cache tensor 字节数和 BlockManager 页数计算：full-history 池按 `(prompt tokens + max output tokens)` 预留整块页数；rolling 池按 prefill 的完整 prompt 分配峰值与生成期 `ring_cap` 占用中的较大值估算，split rolling/full 模型分别报告两池容量。它不包含 CPU swap，也不代表同延迟服务能力。CUDA peak 包括 engine 初始化后当前分配基线和本次场景峰值，JSON 同时保留 peak delta。
 
@@ -1233,6 +1247,87 @@ top-1 100%；fp8 KV×环/×MLA 与 spec×环 toy 全绿（同内核位级、异�
 真实 Mistral-7B fp8 环 vs 掩码 5050-token **逐位一致**；真实 gemma-2-2b-it split 30/30 稀疏步、
 环池 cap 18 封顶；DeepSeek-V2-Lite 4L parity 0 失配 / 全量流式 int4 ~2.8 tok/s（3 并发、MoE
 eager）、kv_b w_deq 113MB。
+
+#### 10.3.9 在线准入与前缀命中估算（2026-10-06，Qwen3-0.6B，RTX 5060 Ti / WSL2，mixed 单卡）
+
+**目的**：验证"准入估算的前缀命中"和"引擎实际复用"是否吻合，并做准入三档消融
+（关闭 / 开但不感知缓存 / 开且感知缓存）。所有数字来自本 checkout 的实跑，JSON 见
+`results/prefix_cache_*`、`results/admission_ablation_*`。
+
+**① 估算 vs 实测（逐请求）**
+
+| 探针 | 场景 | 结果 |
+|---|---|---|
+| `prefix_cache_probe.py`（进程内，scheduler Top-W 估算 vs `num_prefix_cached_tokens`） | 首发 4 条 + 复用 6 条（精确重复 / 新后缀 / 半前缀） | **10/10 完全相等**，命中档 0 / 256 / 512 token，绝对误差 0，全部块对齐（block_size=256） |
+| `prefix_cache_verify.py`（HTTP `nanovllm-serve`） | 8 请求三波（首发 / 精确重复 / 新后缀），冷启动服务 | **8/8 `admission.estimated_cache_hit_tokens == context.prefix_cache_hit_tokens`，Δ=0**；首发两条 0/0（缓存为空），复用六条 512/512（预热过的服务上首发也会命中 512，同样 Δ=0） |
+| `prefix_estimate_check.py`（HTTP 三条最小对） | 同前缀重复 + 换尾部 | 三条都是 est=512 / actual=512，但 `predicted_ttft_ms` 从缓存未命中场景的 ~65-77 ms 降到 ~22-24 ms，说明命中确实进入了准入的 TTFT 预测 |
+| `/health` 累计口径 | 一次 8 请求验证后 | 准入累计估算 6144 vs 引擎累计复用 3072；差异来自**并发波次内后到请求共享同一批块**（估算按提交时快照预测 1024，实际只新复用 512），属口径差异而非估算错误——逐请求 `context` 字段是权威对照 |
+
+**② 准入三档消融（`admission_ablation.py`，每档新引擎 + 同一到达 trace，共享前缀 512）**
+
+低费率（32 请求 @1 req/s constant）：
+
+| 变体 | 接受/拒绝 | 延迟(defer) | 吞吐 tok/s | TTFT p50/p99 ms | E2E p99 ms | 估算/实际命中 token | 平均估算误差 |
+|---|---|---|---|---|---|---|---|
+| 关闭准入 | 32/0 | 0 | 264.9 | 313.3/336.6 | 4745 | 0 / 15872 | -496.0 |
+| 开·不感知缓存 | 32/0 | 0 | 264.5 | 312.9/352.9 | 4662 | 0 / 15872 | -496.0 |
+| 开·感知缓存 | 32/0 | 0 | 264.6 | 319.0/337.0 | 4702 | 15872 / 15872 | **+0.0** |
+
+高费率（64 请求 poisson；"相对关闭准入"= 吞吐变化）：
+
+| 场景 | 变体 | 接受/拒绝 | 吞吐 tok/s | 相对关闭准入 | TTFT p50/p99 ms | 平均估算误差 |
+|---|---|---|---|---|---|---|
+| 4 req/s | 关闭准入 | 64/0 | 828.7 | — | 481.0/752.8 | -504.0 |
+| 4 req/s | 开·不感知缓存 | 45/19 | 667.8 | -19.4% | 536.7/1199.4 | -500.6 |
+| 4 req/s | 开·感知缓存 | 51/13 | **725.7** | -12.4% | 535.8/1218.3 | **-10.0** |
+| 8 req/s（seed 0） | 关闭准入 | 64/0 | 1130.5 | — | 563.6/1044.1 | -504.0 |
+| 8 req/s（seed 0） | 开·不感知缓存 | 30/34 | 725.7 | -35.8% | 609.6/2084.8 | -494.9 |
+| 8 req/s（seed 0） | 开·感知缓存 | 34/30 | **776.9** | -31.3% | 617.6/2083.8 | **-15.1** |
+| 8 req/s（seed 2） | 关闭准入 | 64/0 | 993.1 | — | 607.1/905.8 | -504.0 |
+| 8 req/s（seed 2） | 开·不感知缓存 | 28/36 | 700.5 | -29.5% | 655.3/2007.7 | -493.7 |
+| 8 req/s（seed 2） | 开·感知缓存 | 41/23 | **872.1** | -12.2% | 630.4/1898.9 | **-12.5** |
+| 8 req/s（seed 3） | 关闭准入 | 64/0 | 1161.2 | — | 584.9/943.8 | -504.0 |
+| 8 req/s（seed 3） | 开·不感知缓存 | 19/45 | 533.7 | -54.0% | 605.0/2005.3 | -485.1 |
+| 8 req/s（seed 3） | 开·感知缓存 | 32/32 | **805.8** | -30.6% | 612.0/1630.4 | **+0.0** |
+| 16 req/s | 关闭准入 | 64/0 | 1408.4 | — | 1062.8/1577.1 | -504.0 |
+| 16 req/s | 开·不感知缓存 | 17/47 | 791.5 | -43.8% | 708.5/1188.6 | -481.9 |
+| 16 req/s | 开·感知缓存 | 17/47 | 775.0 | -45.0% | 699.9/1193.7 | -30.1 |
+
+**读数（诚实结论）**：
+- **缓存感知准入确实有用，而且稳定**：在 4 / 8(×3 seed) req/s 全部 5 个对照点上，"感知缓存"比"不感知"多接受 4~13 个请求、吞吐高 4.9%~51%（seed 2 +24.5%、seed 3 +51.0%），命中估算误差从约 -490 token 收到 -10~0 token；16 req/s 饱和点上接受数相同（各 17），吞吐打平（791.5 vs 775.0，噪声内），说明收益来自"把命中算进工作量"从而少误拒，而不是排序本身。
+- **但默认准入阈值整体是净损失**：4/8/16 req/s 下"感知缓存"相对"关闭准入"分别 -12.4% / -12.2~-31.3% / -45.0% 吞吐；越是高费率越亏（拒绝 47/64 请求）。同时 TTFT p99（16 req/s：1577 → 1194 ms）与 E2E p99 明显改善——因为被拒的请求根本不进系统，这是"少做事换好看的尾延迟"，不能当作收益。
+- **1 req/s 下准入完全不触发**（0 拒绝 0 延迟），三档在噪声内，缓存感知的唯一可见效果是把估算误差从 -496 打到 0：这是"估算正确性"实验，不是性能实验。
+- 口径提醒：`/health` 的 `estimated_cache_hit_tokens` 是**准入累计潜在命中**，`actual_cache_hit_tokens` 是引擎累计实际复用；同批并发请求共享同一批块时后者小于前者（一次 8 请求验证里 6144 vs 3072），**逐请求** `context.estimated_cache_hit_tokens` vs `context.prefix_cache_hit_tokens` 才是权威对照口径。
+
+**③ decode burst 提前让出**：本 checkout 原先只有"PD decode 让出独立 prefill 队列"，mixed 模式下 burst 期间新到的 prefill 只能等 burst 跑完。本次新增 `decode_burst_yield`（默认开，`--no-decode-burst-yield` 消融）与 `decode_bursts / decode_burst_rounds / decode_burst_yields / decode_burst_skipped_slots` 计数，`scheduling_ablation.py` 增加 `without_decode_burst_yield` 变体与 "Decode burst behaviour" 报告表；实测见 §10.3.10——该让出条件在 mixed 模式下结构上恒不成立（0/7021）。
+
+#### 10.3.10 调度策略消融：TPOT 配额与 decode burst 让出（2026-10-06，Qwen3-0.6B，RTX 5060 Ti / WSL2）
+
+命令（用户给定口径，全量跑完）：
+
+```bash
+python benchmarks/scheduling_ablation.py --variants baseline all_on \
+  without_multi_step_decode without_decode_burst_yield \
+  --num-seqs 128 --arrival-rate 16 --arrival-mode poisson \
+  --slo-tpot-ms 20 --max-decode-steps 4
+```
+
+补充跑了一次 5 变体（加 `without_tpot_aware`）以定位根因；两次运行的 baseline/all_on 在 1~5% 内一致（Poisson trace 噪声）。JSON：`results/scheduling_ablation_128_r16.json`、`results/scheduling_ablation_128_r16_5v.json`。
+
+| 变体 | 吞吐 tok/s | 相对 baseline | TTFT p50/p99 ms | TPOT p50 ms | E2E p99 ms | request TTFT SLO | prefill 步数 / token / tok/s |
+|---|---|---|---|---|---|---|---|
+| baseline（全关） | 1848.3 | — | 468/772 | 41.6 | 18213 | 60.2% | 25 / 76474 / **10098** |
+| all_on（全开） | 365.8 | **-80.2%** | 43738/81343 | 170.2 | 92922 | 0.8% | **355** / 76474 / **1106** |
+| without_tpot_aware | 1688.2 | -8.7% | 1133/1680 | 44.5 | 20066 | 2.3% | 23 / 76474 / 8536 |
+| without_multi_step_decode | 354.4 | -80.8% | 44721/84344 | 175.2 | 96036 | 0.8% | 355+ |
+| without_decode_burst_yield | 356.0 | -80.7% | 45158/83822 | 173.8 | 95608 | 0.8% | 355+ |
+
+**读数（诚实结论）**：
+- **collapse 的根因是 TPOT-aware 配额，不是 multi-step，也不是 burst**：`all_on` 与 `without_multi_step_decode` 都是 ~355 步 prefill（吞吐 -80%），而单独移除 `tpot_aware_scheduling` 就把吞吐拉回 1688 tok/s（-8.7%）、prefill 回到 23 步。机制在代码里可追：`_slo_prefill_controls` 的 `token_budget = min_budget + pressure·(max_budget−min_budget)·(1−tpot_pressure)`，当请求带 20 ms TPOT 目标而实测 TPOT ~170 ms 时 `tpot_pressure → 1`，配额被压到 **`prefill_reserve_tokens` 下限（256）**，于是 128 条 ~600-token prompt 被切成 355 个 ~215-token 的碎片步——prefill 从 10.1k tok/s 掉到 1.1k tok/s，队列 p50 等待 43 s。**触发条件是"存在活跃 TPOT 目标且实测超过目标"**：不设 `--slo-tpot-ms`/`default_tpot_slo_ms` 时 `_has_active_tpot_target()=False`，配额不收缩（baseline 正常的原因）。
+- **multi-step decode 在无 TPOT 目标时的收益很轻**：5 变体里 `without_multi_step_decode` 相对 `all_on` 吞吐 -3.1%、TTFT p99 +3.7%；两次运行符号一致但幅度在噪声量级，只能算"轻微正向"。
+- **`without_decode_burst_yield` 在 mixed 下是近似空操作，而且量到了原因**：让出条件是"burst 期间 waiting 非空 → 提前收尾"，但 mixed 模式只在两次 `engine.step()` 之间提交请求，而 burst 只在 `scheduler.waiting` 为空时开始，因此该条件**结构上恒不成立**——实测 `yields = 0 / 7021 bursts`，`rounds/burst = 4.00`（跑满预算），`without_decode_burst_yield` 与 `without_multi_step_decode` 的 rounds 完全相同（7021/28082），即这一消融臂在 mixed 下等价于关掉 multi-step。真正的提前让出只在 PD 模式（独立 prefill 队列，`yield_for_prefill=True`）可达。**要衡量"让出"的收益必须跑 PD，或改成 step 内可提交请求的驱动方式**。
+- decode burst 计数随策略变化很大（baseline 0、all_on 7021 次 × 4.00 轮），说明多步复用在发生；TPOT 目标下的低吞吐不是多步造成的。
+- `prefix_feature_cache` 命中率在 all_on 下只有 6.8~7.3%（parses 5254 / reuses 416），stale reparse 5126 次与 parses 同量级——与 §4.1 记录的"每步重新解析"一致，属已知成本，未单独消融。
 
 ### 10.4 Profiling
 

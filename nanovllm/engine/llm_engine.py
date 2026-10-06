@@ -124,6 +124,8 @@ class LLMEngine:
         return dict(prefill_steps=0, decode_steps=0, prefill_tokens=0, decode_tokens=0,
                     prefill_time=0.0, decode_time=0.0, decode_iterations=0,
                     multi_step_decode_steps=0, multi_step_decode_tokens=0,
+                    decode_bursts=0, decode_burst_rounds=0, decode_burst_yields=0,
+                    decode_burst_skipped_slots=0,
                     spec_steps=0, spec_rows=0,
                     spec_verify_tokens=0, spec_draft_tokens=0, spec_accepted_drafts=0)
 
@@ -424,15 +426,32 @@ class LLMEngine:
         Follow-up rounds use the same scheduler state and normal KV append/COW/swap
         accounting. Prefill, PD prefill handoff, and speculative paths never enter
         this helper, so each returned engine step remains streamable.
+
+        ``decode_burst_yield``（默认开）让 burst 在后续轮开始前检查 prefill 队列：
+        mixed 模式下本步是纯 decode，说明本步调度时无 prefill 可排；但 burst 期间
+        仍在到达的新请求会落进 waiting，此时提前收尾让外循环尽快调度 prefill。
+        关闭后跑满 ``max_decode_steps`` 再回外循环（消融口径：多步复用 vs 新请求
+        TTFT 的取舍）。
         """
         total_decode_tokens = initial_decode_tokens
         if (not self.config.multi_step_decode or self.config.max_decode_steps <= 1
                 or self.config.speculative != "none" or scheduler.waiting
                 or scheduler.swapped or yield_for_prefill):
             return total_decode_tokens
+        self._step_stats["decode_bursts"] += 1
+        rounds_done = 1  # 首轮已由 schedule() + 本步 run() 完成
 
         for _ in range(1, self.config.max_decode_steps):
-            if not scheduler.running or scheduler.waiting or scheduler.swapped:
+            if not scheduler.running or scheduler.swapped:
+                break
+            # 让出检查：decode_burst_yield=False 时故意跳过，继续跑满余下轮次（消融）
+            if self.config.decode_burst_yield and (scheduler.waiting or yield_for_prefill):
+                if scheduler.waiting:
+                    # 放弃的 decode 轮次/行槽位（估算值，不代表实际会产出的 token 数）
+                    self._step_stats["decode_burst_yields"] += 1
+                    self._step_stats["decode_burst_skipped_slots"] += (
+                        (self.config.max_decode_steps - rounds_done)
+                        * len(scheduler.running))
                 break
             scheduler._order_running_by_tpot()
             scheduler.cow_pairs = []
@@ -466,6 +485,8 @@ class LLMEngine:
             total_decode_tokens += len(token_ids)
             self._last_step_multistep_tokens += len(token_ids)
             self._last_step_decode_iterations += 1
+            rounds_done += 1
+        self._step_stats["decode_burst_rounds"] += rounds_done
         return total_decode_tokens
 
     def _step_pd_decode(self) -> tuple[list[Sequence], int, int, bool]:
@@ -877,4 +898,9 @@ class LLMEngine:
             "multi_step_decode_tokens": self._step_stats["multi_step_decode_tokens"],
             "multi_step_decode_enabled": self.config.multi_step_decode,
             "max_decode_steps": self.config.max_decode_steps,
+            "decode_burst_yield_enabled": self.config.decode_burst_yield,
+            "decode_bursts": self._step_stats["decode_bursts"],
+            "decode_burst_rounds": self._step_stats["decode_burst_rounds"],
+            "decode_burst_yields": self._step_stats["decode_burst_yields"],
+            "decode_burst_skipped_slots": self._step_stats["decode_burst_skipped_slots"],
         }

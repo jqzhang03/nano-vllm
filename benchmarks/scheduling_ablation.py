@@ -41,6 +41,7 @@ FEATURES = (
     "slo_aware_scheduling",
     "tpot_aware_scheduling",
     "multi_step_decode",
+    "decode_burst_yield",
 )
 
 
@@ -57,6 +58,7 @@ def variant_table() -> dict[str, dict[str, bool]]:
         "slo_aware_scheduling": "without_slo_adaptive",
         "tpot_aware_scheduling": "without_tpot_aware",
         "multi_step_decode": "without_multi_step_decode",
+        "decode_burst_yield": "without_decode_burst_yield",
     }
     for feature, name in names.items():
         options = dict(all_on)
@@ -106,6 +108,10 @@ def _step_stats_empty():
         "decode_iterations": 0,
         "multi_step_decode_steps": 0,
         "multi_step_decode_tokens": 0,
+        "decode_bursts": 0,
+        "decode_burst_rounds": 0,
+        "decode_burst_yields": 0,
+        "decode_burst_skipped_slots": 0,
     }
 
 
@@ -200,6 +206,9 @@ def run_arrival_trace(args, prompts, sampling_params, arrival_times,
                 engine._last_step_multistep_tokens)
             if engine._last_step_decode_iterations > 1:
                 step_stats["multi_step_decode_steps"] += 1
+            for burst_key in ("decode_bursts", "decode_burst_rounds",
+                              "decode_burst_yields", "decode_burst_skipped_slots"):
+                step_stats[burst_key] += engine._step_stats.get(burst_key, 0)
             if kind == "prefill":
                 step_stats["prefill_steps"] += 1
                 step_stats["prefill_tokens"] += n_prefill
@@ -309,6 +318,16 @@ def summarize_requests(metrics: dict, wall: float, args) -> dict:
         "decode_iterations": stats["decode_iterations"],
         "multi_step_decode_steps": stats["multi_step_decode_steps"],
         "multi_step_decode_tokens": stats["multi_step_decode_tokens"],
+        "decode_bursts": stats["decode_bursts"],
+        "decode_burst_rounds": stats["decode_burst_rounds"],
+        "decode_burst_rounds_per_burst": (
+            stats["decode_burst_rounds"] / stats["decode_bursts"]
+            if stats["decode_bursts"] else None),
+        "decode_burst_yields": stats["decode_burst_yields"],
+        "decode_burst_yield_rate": (
+            stats["decode_burst_yields"] / stats["decode_bursts"]
+            if stats["decode_bursts"] else None),
+        "decode_burst_skipped_slots": stats["decode_burst_skipped_slots"],
         "max_queue_wait_seconds": max(queue_wait, default=0.0),
         "lifecycle": {
             "prefix_feature_parses": feature_parses,
@@ -427,6 +446,9 @@ def parse_args():
     parser.add_argument("--slo-tpot-ms", type=float, default=10.0)
     parser.add_argument("--max-decode-steps", type=int, default=4,
                         help="maximum pure-decode forwards per engine step")
+    parser.add_argument("--no-decode-burst-yield", action="store_true",
+                        help="force decode_burst_yield off in every variant "
+                             "(burst runs its full round budget past newly arrived prefills)")
     parser.add_argument("--output", default=None)
     return parser.parse_args()
 
@@ -444,6 +466,9 @@ def main():
         len(prompts), args.min_request_ttft_slo_ms,
         args.max_request_ttft_slo_ms, args.seed + 2)
     variants = variant_table()
+    if args.no_decode_burst_yield:
+        for options in variants.values():
+            options["decode_burst_yield"] = False
     runs = {}
 
     for variant_name in args.variants:
@@ -510,6 +535,7 @@ def main():
             "max_decode_steps": args.max_decode_steps,
             "warmup_seqs": args.warmup_seqs,
         },
+        "variants": {name: dict(options) for name, options in variants.items()},
         "workload": {
             "num_requests": len(prompts),
             "arrival_mode": args.arrival_mode,
@@ -564,6 +590,20 @@ def main():
               f"{life['deferred_free_refs_committed']:<7} "
               f"{life['deferred_free_peak_blocks']:>4}/"
               f"{life['deferred_free_peak_refs']:<4}")
+
+    print("\nDecode burst behaviour by policy (rounds = model forwards per burst):")
+    print("variant                 bursts  rounds  rounds/burst  yields  yield%  skipped slots")
+    for name, result in runs.items():
+        summary = result["summary"]
+        rounds_per_burst = summary["decode_burst_rounds_per_burst"]
+        yield_rate = summary["decode_burst_yield_rate"]
+        rounds_text = ("n/a" if rounds_per_burst is None
+                       else f"{rounds_per_burst:.2f}")
+        yield_text = "n/a" if yield_rate is None else f"{yield_rate * 100:.1f}%"
+        print(f"{name:<23} {summary['decode_bursts']:>6} "
+              f"{summary['decode_burst_rounds']:>7} {rounds_text:>13} "
+              f"{summary['decode_burst_yields']:>7} {yield_text:>6} "
+              f"{summary['decode_burst_skipped_slots']:>14}")
 
     if all_on:
         print("\nEffect of removing one policy (relative to all_on; lower latency is better):")

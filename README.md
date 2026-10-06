@@ -156,6 +156,14 @@ admission so TTFT and queue-wait metrics include time spent waiting in the servi
 Before placing a request in the engine backlog, dynamic admission estimates prefill work
 from prompt tokens, expected decode work from the requested output limit and the observed
 completion-length ratio, plus pressure from active work, queued work, and projected KV blocks.
+When cache-affinity admission is enabled (default), the prompt work is charged net of the
+block-aligned prefix the shared prefix cache can serve: the manager keeps a read-only snapshot
+of the block-manager hash table (rebuilt between engine steps while the worker is idle, keyed by
+a version counter) and walks the candidate's chained block hashes against it. The estimate and
+the tokens actually reused are both reported (`admission.estimated_cache_hit_tokens` and
+`context.prefix_cache_hit_tokens`); `/health` additionally reports the engine-side cumulative
+reuse counters. `--no-cache-affinity-admission` turns both the scheduler ordering and the
+cache-aware estimate off, giving a "no cache awareness" admission variant.
 The output estimate starts at the full requested limit, then adapts using completed requests;
 KV capacity checks still reserve against the full limit. Prefill/Decode rates start from configurable
 fallbacks and adapt from completed engine steps. When the engine is idle, it admits one
@@ -188,7 +196,11 @@ The scheduler enables these policies by default:
 * **TPOT-target-aware batching** accepts a request-level `tpot_slo_ms` (or the optional
   `default_tpot_slo_ms`). It tracks each active request's observed token interval, prioritizes
   requests with less TPOT slack, and shrinks prefill token/row quotas when decode latency is
-  near or over target. Benchmark TPOT SLO attainment uses the same per-request average as the
+  near or over target. The quota scales with `(1 - tpot_pressure)`, so an unreachable target
+  pushes it to the `prefill_reserve_tokens` floor: a 2026-10-06 run with `tpot_slo_ms=20` at
+  128 requests / 16 req/s measured 10.1k → 1.1k prefill tok/s, 25 → 355 prefill steps and a
+  TTFT p50 of 0.5 s → 44 s. Prefer a target the hardware can actually hold, or leave it unset.
+  Benchmark TPOT SLO attainment uses the same per-request average as the
   reported TPOT: `(completed - first_token) / (completion_tokens - 1)`. Requests that emit
   fewer than two completion tokens have no measurable inter-token interval and are excluded
   from the TPOT SLO denominator.
@@ -197,7 +209,11 @@ The scheduler enables these policies by default:
   engine/server-loop handoffs between forwards. Each round performs ordinary KV
   append/COW/preemption accounting. Prefill or
   speculative work ends the burst; mixed, prefill, and speculative batches remain one forward.
-  In online streaming, generated tokens are delivered together at the end of each burst.
+  `decode_burst_yield` (default on) additionally stops a running burst when prefill work is
+  waiting, but in `mixed` mode that condition cannot trigger — requests are only submitted
+  between engine steps and a burst only starts with an empty waiting queue — so the yield path is
+  reachable only in PD mode; `--no-decode-burst-yield` is the ablation. In online streaming,
+  generated tokens are delivered together at the end of each burst.
 
 The policies can be changed through `LLM(...)` config fields or the equivalent
 `nanovllm-serve` / `benchmarks/bench.py` flags: `latency_aware_scheduling`,
@@ -210,9 +226,12 @@ The policies can be changed through `LLM(...)` config fields or the equivalent
 `--no-tpot-aware-scheduling` disables TPOT prioritization, and
 `tpot_decode_ms_fallback` controls the estimate before request samples are available.
 Set `max_decode_steps` (1–16) to bound each decode burst; `multi_step_decode=False`
-or `--no-multi-step-decode` provides the single-step ablation. The benchmark accepts
+or `--no-multi-step-decode` provides the single-step ablation, and `decode_burst_yield=False`
+or `--no-decode-burst-yield` keeps a burst running its full round budget past newly arrived
+prefills. The benchmark accepts
 `--max-decode-steps`, `--default-tpot-slo-ms`, and both `--no-*` ablations; the continuous
-arrival harness includes `without_tpot_aware` and `without_multi_step_decode` cases.
+arrival harness includes `without_tpot_aware`, `without_multi_step_decode`, and
+`without_decode_burst_yield` cases.
 Admission can be tuned with `--max-queued-requests`,
 `--max-deferred-requests`, `--max-admission-wait-ms`, `--admission-work-budget-ms`,
 `--admission-target-ttft-ms`, and `--admission-soft-pressure`. Use
@@ -227,18 +246,20 @@ python benchmarks/scheduling_ablation.py --num-seqs 128 --arrival-rate 16 \
   --arrival-mode poisson --shared-prefix-len 512
 ```
 
-The default variants are `baseline` (all six policies off), `all_on`, and one run with
+The default variants are `baseline` (all policies off), `all_on`, and one run with
 each policy removed from `all_on`. This includes `without_prefix_feature_cache`, which keeps
 cache-affinity scheduling enabled but reparses each Top-W feature query; it isolates the cost
-and reuse benefit of generation-tagged lazy features. Use `--variants baseline all_on` for a quick A/B run,
+and reuse benefit of generation-tagged lazy features, and `without_decode_burst_yield`, which
+keeps multi-step decode on but lets a burst run its full round budget past arrived prefills.
+Use `--variants baseline all_on` for a quick A/B run,
 or `--arrival-mode burst` to compare burst admission with continuously offered load. Set
 `--min-request-ttft-slo-ms` and `--max-request-ttft-slo-ms` to give requests reproducible
 individual TTFT targets. The report compares throughput, TTFT p50/p99, queue wait, TPOT,
 E2E, fixed and per-request SLO attainment, adaptive prefill quotas, prefix-cache hits,
 aging promotions, recompute/swap counts, and estimated preemption cost. It also records
 lazy-feature parses/reuses, stale-generation reparses, KV-generation mutations, LRU
-evictions, and deferred-free references queued/committed with peak unique-block and reference
-counts.
+evictions, deferred-free references queued/committed with peak unique-block and reference
+counts, and decode-burst rounds/yields with the decode slots given up to prefill.
 The JSON includes per-policy deltas from `baseline` and paired deltas from `all_on`, so each
 `without_*` run shows the effect of removing that policy while holding the others on.
 Raw per-request data and the shared arrival trace are saved as JSON under `results/`.
@@ -253,28 +274,47 @@ parse/reuse counts and rates, stale-generation reparses, KV-generation mutations
 evictions, deferred-free lifecycle counters, mixed graph captures/replays/fallbacks, and
 per-request prefix-hit tokens.
 
-Compare predictive request admission on/off against one shared arrival trace with:
+Compare the three admission variants (off / on without cache awareness / on with cache
+awareness) against one shared arrival trace with:
 
 ```bash
 python benchmarks/admission_ablation.py --num-seqs 128 --arrival-rate 16 \
-  --arrival-mode poisson
+  --arrival-mode poisson --shared-prefix-len 512
 ```
 
-It reports accepted/deferred/rejected requests, actual TTFT/E2E, output throughput, and
-per-request estimates to `results/admission_ablation_*.json`.
+Each variant gets a fresh engine and the same trace. It reports accepted/deferred/rejected
+requests, actual TTFT/E2E, output throughput, the per-request cache-hit estimate vs the tokens
+actually reused (mean and worst absolute error), and the admission counters to
+`results/admission_ablation_*.json`.
+
+Two standalone checks make the estimate-vs-measured comparison easy to read:
+
+```bash
+python benchmarks/prefix_cache_probe.py       # in-process: scheduler estimate vs committed reuse
+python benchmarks/prefix_cache_verify.py      # over HTTP against nanovllm-serve
+python benchmarks/prefix_estimate_check.py    # three requests, estimate and actual per response
+```
 
 ### Current scope and known limits
 
-Admission is predictive and bounded, but its model is a heuristic: it uses token counts rather
-than prefix-cache hit predictions, and a single global output-length ratio is not conditioned
-on request content. Throughput fallbacks may misestimate a model until online samples arrive.
+Admission is predictive and bounded, but its model is a heuristic: prompt work is charged net of a
+block-aligned prefix-cache prediction that matched the engine's committed reuse exactly in every
+probe run so far (see `benchmarks/prefix_cache_probe.py` and `benchmarks/prefix_cache_verify.py`),
+while the accept/defer thresholds themselves (`admission_work_budget_ms`,
+`admission_soft_pressure`) are not calibrated per model or arrival rate — a 2026-10-06 sweep on the
+RTX 5060 Ti (64-request Poisson traces) lost 12% throughput at 4 req/s, 12–54% at 8 req/s, and 45%
+at 16 req/s versus disabling admission, with the cache-aware variant consistently better than the
+cache-blind one (up to +51%), so treat the default thresholds as unvalidated on new hardware. A single
+global output-length ratio is not conditioned on request content. Throughput fallbacks may
+misestimate a model until online samples arrive.
 The fixed hard queue cap remains as a safety bound. Conversation
 history is held in host memory only and is lost when the server exits; GPU KV is not retained
 between turns. Summary compaction is lossy and costs an additional model inference. Multi-step
-decode is limited to pure non-speculative decode windows; it delays newly arriving work by at
-most the configured burst and may coalesce several token IDs into one SSE text chunk. TPOT
+decode is limited to pure non-speculative decode windows; `decode_burst_yield` (default on) ends a
+burst early once new requests are waiting, so the added delay is bounded by the rounds already
+executed, and several token IDs may arrive in one SSE text chunk. TPOT
 control uses a request-local EWMA with a configurable fallback, so it is a heuristic rather than
-a hard real-time guarantee. Neither new policy has a measured performance claim yet; run the
+a hard real-time guarantee. Run the
 same-trace scheduling ablation on the target GPU before drawing conclusions.
 KV swap combined with rolling-cache modes is not verified; Gemma-2 split rolling-cache requires
 KV swap to be disabled.

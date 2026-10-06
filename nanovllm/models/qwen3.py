@@ -6,7 +6,9 @@ from transformers import Qwen3Config
 from nanovllm.layers.activation import SiluAndMul
 from nanovllm.layers.attention import Attention
 from nanovllm.layers.layernorm import RMSNorm
-from nanovllm.layers.linear import QKVParallelLinear, MergedColumnParallelLinear, RowParallelLinear
+from nanovllm.layers.linear import (
+    QKVParallelLinear, MergedColumnParallelLinear, RowParallelLinear, tp_size,
+)
 from nanovllm.layers.rotary_embedding import get_rope
 from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 
@@ -26,13 +28,13 @@ class Qwen3Attention(nn.Module):
         rope_scaling: dict | None = None,
     ) -> None:
         super().__init__()
-        tp_size = dist.get_world_size() # 张量并行中，GPU数量
+        ts = tp_size()  # 张量并行世界大小；进程组未初始化（TP=1 引擎）时按 1
         self.total_num_heads = num_heads # 全局注意力头总数
-        assert self.total_num_heads % tp_size == 0
-        self.num_heads = self.total_num_heads // tp_size # 每张GPU分配的注意力头数
+        assert self.total_num_heads % ts == 0
+        self.num_heads = self.total_num_heads // ts # 每张GPU分配的注意力头数
         self.total_num_kv_heads = num_kv_heads # 全局KV头总数
-        assert self.total_num_kv_heads % tp_size == 0
-        self.num_kv_heads = self.total_num_kv_heads // tp_size # 每张GPU分配的KV头数
+        assert self.total_num_kv_heads % ts == 0
+        self.num_kv_heads = self.total_num_kv_heads // ts # 每张GPU分配的KV头数
         self.head_dim = head_dim or hidden_size // self.total_num_heads # 每个注意力头的维度
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim

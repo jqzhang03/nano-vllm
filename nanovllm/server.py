@@ -18,6 +18,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from nanovllm import LLM, SamplingParams
+from nanovllm.engine.sequence import Sequence
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +79,8 @@ class GenerationHandle:
     predicted_ttft_ms: float = 0.0
     queue_pressure: float = 0.0
     estimated_output_tokens: float = 0.0
+    estimated_cache_hit_tokens: float = 0.0
+    hit_estimate_counted: bool = False
     prefix_cached_tokens: int = 0
 
 
@@ -93,7 +96,8 @@ class GenerationManager:
                  admission_target_ttft_ms: float = 2000.0,
                  admission_soft_pressure: float = 0.85,
                  prefill_tps_fallback: float = 10000.0,
-                 decode_tps_fallback: float = 1000.0):
+                 decode_tps_fallback: float = 1000.0,
+                 cache_affinity_admission: bool = True):
         if max_deferred_requests < 0:
             raise ValueError("max_deferred_requests must be non-negative")
         if max_queued_requests < 1:
@@ -120,6 +124,16 @@ class GenerationManager:
         self.admission_soft_pressure = admission_soft_pressure
         self.prefill_tps = prefill_tps_fallback
         self.decode_tps = decode_tps_fallback
+        # 准入是否按前缀缓存命中折算 prompt 工作量（消融开关）。
+        self.cache_affinity_admission = cache_affinity_admission
+        # 跨线程只读的前缀缓存快照（hash -> (block_id, pending_free, token_ids)）与
+        # 其版本号：只在 engine 空闲时重建（`_refresh_prefix_snapshot`），准入估算
+        # 只读这份不可变副本，绝不读 worker 线程正在改的活表。
+        self._prefix_snapshot: dict[int, tuple[int, bool, tuple]] = {}
+        self._prefix_snapshot_version = -1
+        self._prefix_snapshot_age_steps = 0
+        self._admission_hit_estimate_tokens = 0
+        self._admission_hit_actual_tokens = 0
         # Begin with the requested output cap as a conservative prior, then
         # learn the generated/capped ratio from completed requests.
         self.output_length_ratio = 1.0
@@ -137,8 +151,14 @@ class GenerationManager:
                            "prefill_seconds": 0.0, "decode_seconds": 0.0,
                            "decode_iterations": 0, "multi_step_decode_steps": 0,
                            "multi_step_decode_tokens": 0,
+                           # 引擎侧权威前缀复用计数（scheduler 累加），用于和准入估算对账：
+                           # 每完成一次 prefill 分配，按 seq.num_prefix_cached_tokens 累加。
+                           "prefix_cache_hit_tokens": 0,
+                           "prefix_cache_hit_requests": 0,
+                           "prefix_cache_evictions": 0,
                            "engine_seconds": 0.0}
         self._refresh_kv_pool_stats()
+        self._refresh_prefix_snapshot()
         self.task: asyncio.Task | None = None
         self.stopping = False
         self.accepting = True
@@ -190,6 +210,12 @@ class GenerationManager:
                         handle.predicted_ttft_ms = estimate["predicted_ttft_ms"]
                         handle.queue_pressure = estimate["queue_pressure"]
                         handle.estimated_output_tokens = estimate["candidate_output_tokens"]
+                        handle.estimated_cache_hit_tokens = estimate[
+                            "estimated_cache_hit_tokens"]
+                        if not handle.hit_estimate_counted:
+                            handle.hit_estimate_counted = True
+                            self._admission_hit_estimate_tokens += int(
+                                estimate["estimated_cache_hit_tokens"])
                         self.pending[handle.request_id] = handle
                         self.incoming.put_nowait(handle)
                         self._admission_counts["accepted"] += 1
@@ -270,6 +296,37 @@ class GenerationManager:
             self._kv_pool_peak_used[index] = max(
                 self._kv_pool_peak_used[index], total - free)
 
+    def _refresh_prefix_snapshot(self) -> None:
+        """Rebuild the cross-thread prefix-cache snapshot (engine idle only).
+
+        Same idle-only rule as ``_refresh_kv_pool_stats``: the version check keeps
+        the cost near zero on decode-only steps, and a snapshot that is one engine
+        step stale only shifts the admission estimate by the blocks published in
+        that step.
+        """
+        managers = self._block_managers()
+        if not managers:
+            return
+        primary = managers[0]
+        version = primary.prefix_map_version()
+        if version == self._prefix_snapshot_version:
+            return
+        self._prefix_snapshot = primary.prefix_snapshot()
+        self._prefix_snapshot_version = version
+
+    def _estimate_candidate_hit_tokens(self, candidate: GenerationHandle) -> int:
+        """Estimate how many prompt tokens the prefix cache can serve for a request.
+
+        Uses the same chained block hashes as ``BlockManager.can_allocate`` against
+        the idle-time snapshot, so the number is the block-aligned reuse the engine
+        would commit if the cache does not change before this request is scheduled.
+        """
+        if not self.cache_affinity_admission or not self._prefix_snapshot:
+            return 0
+        manager = self._block_managers()[0]
+        probe = Sequence(candidate.prompt_token_ids, candidate.sampling_params)
+        return manager.estimate_cached_tokens(probe, self._prefix_snapshot)
+
     def _estimate_admission(self, candidate: GenerationHandle) -> dict[str, float]:
         prefill_tokens = 0
         decode_tokens = 0
@@ -290,10 +347,15 @@ class GenerationManager:
 
         candidate_output_tokens = self._expected_output_tokens(
             candidate.sampling_params.max_tokens)
-        prefill_tokens += len(candidate.prompt_token_ids)
+        # 前缀缓存感知：估算这个候选能直接复用多少 prompt token（块对齐）。
+        # cache_affinity_admission=False 时恒为 0，即"准入不感知缓存"的消融口径。
+        candidate_hit_tokens = self._estimate_candidate_hit_tokens(candidate)
+        candidate_prefill_tokens = len(candidate.prompt_token_ids) - candidate_hit_tokens
+        prefill_tokens += candidate_prefill_tokens
         decode_tokens += candidate_output_tokens
-        pending_blocks += (len(candidate.prompt_token_ids)
+        pending_blocks += (candidate_prefill_tokens
                            + candidate.sampling_params.max_tokens + block_size - 1) // block_size
+        self._admission_hit_estimate_tokens += candidate_hit_tokens
 
         prefill_rate = max(1.0, self.prefill_tps)
         decode_rate = max(1.0, self.decode_tps)
@@ -325,6 +387,9 @@ class GenerationManager:
             "projected_prefill_tokens": float(prefill_tokens),
             "projected_output_tokens": float(decode_tokens),
             "candidate_output_tokens": candidate_output_tokens,
+            "candidate_prompt_tokens": float(len(candidate.prompt_token_ids)),
+            "estimated_cache_hit_tokens": float(candidate_hit_tokens),
+            "candidate_prefill_tokens": float(candidate_prefill_tokens),
             "output_length_ratio": self.output_length_ratio,
             "queue_pressure": max(count_pressure, work_pressure, kv_pressure),
             "kv_pressure": kv_pressure,
@@ -367,6 +432,15 @@ class GenerationManager:
             "prefill_tps_estimate": round(self.prefill_tps, 1),
             "decode_tps_estimate": round(self.decode_tps, 1),
             "output_length_ratio": round(self.output_length_ratio, 3),
+            "cache_affinity_admission": self.cache_affinity_admission,
+            # 准入估算命中 vs 引擎实际复用：两个累加器口径一致（都按请求前缀 token 数），
+            # 前者在准入时按快照算，后者在 prefill 分配后由引擎回报。
+            "estimated_cache_hit_tokens": self._admission_hit_estimate_tokens,
+            "actual_cache_hit_tokens": self._admission_hit_actual_tokens,
+            "hit_estimate_error_tokens": (self._admission_hit_estimate_tokens
+                                          - self._admission_hit_actual_tokens),
+            "prefix_snapshot_version": self._prefix_snapshot_version,
+            "prefix_snapshot_entries": len(self._prefix_snapshot),
             "last_estimate": dict(self._last_admission_estimate),
             "step_stats": dict(self.step_stats),
             "kv_pools": [
@@ -386,6 +460,8 @@ class GenerationManager:
             "predicted_ttft_ms": round(handle.predicted_ttft_ms, 1),
             "queue_pressure": round(handle.queue_pressure, 3),
             "estimated_output_tokens": round(handle.estimated_output_tokens, 1),
+            # 估算（准入时按前缀缓存快照算出）；实测命中见 context.prefix_cache_hit_tokens
+            "estimated_cache_hit_tokens": round(handle.estimated_cache_hit_tokens, 1),
         }
 
     async def close(self) -> None:
@@ -524,9 +600,23 @@ class GenerationManager:
                             step_elapsed * n_decode / token_total)
                 self._sync_prefill_progress()
                 self._refresh_kv_pool_stats()
+                self._refresh_prefix_snapshot()
+                # 引擎侧权威前缀复用计数（scheduler 累加，读标量不算开销）
+                schedulers = ((self.engine.prefill_scheduler, self.engine.decode_scheduler)
+                              if self.engine._pd else (self.engine.scheduler,))
+                self.step_stats["prefix_cache_hit_tokens"] = sum(
+                    scheduler.prefix_cache_hit_tokens for scheduler in schedulers)
+                self.step_stats["prefix_cache_hit_requests"] = sum(
+                    scheduler.prefix_cache_hit_requests for scheduler in schedulers)
+                self.step_stats["prefix_cache_evictions"] = sum(
+                    scheduler.block_manager.prefix_cache_evictions
+                    for scheduler in schedulers)
                 for seq_id, cached_tokens in self.engine._last_step_prefix_hits.items():
                     handle = self.active.get(seq_id)
                     if handle is not None:
+                        # 实测命中：按增量累计（max 更新可能分多个 step 到齐）
+                        growth = max(0, cached_tokens - handle.prefix_cached_tokens)
+                        self._admission_hit_actual_tokens += growth
                         handle.prefix_cached_tokens = max(
                             handle.prefix_cached_tokens, cached_tokens)
                 for seq_id, token_ids in self.engine._last_step_tokens.items():
@@ -879,7 +969,8 @@ def create_app(model: str, *, engine_kwargs: dict[str, Any] | None = None,
                admission_target_ttft_ms: float = 2000.0,
                admission_soft_pressure: float = 0.85,
                admission_prefill_tps_fallback: float = 10000.0,
-               admission_decode_tps_fallback: float = 1000.0) -> FastAPI:
+               admission_decode_tps_fallback: float = 1000.0,
+               cache_affinity_admission: bool = True) -> FastAPI:
     """Create an OpenAI-compatible app; model loading happens in the lifespan."""
     engine_kwargs = dict(engine_kwargs or {})
     if max_queued_requests < 1:
@@ -929,6 +1020,7 @@ def create_app(model: str, *, engine_kwargs: dict[str, Any] | None = None,
                 admission_soft_pressure=admission_soft_pressure,
                 prefill_tps_fallback=admission_prefill_tps_fallback,
                 decode_tps_fallback=admission_decode_tps_fallback,
+                cache_affinity_admission=cache_affinity_admission,
             )
             manager.start()
             app.state.engine = engine
@@ -965,6 +1057,7 @@ def create_app(model: str, *, engine_kwargs: dict[str, Any] | None = None,
             "decode": {
                 "multi_step_enabled": engine.config.multi_step_decode,
                 "max_steps": engine.config.max_decode_steps,
+                "burst_yield": engine.config.decode_burst_yield,
                 "tpot_aware": engine.config.tpot_aware_scheduling,
                 "default_tpot_slo_ms": engine.config.default_tpot_slo_ms,
             },
@@ -1066,6 +1159,7 @@ def create_app(model: str, *, engine_kwargs: dict[str, Any] | None = None,
             "X-Predicted-TTFT-Ms": f"{handle.predicted_ttft_ms:.1f}",
             "X-Queue-Pressure": f"{handle.queue_pressure:.3f}",
             "X-Estimated-Output-Tokens": f"{handle.estimated_output_tokens:.1f}",
+            "X-Prefix-Cache-Hit-Tokens": str(handle.prefix_cached_tokens),
         })
 
     @app.post("/v1/completions")
@@ -1099,6 +1193,10 @@ def create_app(model: str, *, engine_kwargs: dict[str, Any] | None = None,
             "usage": {"prompt_tokens": len(prompt_ids),
                       "completion_tokens": len(result["token_ids"]),
                       "total_tokens": len(prompt_ids) + len(result["token_ids"])},
+            # 与 /v1/chat/completions 对齐：暴露实际前缀复用（无会话时 session 为 None）
+            "context": {"prefix_cache_hit_tokens": handle.prefix_cached_tokens,
+                        "estimated_cache_hit_tokens": int(
+                            handle.estimated_cache_hit_tokens)},
             "admission": app.state.manager.admission_metadata(handle),
         }
 
@@ -1223,6 +1321,8 @@ def create_app(model: str, *, engine_kwargs: dict[str, Any] | None = None,
                             "removed_turns": removed_turns,
                             "session_token_budget": session_budget,
                             "prefix_cache_hit_tokens": handle.prefix_cached_tokens,
+                            "estimated_cache_hit_tokens": int(
+                                handle.estimated_cache_hit_tokens),
                             "session_statistics": session_context},
                 "admission": app.state.manager.admission_metadata(handle),
             }
@@ -1293,7 +1393,9 @@ def main() -> None:
     parser.add_argument("--context-compaction", choices=("truncate", "summarize"),
                         default="truncate")
     parser.add_argument("--no-latency-aware-scheduling", action="store_true")
-    parser.add_argument("--no-cache-affinity-admission", action="store_true")
+    parser.add_argument("--no-cache-affinity-admission", action="store_true",
+                        help="disable Top-W cache-affinity ordering AND cache-aware "
+                             "admission estimates (prefill work is charged in full)")
     parser.add_argument("--no-aging-fairness", action="store_true")
     parser.add_argument("--no-recompute-aware-preemption", action="store_true")
     parser.add_argument("--admission-window", type=int, default=16)
@@ -1311,6 +1413,9 @@ def main() -> None:
                         help="disable bounded multi-step decode (ablation path)")
     parser.add_argument("--max-decode-steps", type=int, default=4,
                         help="maximum pure-decode model forwards per engine step")
+    parser.add_argument("--no-decode-burst-yield", action="store_true",
+                        help="disable early burst yield: run the full multi-step round "
+                             "budget even when prefill work is queued (ablation path)")
     parser.add_argument("--max-prefill-chunk-tokens", type=int, default=4096)
     parser.add_argument("--queue-depth-for-full-prefill", type=int, default=16)
     parser.add_argument("--preempt-prefill-tps", type=float, default=10000.0)
@@ -1348,6 +1453,7 @@ def main() -> None:
             "tpot_decode_ms_fallback": args.tpot_decode_ms_fallback,
             "multi_step_decode": not args.no_multi_step_decode,
             "max_decode_steps": args.max_decode_steps,
+            "decode_burst_yield": not args.no_decode_burst_yield,
             "max_prefill_chunk_tokens": args.max_prefill_chunk_tokens,
             "queue_depth_for_full_prefill": args.queue_depth_for_full_prefill,
             "preempt_prefill_tokens_per_second": args.preempt_prefill_tps,
@@ -1366,6 +1472,7 @@ def main() -> None:
         admission_soft_pressure=args.admission_soft_pressure,
         admission_prefill_tps_fallback=args.admission_prefill_tps_fallback,
         admission_decode_tps_fallback=args.admission_decode_tps_fallback,
+        cache_affinity_admission=not args.no_cache_affinity_admission,
     )
     uvicorn.run(app, host=args.host, port=args.port)
 

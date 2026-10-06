@@ -43,6 +43,7 @@ class Config:
     queue_depth_for_full_prefill: int = 16 # 等待队列达到该长度时进入最高队列压力
     multi_step_decode: bool = True # 纯decode时连续复用调度批次；prefill/spec/mixed路径仍单步
     max_decode_steps: int = 4 # 每个decode调度窗口最多执行的模型前向轮数（含首轮）
+    decode_burst_yield: bool = True # burst 提前让出：后续轮开始前检查prefill队列，有等待请求就不再复用余下轮次（False=消融，跑满max_decode_steps再回外循环，会推迟新请求的TTFT；PD模式另有独立prefill队列让出）
     recompute_aware_preemption: bool = True # 按估算swap往返成本与cache-aware recompute成本选择抢占方式
     preempt_prefill_tokens_per_second: float = 10000.0 # 尚无在线样本时的recompute估算回退值
     preempt_kv_transfer_gbps: float = 12.0 # 尚无在线样本时的KV swap带宽估算回退值
