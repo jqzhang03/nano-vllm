@@ -29,6 +29,10 @@ class Scheduler:
         self.tpot_aware_scheduling = config.tpot_aware_scheduling
         self.default_tpot_slo_ms = config.default_tpot_slo_ms
         self.tpot_decode_ms_fallback = config.tpot_decode_ms_fallback
+        # TPOT 压力对 prefill 的收缩死区（见 _tpot_decode_pressure 的注释）
+        self.tpot_prefill_throttle_margin = config.tpot_prefill_throttle_margin
+        # 等待队列达到该深度时停用 TPOT 对 prefill 的压缩（防自锁，见同处注释）
+        self.tpot_throttle_max_waiting = config.tpot_throttle_max_waiting
         self.external_tpot_pressure = 0.0
         self.external_tpot_target_active = False
         self.max_prefill_chunk_tokens = config.max_prefill_chunk_tokens
@@ -117,6 +121,12 @@ class Scheduler:
         self.num_tpot_prefill_steps = 0
         self.tpot_prefill_budget_sum = 0
         self.num_tpot_priority_steps = 0
+        # TPOT 压力对 prefill 配额的收缩观测：scale = prefill_pressure·(1−tpot_pressure)，
+        # scale→0 表示 prefill 被压到 min_budget（饥饿）。
+        self.slo_prefill_budget_scale_sum = 0.0
+        self.slo_prefill_budget_scale_min = 1.0
+        self._last_prefill_budget_scale = 1.0
+        self.num_tpot_starved_steps = 0
         self._last_tpot_pressure = 0.0
         self.cow_pairs: list[tuple[int, int]] = []  # 本轮调度产生的COW复制对 (old_block_id, new_block_id)
         self.swap_pairs: list[tuple[Sequence, list[int], object, str]] = []  # 本轮KV swap对 (seq, gpu块id, cpu缓冲, "out"/"in")——GPU拷贝由engine在run前执行
@@ -181,6 +191,10 @@ class Scheduler:
         self.num_tpot_prefill_steps = 0
         self.tpot_prefill_budget_sum = 0
         self.num_tpot_priority_steps = 0
+        self.slo_prefill_budget_scale_sum = 0.0
+        self.slo_prefill_budget_scale_min = 1.0
+        self._last_prefill_budget_scale = 1.0
+        self.num_tpot_starved_steps = 0
         self._last_tpot_pressure = 0.0
 
     def observe_prefill(self, num_tokens: int, elapsed_seconds: float) -> None:
@@ -237,15 +251,53 @@ class Scheduler:
         return target - observed
 
     def _tpot_decode_pressure(self) -> float:
+        """How hard decode work should throttle prefill, in [0, 1].
+
+        ``slack = target − observed``, so the raw ratio ``1 − slack/target`` is
+        ``observed/target``: it reaches 1.0 as soon as the observed interval merely
+        exceeds the target, and every larger overshoot saturates there too. That
+        cliff is what starves prefill — the quota collapses to
+        ``prefill_reserve_tokens`` regardless of *how far* off the target is, and the
+        resulting 256-token prefill fragments then keep measured TPOT high, which
+        keeps the pressure pinned. Measured on the RTX 5060 Ti with 128 requests at
+        16 req/s: budget scale 0.001 (min 0.000), prefill quota exactly 256 tokens
+        over 355 steps, TTFT p50 43.7 s, and the same result for TPOT targets of
+        10/20/40/80/160 ms once observed TPOT (~85 ms) exceeded them.
+
+        ``tpot_prefill_throttle_margin`` adds a deadband: within
+        ``margin × target`` of the target the throttle stays off, and beyond it the
+        throttle ramps linearly with the overshoot instead of clipping at 1.0. A
+        target of 0 keeps the legacy cliff behaviour for comparison.
+
+        ``tpot_throttle_max_waiting`` additionally disables the throttle once the
+        waiting queue is at least that deep. The throttle's own justification is
+        "decode is the bottleneck", but at depth the bottleneck is prefill
+        throughput — starving prefill keeps every late request without a first
+        token while the already-running requests keep missing their target, so the
+        signal reinforces itself. Measured at 128 requests / 16 req/s with a 20 ms
+        target: throttle pinned the budget at 256 tokens for 355 steps and left
+        TTFT p50 at 43.7 s, and a target of 10/20/40/80/160 ms all behaved the same.
+        """
         if not self.tpot_aware_scheduling:
             return 0.0
+        if 0 < self.tpot_throttle_max_waiting <= len(self.waiting):
+            return 0.0
         pressure = self.external_tpot_pressure
+        margin = max(0.0, self.tpot_prefill_throttle_margin)
         for seq in self.running:
             target = self._tpot_target_ms(seq)
-            if target is None:
+            if target is None or target <= 0:
                 continue
-            slack = self._estimated_tpot_slack_ms(seq)
-            pressure = max(pressure, min(1.0, max(0.0, 1.0 - slack / target)))
+            observed = (seq.tpot_ewma_ms if seq.tpot_ewma_ms is not None
+                        else self.tpot_decode_ms_fallback)
+            if margin > 0:
+                deadband = margin * target
+                overshoot = observed - target - deadband
+                ratio = (0.0 if overshoot <= 0
+                         else overshoot / (target + deadband))
+            else:
+                ratio = observed / target
+            pressure = max(pressure, min(1.0, max(0.0, ratio)))
         return pressure
 
     def _order_running_by_tpot(self) -> None:
@@ -300,19 +352,34 @@ class Scheduler:
         self._last_tpot_pressure = tpot_pressure
         max_budget = min(self.max_num_batched_tokens, self.max_prefill_chunk_tokens)
         min_budget = min(self.prefill_reserve_tokens, max_budget)
-        token_budget = round(min_budget + prefill_pressure * (max_budget - min_budget)
-                             * (1.0 - tpot_pressure))
+        # TPOT 压力对 prefill 配额的收缩是"乘法"的：pressure→1 时配额直接落到
+        # min_budget（prefill_reserve_tokens）。目标不可达时（如 20ms 目标 vs 实测
+        # 170ms）这会把 prefill 切成碎片步——饥饿就是这么来的。下面记录收缩因子，
+        # 供消融报告直接观测，不必再从吞吐反推。
+        budget_scale = prefill_pressure * (1.0 - tpot_pressure)
+        self._last_prefill_budget_scale = budget_scale
+        self.slo_prefill_budget_scale_sum += budget_scale
+        self.slo_prefill_budget_scale_min = min(self.slo_prefill_budget_scale_min,
+                                                budget_scale)
+        if tpot_pressure >= 0.5:
+            self.num_tpot_starved_steps += 1
+        token_budget = round(min_budget + budget_scale * (max_budget - min_budget))
         if self.max_num_seqs <= 1:
             prefill_rows = 1
         else:
             row_capacity = self.max_num_seqs - 1
-            row_pressure = prefill_pressure * (1.0 - tpot_pressure)
-            prefill_rows = min(len(self.waiting), max(1, ceil(row_capacity * row_pressure)))
+            prefill_rows = min(len(self.waiting), max(1, ceil(row_capacity * budget_scale)))
         return max(1, token_budget), prefill_rows, prefill_pressure
 
     def _record_slo_controls(self, token_budget: int, prefill_rows: int) -> None:
         if not (self.slo_aware_scheduling or self._has_active_tpot_target()) or not self.waiting:
             return
+        budget_scale = getattr(self, "_last_prefill_budget_scale", 1.0)
+        self.slo_prefill_budget_scale_sum += budget_scale
+        self.slo_prefill_budget_scale_min = min(self.slo_prefill_budget_scale_min,
+                                                budget_scale)
+        if self._last_tpot_pressure >= 0.5:
+            self.num_tpot_starved_steps += 1
         if self.slo_aware_scheduling:
             self.num_slo_prefill_steps += 1
             self.slo_prefill_budget_sum += token_budget

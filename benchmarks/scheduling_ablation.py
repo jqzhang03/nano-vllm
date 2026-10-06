@@ -143,6 +143,8 @@ def run_arrival_trace(args, prompts, sampling_params, arrival_times,
         queue_depth_for_full_prefill=args.queue_depth_for_full_prefill,
         preempt_prefill_tokens_per_second=args.preempt_prefill_tps,
         preempt_kv_transfer_gbps=args.preempt_kv_transfer_gbps,
+        tpot_prefill_throttle_margin=args.tpot_prefill_throttle_margin,
+        tpot_throttle_max_waiting=args.tpot_throttle_max_waiting,
         **policy,
     )
     try:
@@ -163,10 +165,10 @@ def run_arrival_trace(args, prompts, sampling_params, arrival_times,
 
         torch.manual_seed(args.seed)
         torch.cuda.manual_seed_all(args.seed)
-        engine._req_metrics = []
-        engine._step_stats = engine._empty_step_stats()
+        # 用引擎提供的入口重置（含 per-seq 去重集），直接改 _req_metrics 会让下一轮
+        # 的记录被静默丢弃。
+        engine.reset_benchmark_metrics()
         for scheduler in scheduler_list(engine):
-            scheduler.reset_metrics()
             # Keep the online estimator's starting point identical across variants;
             # warmup timings are excluded from this workload comparison.
             scheduler._prefill_seconds_per_token = 1.0 / args.preempt_prefill_tps
@@ -175,6 +177,8 @@ def run_arrival_trace(args, prompts, sampling_params, arrival_times,
 
         next_request = 0
         completed = 0
+        # 只按"首次完成"计数（seq_id 集合），避免任何重复回报把循环提前结束
+        completed_seq_ids: set[int] = set()
         step_stats = _step_stats_empty()
         torch.cuda.synchronize()
         start = time.perf_counter()
@@ -232,12 +236,25 @@ def run_arrival_trace(args, prompts, sampling_params, arrival_times,
                 if total:
                     step_stats["prefill_time"] += duration * n_prefill / total
                     step_stats["decode_time"] += duration * n_decode / total
-            completed += len(finished)
+            for seq_id, token_ids in finished:
+                if seq_id not in completed_seq_ids:
+                    completed_seq_ids.add(seq_id)
+            completed = len(completed_seq_ids)
 
         torch.cuda.synchronize()
         wall = time.perf_counter() - start
         metrics = engine.collect_metrics()
         metrics["step_stats"] = step_stats
+        rows = metrics["per_request"]
+        row_ids = [row["seq_id"] for row in rows]
+        if len(row_ids) != len(set(row_ids)):
+            raise AssertionError(
+                f"per-request metrics contain duplicate seq_ids "
+                f"({len(row_ids)} rows, {len(set(row_ids))} unique)")
+        if len(set(row_ids)) != len(prompts):
+            raise AssertionError(
+                f"only {len(set(row_ids))} of {len(prompts)} requests were recorded; "
+                f"the run stopped before every request completed")
         summary = summarize_requests(metrics, wall, args)
         return {
             "wall_seconds": wall,
@@ -259,6 +276,8 @@ def run_arrival_trace(args, prompts, sampling_params, arrival_times,
                     "adaptive_prefill_tokens_avg", "adaptive_prefill_tokens_max",
                     "adaptive_prefill_rows_avg", "tpot_prefill_steps",
                     "tpot_priority_steps", "tpot_adaptive_prefill_tokens_avg",
+                    "tpot_budget_scale_avg", "tpot_budget_scale_min",
+                    "tpot_starved_prefill_steps", "prefill_reserve_tokens",
                 )
             },
             "per_request": metrics["per_request"],
@@ -340,6 +359,19 @@ def summarize_requests(metrics: dict, wall: float, args) -> dict:
             if stats["decode_bursts"] else None),
         "decode_burst_skipped_slots": stats["decode_burst_skipped_slots"],
         "max_queue_wait_seconds": max(queue_wait, default=0.0),
+        # TPOT 压力对 prefill 配额的收缩（饥饿诊断）：scale→0 表示被压到下限
+        "tpot_starvation": {
+            "budget_scale_avg": metrics.get("tpot_budget_scale_avg", 1.0),
+            "budget_scale_min": metrics.get("tpot_budget_scale_min", 1.0),
+            "starved_steps": metrics.get("tpot_starved_prefill_steps", 0),
+            "prefill_steps": stats["prefill_steps"],
+            "starved_step_rate": (
+                metrics.get("tpot_starved_prefill_steps", 0) / stats["prefill_steps"]
+                if stats["prefill_steps"] else None),
+            "adaptive_prefill_tokens_avg": metrics.get(
+                "tpot_adaptive_prefill_tokens_avg", 0.0),
+            "prefill_reserve_tokens": metrics.get("prefill_reserve_tokens", 0),
+        },
         "lifecycle": {
             "prefix_feature_parses": feature_parses,
             "prefix_feature_reuses": feature_reuses,
@@ -466,6 +498,18 @@ def parse_args():
     parser.add_argument("--no-decode-burst-yield-on-arrival", action="store_true",
                         help="force decode_burst_yield_on_arrival off in every variant "
                              "(requests that become due during a burst no longer end it)")
+    parser.add_argument("--slo-tpot-targets", default=None,
+                        help="comma-separated TPOT targets (ms) to sweep with all_on "
+                             "(e.g. 10,20,40,80,160); each gets its own all_on run so "
+                             "the prefill-starvation curve can be read directly")
+    parser.add_argument("--tpot-sweep-variant", default="all_on",
+                        help="variant whose policy is reused for each swept target")
+    parser.add_argument("--tpot-prefill-throttle-margin", type=float, default=0.5,
+                        help="deadband for the TPOT-driven prefill throttle; "
+                             "0 reproduces the legacy cliff (any overshoot saturates)")
+    parser.add_argument("--tpot-throttle-max-waiting", type=int, default=16,
+                        help="disable the TPOT prefill throttle once the waiting queue "
+                             "is at least this deep (0 = legacy, never gate)")
     parser.add_argument("--output", default=None)
     return parser.parse_args()
 
@@ -491,6 +535,57 @@ def main():
             options["decode_burst_yield_on_arrival"] = False
     runs = {}
 
+    # TPOT 目标扫描：每个目标值单独跑一遍（同一到达 trace），用于画饥饿曲线。
+    if args.slo_tpot_targets:
+        base_options = variants[args.tpot_sweep_variant]
+        for raw in args.slo_tpot_targets.split(","):
+            target = float(raw)
+            name = f"tpot_{target:g}ms"
+            print(f"running {name} ({len(prompts)} requests, {args.arrival_mode}, "
+                  f"{args.arrival_rate:g} req/s, TPOT target {target:g} ms) ...",
+                  flush=True)
+            saved = args.slo_tpot_ms
+            args.slo_tpot_ms = target
+            try:
+                result = run_arrival_trace(
+                    args, prompts, sampling_params, arrivals, ttft_slo_targets_ms,
+                    base_options)
+            finally:
+                args.slo_tpot_ms = saved
+            runs[name] = result
+            summary = result["summary"]
+            starve = summary["tpot_starvation"]
+            print(f"  throughput {summary['throughput_output_tok_per_s']:.1f} tok/s | "
+                  f"TTFT p50 {summary['ttft']['p50'] * 1000:.1f} ms | "
+                  f"TPOT p50 {summary['tpot']['p50'] * 1000:.1f} ms | "
+                  f"budget scale avg/min "
+                  f"{starve['budget_scale_avg']:.3f}/{starve['budget_scale_min']:.3f} | "
+                  f"starved steps {starve['starved_steps']}/{starve['prefill_steps']} | "
+                  f"avg prefill budget {starve['adaptive_prefill_tokens_avg']:.0f} tok",
+                  flush=True)
+        print("\nTPOT target sweep (same trace; starvation = prefill budget scale):")
+        print("target ms   throughput  TTFT p50  TPOT p50  req-TPOT-SLO  budget avg/min  "
+              "starved/prefill  avg prefill tok  prefill steps")
+        for name, result in runs.items():
+            summary = result["summary"]
+            starve = summary["tpot_starvation"]
+            request_tpot = summary["request_tpot_slo_percent"]
+            request_tpot_text = ("n/a" if request_tpot is None
+                                 else f"{request_tpot:.1f}%")
+            scale_text = f"{starve['budget_scale_avg']:.3f}/{starve['budget_scale_min']:.3f}"
+            print(f"{name:<11} {summary['throughput_output_tok_per_s']:>10.1f} "
+                  f"{summary['ttft']['p50'] * 1000:>9.1f} "
+                  f"{summary['tpot']['p50'] * 1000:>9.1f} "
+                  f"{request_tpot_text:>13} {scale_text:>14} "
+                  f"{starve['starved_steps']:>7}/{starve['prefill_steps']:<8} "
+                  f"{starve['adaptive_prefill_tokens_avg']:>15.0f} "
+                  f"{summary['prefill_steps']:>14}")
+        # 与"最宽松目标"对比，反映收紧目标带来的代价
+        widest = max(runs.items(), key=lambda item: float(item[0].split("_")[1][:-2]))
+        _report_and_save(args, runs, variants, prompts, arrivals, ttft_slo_targets_ms,
+                         delta_baseline=widest[0])
+        return
+
     for variant_name in args.variants:
         print(f"running {variant_name} ({len(prompts)} requests, {args.arrival_mode}, "
               f"{args.arrival_rate:g} req/s) ...", flush=True)
@@ -515,7 +610,13 @@ def main():
               f"burst pressure yields {summary['decode_burst_pressure_yields']}",
               flush=True)
 
-    baseline = runs.get("baseline")
+    _report_and_save(args, runs, variants, prompts, arrivals, ttft_slo_targets_ms)
+
+
+def _report_and_save(args, runs, variants, prompts, arrivals, ttft_slo_targets_ms,
+                     delta_baseline: str = "baseline") -> None:
+    """Write the JSON payload and print the comparison tables for a finished run set."""
+    baseline = runs.get(delta_baseline)
     if baseline:
         baseline_summary = baseline["summary"]
         for result in runs.values():

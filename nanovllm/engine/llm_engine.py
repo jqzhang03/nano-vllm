@@ -111,6 +111,9 @@ class LLMEngine:
             self.scheduler = Scheduler(config)
         # 基准计时数据：已结束请求的per-request时间戳快照 + 逐step聚合统计
         self._req_metrics: list[dict] = []
+        # 已落盘的 seq_id（per-request 记录幂等）：burst 收尾与外层批次可能同时
+        # 报同一条序列，重复记录会让驱动侧 completed 计数虚高、提前结束跑批。
+        self._recorded_seq_ids: set[int] = set()
         self._step_stats: dict[str, float | int] = self._empty_step_stats()
         self._collect_logits = False
         self._collect_decode_logits_only = False
@@ -133,6 +136,47 @@ class LLMEngine:
                     decode_burst_skipped_slots=0, decode_burst_pressure_yields=0,
                     spec_steps=0, spec_rows=0,
                     spec_verify_tokens=0, spec_draft_tokens=0, spec_accepted_drafts=0)
+
+    def _record_once(self, seq: Sequence) -> None:
+        """Append this sequence's timing snapshot exactly once.
+
+        A sequence that finishes inside a multi-step decode burst is reported both
+        by ``_run_decode_burst`` (it collects each round's completions) and by the
+        outer batch list, so an unguarded append produces duplicate ``seq_id``
+        records. Benchmarks derive their completion count from
+        ``collect_metrics()["per_request"]``, so duplicates made a 128-request run
+        stop after 95 distinct sequences while reporting 133 rows.
+        """
+        if seq.seq_id in self._recorded_seq_ids:
+            return
+        self._recorded_seq_ids.add(seq.seq_id)
+        self._req_metrics.append({
+            "seq_id": seq.seq_id,
+            "prompt_tokens": seq.num_prompt_tokens,
+            "completion_tokens": len(seq.completion_token_ids),
+            "t_submitted": seq.t_submitted,
+            "t_prefill_started": seq.t_prefill_started,
+            "t_first_token": seq.t_first_token,
+            "t_completed": seq.t_completed,
+            "prefix_cached_tokens": seq.num_prefix_cached_tokens,
+            "ttft_slo_ms": seq.ttft_slo_ms,
+            "ttft_slo_met": self._ttft_slo_met(seq),
+            "tpot_slo_ms": seq.tpot_slo_ms,
+            "tpot_slo_met": self._tpot_slo_met(seq),
+        })
+
+    def reset_benchmark_metrics(self) -> None:
+        """Drop per-request/step timing so a benchmark run starts from a clean slate.
+
+        Benchmarks used to assign ``engine._req_metrics = []`` directly, which left the
+        per-seq dedup set populated and silently dropped the next run's records.
+        """
+        self._req_metrics = []
+        self._recorded_seq_ids = set()
+        self._step_stats = self._empty_step_stats()
+        for scheduler in ((self.prefill_scheduler, self.decode_scheduler) if self._pd
+                          else (self.scheduler,)):
+            scheduler.reset_metrics()
 
     def exit(self):
         # 幂等：显式调用与atexit可能都触发，且同一进程可能先后创建多个引擎（如精度对比）
@@ -729,23 +773,21 @@ class LLMEngine:
                 n_decode = scheduled_decode_rows
         # 调度器完成后处理，如追加token、更新缓存、判断是否结束等
         # 快照已结束请求的计时信息（基准测试使用；driver侧数据完整）
-        finished_seqs = seqs + burst_finished
+        #
+        # 去重是必须的：`_run_decode_burst` 每跑完一轮就把该轮结束的序列收进
+        # `burst_finished` 并**当场**落盘（序列在自己的轮次结束时即完成），而外层
+        # `seqs` 里同一条序列也会出现在 `finished_seqs` 中——不去重会得到同 seq_id
+        # 的多条记录，驱动侧 `completed` 计数随之虚高、提前结束循环（实测 128 请求
+        # 只统计到 95 个不同 seq_id、另有 38 条重复）。
+        finished_seqs = list(seqs)
+        seen_seq_ids = {seq.seq_id for seq in finished_seqs}
+        for seq in burst_finished:
+            if seq.seq_id not in seen_seq_ids:
+                seen_seq_ids.add(seq.seq_id)
+                finished_seqs.append(seq)
         for seq in finished_seqs:
             if seq.is_finished:
-                self._req_metrics.append({
-                    "seq_id": seq.seq_id,
-                    "prompt_tokens": seq.num_prompt_tokens,
-                    "completion_tokens": len(seq.completion_token_ids),
-                    "t_submitted": seq.t_submitted,
-                    "t_prefill_started": seq.t_prefill_started,
-                    "t_first_token": seq.t_first_token,
-                    "t_completed": seq.t_completed,
-                    "prefix_cached_tokens": seq.num_prefix_cached_tokens,
-                    "ttft_slo_ms": seq.ttft_slo_ms,
-                    "ttft_slo_met": self._ttft_slo_met(seq),
-                    "tpot_slo_ms": seq.tpot_slo_ms,
-                    "tpot_slo_met": self._tpot_slo_met(seq),
-                })
+                self._record_once(seq)
         # 收集已经完成的请求
         outputs = [(seq.seq_id, seq.completion_token_ids)
                    for seq in finished_seqs if seq.is_finished]
@@ -792,6 +834,7 @@ class LLMEngine:
         prefill_throughput = decode_throughput = 0.
         # 重置基准计时统计
         self._req_metrics = []
+        self._recorded_seq_ids = set()
         self._step_stats = self._empty_step_stats()
         for scheduler in ((self.prefill_scheduler, self.decode_scheduler) if self._pd
                           else (self.scheduler,)):
@@ -945,6 +988,16 @@ class LLMEngine:
             "tpot_adaptive_prefill_tokens_avg": (
                 sum(s.tpot_prefill_budget_sum for s in schedulers) / tpot_steps
                 if tpot_steps else 0.0),
+            # Prefill 饥饿观测：budget_scale = prefill_pressure·(1−tpot_pressure)。
+            # 目标不可达时 scale→0，prefill 配额落到 prefill_reserve_tokens 下限。
+            "tpot_budget_scale_avg": (
+                sum(s.slo_prefill_budget_scale_sum for s in schedulers) / slo_steps
+                if slo_steps else 1.0),
+            "tpot_budget_scale_min": min(
+                (s.slo_prefill_budget_scale_min for s in schedulers), default=1.0),
+            "tpot_starved_prefill_steps": sum(
+                s.num_tpot_starved_steps for s in schedulers),
+            "prefill_reserve_tokens": self.config.prefill_reserve_tokens,
             "multi_step_decode_tokens": self._step_stats["multi_step_decode_tokens"],
             "multi_step_decode_enabled": self.config.multi_step_decode,
             "max_decode_steps": self.config.max_decode_steps,

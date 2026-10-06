@@ -63,7 +63,7 @@ def parse_args():
 
 async def run_variant(args, prompts, sampling_params, arrival_times,
                       dynamic_admission: bool,
-                      cache_affinity_admission: bool = True) -> dict:
+                      prefix_cache_aware_admission: bool = True) -> dict:
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
     executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="admission-bench")
@@ -118,7 +118,6 @@ async def run_variant(args, prompts, sampling_params, arrival_times,
             admission_work_budget_ms=args.admission_work_budget_ms,
             admission_target_ttft_ms=args.admission_target_ttft_ms,
             admission_soft_pressure=args.admission_soft_pressure,
-            cache_affinity_admission=cache_affinity_admission,
         )
         manager.start()
         torch.cuda.synchronize()
@@ -134,18 +133,19 @@ async def run_variant(args, prompts, sampling_params, arrival_times,
                     prompts[index], sampling_params[index], submitted_at=arrival)
             except HTTPException as exc:
                 detail = exc.detail if isinstance(exc.detail, dict) else {}
-                return {
+                rejected_row = {
                     "index": index,
                     "status": "rejected",
                     "status_code": exc.status_code,
-                    "predicted_ttft_ms": detail.get("predicted_ttft_ms"),
-                    "queue_pressure": detail.get("queue_pressure"),
-                    "estimated_output_tokens": detail.get("estimated_output_tokens"),
-                    "estimated_prefill_tokens": detail.get("estimated_prefill_tokens"),
-                    "estimated_prefix_cached_tokens": detail.get(
-                        "estimated_prefix_cached_tokens"),
-                    "error": str(exc.detail),
+                    "sampling_max_tokens": sampling_params[index].max_tokens,
+                    "error": str(detail.get("reason") or exc.detail)[:200],
                 }
+                # 拒绝原因与当时的估算（detail 里带的是本次拒绝的预测值）
+                for key in ("predicted_ttft_ms", "queue_pressure",
+                            "estimated_output_tokens", "estimated_prefill_tokens",
+                            "estimated_prefix_cached_tokens"):
+                    rejected_row[key] = detail.get(key)
+                return rejected_row
             result = await handle.result
             return {
                 "index": index,
@@ -157,6 +157,7 @@ async def run_variant(args, prompts, sampling_params, arrival_times,
                 "estimated_output_tokens": handle.estimated_output_tokens,
                 "estimated_cache_hit_tokens": handle.estimated_cache_hit_tokens,
                 "actual_cache_hit_tokens": handle.prefix_cached_tokens,
+                "sampling_max_tokens": sampling_params[index].max_tokens,
                 "ttft_ms": (None if handle.first_token_at is None else
                             (handle.first_token_at - arrival) * 1000.0),
                 "e2e_ms": (None if handle.completed_at is None else
@@ -171,14 +172,6 @@ async def run_variant(args, prompts, sampling_params, arrival_times,
         admission = manager.admission_snapshot()
         await manager.close()
         accepted = [row for row in rows if row["status"] == "accepted"]
-        rows_with_estimates = [
-            row for row in rows if row.get("estimated_prefix_cached_tokens") is not None]
-        accepted_estimates = [
-            row for row in accepted
-            if row.get("estimated_prefix_cached_tokens") is not None]
-        estimated_prefix_tokens = sum(
-            row["estimated_prefix_cached_tokens"] for row in rows_with_estimates)
-        actual_prefix_tokens = sum(row["prefix_cache_hit_tokens"] for row in accepted)
         total_output_tokens = sum(row["completion_tokens"] for row in accepted)
         ttfts = [row["ttft_ms"] for row in accepted if row["ttft_ms"] is not None]
         e2es = [row["e2e_ms"] for row in accepted if row["e2e_ms"] is not None]
@@ -187,14 +180,40 @@ async def run_variant(args, prompts, sampling_params, arrival_times,
                     if row["estimated_cache_hit_tokens"] is not None]
         hit_deltas = [row["estimated_cache_hit_tokens"] - row["actual_cache_hit_tokens"]
                       for row in hit_rows]
+        rejected = sum(row["status"] == "rejected" for row in rows)
+        failed = sum(row["status"] == "failed" for row in rows)
+        # 到达请求口径的成功/拒绝率：拒绝率与"被拒请求本可多产生多少输出"一起看，
+        # 才能判断准入是保护了 SLO 还是单纯少做事。
+        total_arrivals = len(rows)
+        rejected_output_tokens = sum(
+            row.get("sampling_max_tokens") or 0 for row in rows
+            if row["status"] == "rejected")
+        # 未被拒的请求里，TTFT 是否真的落在目标内（准入的目标就是 admission_target_ttft_ms）
+        served = [row for row in rows if row["status"] != "rejected"]
+        served_ttfts = [row["ttft_ms"] for row in served if row["ttft_ms"] is not None]
+        served_slo_met = [value <= args.admission_target_ttft_ms
+                          for value in served_ttfts]
         return {
             "dynamic_admission": dynamic_admission,
-            "cache_affinity_admission": cache_affinity_admission,
+            "prefix_cache_aware_admission": prefix_cache_aware_admission,
             "wall_seconds": wall,
-            "requests": len(rows),
+            "requests": total_arrivals,
             "accepted": len(accepted),
-            "rejected": sum(row["status"] == "rejected" for row in rows),
-            "failed": sum(row["status"] == "failed" for row in rows),
+            "rejected": rejected,
+            "failed": failed,
+            "acceptance": {
+                "total_arrivals": total_arrivals,
+                "accept_rate_percent": 100.0 * len(accepted) / max(1, total_arrivals),
+                "reject_rate_percent": 100.0 * rejected / max(1, total_arrivals),
+                "fail_rate_percent": 100.0 * failed / max(1, total_arrivals),
+                # 被拒请求的输出上限合计：准入"省下"的工作量上界
+                "rejected_max_output_tokens": rejected_output_tokens,
+                # 实际服务的请求中 TTFT 达标比例（与 target_ttft_met_percent 的
+                # 分母不同：后者只看已接收且有首 token 的请求）
+                "served_ttft_target_met_percent": (
+                    100.0 * sum(served_slo_met) / max(1, len(served_slo_met))),
+                "served_with_ttft": len(served_ttfts),
+            },
             "deferred_then_accepted": sum(
                 row.get("admission_decision") == "accepted_after_defer" for row in rows),
             "output_tokens": total_output_tokens,
@@ -253,15 +272,19 @@ async def async_main(args, prompts, sampling_params, arrival_times) -> dict:
         result = runs[name]
         hits = result["cache_hits"]
         error = hits["mean_estimate_error_tokens"]
-        print(f"  accepted/rejected {result['accepted']}/{result['rejected']} | "
+        acc = result["acceptance"]
+        print(f"  accepted/rejected {result['accepted']}/{result['rejected']} "
+              f"(accept {acc['accept_rate_percent']:.1f}%, "
+              f"reject {acc['reject_rate_percent']:.1f}%) | "
               f"deferred {result['deferred_then_accepted']} | "
               f"throughput {result['output_tokens_per_second']:.1f} tok/s | "
               f"TTFT p50/p99 {result['ttft_ms']['p50'] or 0:.1f}/"
               f"{result['ttft_ms']['p99'] or 0:.1f} ms | "
+              f"served TTFT target met {acc['served_ttft_target_met_percent']:.1f}% | "
               f"prefix hits: est {hits['estimated_tokens']:.0f} vs actual "
               f"{hits['actual_tokens']} tokens over {hits['requests_reusing_prefix']} "
               f"reusing requests | mean estimate error "
-              f"{'n/a' if error is None else f'{error:+.1f}'} tokens")
+              f"{'n/a' if error is None else f'{error:+.1f}'} tokens", flush=True)
     return runs
 
 
@@ -297,21 +320,22 @@ def main() -> None:
         }, result_file, indent=2, default=str)
     print(f"full results -> {output_path}")
     print("\nAdmission comparison (same trace, fresh engine per variant):")
-    header = (f"{'variant':<24} {'accept/reject':>13} {'defer':>6} {'tok/s':>8} "
-              f"{'TTFT p50':>9} {'TTFT p99':>9} {'E2E p99':>9} "
+    header = (f"{'variant':<24} {'accept%':>8} {'reject%':>8} {'defer':>6} {'tok/s':>8} "
+              f"{'TTFT p50':>9} {'TTFT p99':>9} {'served-SLO':>11} "
               f"{'est hit':>8} {'actual hit':>10} {'est err':>8}")
     print(header)
     for name, result in runs.items():
         hits = result["cache_hits"]
+        acc = result["acceptance"]
         error = hits["mean_estimate_error_tokens"]
-        accepted_text = f"{result['accepted']}/{result['rejected']}"
         error_text = "n/a" if error is None else f"{error:+.1f}"
-        print(f"{name:<24} {accepted_text:>13} "
+        print(f"{name:<24} {acc['accept_rate_percent']:>7.1f}% "
+              f"{acc['reject_rate_percent']:>7.1f}% "
               f"{result['deferred_then_accepted']:>6} "
               f"{result['output_tokens_per_second']:>8.1f} "
               f"{result['ttft_ms']['p50'] or 0:>9.1f} "
               f"{result['ttft_ms']['p99'] or 0:>9.1f} "
-              f"{result['e2e_ms']['p99'] or 0:>9.1f} "
+              f"{acc['served_ttft_target_met_percent']:>10.1f}% "
               f"{hits['estimated_tokens']:>8.0f} "
               f"{hits['actual_tokens']:>10} "
               f"{error_text:>8}")

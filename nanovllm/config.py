@@ -39,6 +39,8 @@ class Config:
     tpot_aware_scheduling: bool = True # 按活动请求TPOT slack动态降低prefill配额、优先decode
     default_tpot_slo_ms: float | None = None # 请求未单独设置时使用的TPOT目标；None表示不设默认目标
     tpot_decode_ms_fallback: float = 20.0 # 尚无该请求decode样本时用于TPOT slack估算的回退值
+    tpot_prefill_throttle_margin: float = 0.5 # TPOT 压力对 prefill 配额的收缩死区：目标超出 50% 以内视为噪声，不压缩 prefill。0=旧行为（任何超出都饱和到 min_budget，会把 prefill 饿成 256-token 碎片步、反过来又抬高 TPOT，形成自锁）
+    tpot_throttle_max_waiting: int = 16 # 等待队列达到该深度时**停止**用 TPOT 压力压缩 prefill：此时瓶颈是 prefill 吞吐（新请求拿不到首 token），继续压 prefill 会自锁（实测 128 请求/16 req/s 下 prefill 被压到 256 token/步、TTFT p50 43.7s）；0=不设门限（旧行为）
     max_prefill_chunk_tokens: int = 4096 # 自适应调度单步prefill预算上限
     queue_depth_for_full_prefill: int = 16 # 等待队列达到该长度时进入最高队列压力
     multi_step_decode: bool = True # 纯decode时连续复用调度批次；prefill/spec/mixed路径仍单步

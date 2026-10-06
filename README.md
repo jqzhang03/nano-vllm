@@ -199,10 +199,16 @@ The scheduler enables these policies by default:
 * **TPOT-target-aware batching** accepts a request-level `tpot_slo_ms` (or the optional
   `default_tpot_slo_ms`). It tracks each active request's observed token interval, prioritizes
   requests with less TPOT slack, and shrinks prefill token/row quotas when decode latency is
-  near or over target. The quota scales with `(1 - tpot_pressure)`, so an unreachable target
-  pushes it to the `prefill_reserve_tokens` floor: a 2026-10-06 run with `tpot_slo_ms=20` at
-  128 requests / 16 req/s measured 10.1k → 1.1k prefill tok/s, 25 → 355 prefill steps and a
-  TTFT p50 of 0.5 s → 44 s. Prefer a target the hardware can actually hold, or leave it unset.
+  near or over target. Two guards keep that throttle from starving prefill: within
+  `tpot_prefill_throttle_margin` (0.5) of the target it stays off and beyond it ramps with the
+  overshoot instead of clipping, and once the waiting queue reaches
+  `tpot_throttle_max_waiting` (16) the throttle is disabled entirely — at depth the bottleneck
+  is prefill throughput, so throttling it only deepens the backlog. Before those guards a 20 ms
+  target pinned the quota at `prefill_reserve_tokens`: measured 350 tok/s, TTFT p50 44.5 s and
+  TPOT p50 173 ms at 128 requests / 16 req/s; with them the same run measures 1140 tok/s,
+  1.6 s and 82 ms. A target the hardware cannot deliver at the offered load is still missed —
+  the guards remove the collapse, not the physics. Set the margin to 0 or the depth to 0 to
+  reproduce the legacy cliff.
   Benchmark TPOT SLO attainment uses the same per-request average as the
   reported TPOT: `(completed - first_token) / (completion_tokens - 1)`. Requests that emit
   fewer than two completion tokens have no measurable inter-token interval and are excluded
@@ -294,9 +300,13 @@ python benchmarks/admission_ablation.py --num-seqs 128 --arrival-rate 16 \
 ```
 
 Each variant gets a fresh engine and the same trace. It reports accepted/deferred/rejected
-requests, actual TTFT/E2E, output throughput, the per-request cache-hit estimate vs the tokens
-actually reused (mean and worst absolute error), and the admission counters to
-`results/admission_ablation_*.json`.
+requests, per-arrival accept/reject rates, throughput, the served-request TTFT-target rate, the
+per-request cache-hit estimate vs the tokens actually reused (mean and worst absolute error), and
+the admission counters to `results/admission_ablation_*.json`. Pick a load that actually breaks
+the target: at 8 req/s with a 2 s target every request already meets it and admission can only
+look harmful, whereas at 24 req/s / 128 requests without admission only 26.6% of requests get a
+first token within 2 s (p99 4.7 s) and admission trades that for a 15.6% accept rate at a 95%
+served-request target rate.
 
 Two standalone checks make the estimate-vs-measured comparison easy to read:
 

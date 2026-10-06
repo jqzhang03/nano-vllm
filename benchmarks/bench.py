@@ -92,6 +92,9 @@ def scheduler_options(args, overrides=None):
         "tpot_aware_scheduling": not getattr(args, "no_tpot_aware_scheduling", False),
         "default_tpot_slo_ms": getattr(args, "default_tpot_slo_ms", None),
         "tpot_decode_ms_fallback": getattr(args, "tpot_decode_ms_fallback", 20.0),
+        "tpot_prefill_throttle_margin": getattr(
+            args, "tpot_prefill_throttle_margin", 0.5),
+        "tpot_throttle_max_waiting": getattr(args, "tpot_throttle_max_waiting", 16),
         "multi_step_decode": not getattr(args, "no_multi_step_decode", False),
         "max_decode_steps": getattr(args, "max_decode_steps", 4),
         "decode_burst_yield": not getattr(args, "no_decode_burst_yield", False),
@@ -493,6 +496,10 @@ def parse_args():
                    help="关闭TPOT目标对decode优先级与prefill配额的影响")
     p.add_argument("--tpot-decode-ms-fallback", type=float, default=20.0,
                    help="请求尚无decode样本时估算的每token延迟（毫秒）")
+    p.add_argument("--tpot-prefill-throttle-margin", type=float, default=0.5,
+                   help="TPOT 压力压缩 prefill 配额的死区比例（0=旧行为：任何超出都饱和）")
+    p.add_argument("--tpot-throttle-max-waiting", type=int, default=16,
+                   help="等待队列达到该深度后停用 TPOT 对 prefill 的压缩（0=不设门限）")
     p.add_argument("--no-multi-step-decode", action="store_true",
                    help="关闭纯decode多步执行，作为消融对照")
     p.add_argument("--max-decode-steps", type=int, default=4,
