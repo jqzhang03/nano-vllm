@@ -1,5 +1,7 @@
 """OpenAI-compatible HTTP serving with incremental token streaming."""
 
+from __future__ import annotations
+
 import argparse
 import asyncio
 from collections import OrderedDict
@@ -128,11 +130,9 @@ class GenerationManager:
         self.decode_tps = decode_tps_fallback
         # 准入是否按前缀缓存命中折算 prompt 工作量（消融开关）。
         self.cache_affinity_admission = cache_affinity_admission
-        # 跨线程只读的前缀缓存快照（hash -> (block_id, pending_free, token_ids)）与
-        # 其版本号：只在 engine 空闲时重建（`_refresh_prefix_snapshot`），准入估算
-        # 只读这份不可变副本，绝不读 worker 线程正在改的活表。
-        self._prefix_snapshot: dict[int, tuple[int, bool, tuple]] = {}
-        self._prefix_snapshot_version = -1
+        # 跨线程只读的前缀缓存快照：每个前缀缓存池一份不可变副本（见
+        # `_refresh_kv_pool_stats`），准入估算只读这份副本，绝不读 worker 线程
+        # 正在改的活表。
         self._prefix_snapshot_age_steps = 0
         self._admission_hit_estimate_tokens = 0
         self._admission_hit_actual_tokens = 0
@@ -154,17 +154,18 @@ class GenerationManager:
         self._kv_pool_stats: list[tuple[int, int]] = []
         self._kv_pool_peak_used: list[int] = []
         self._prefix_cache_snapshots_by_manager: dict[
-            BlockManager,
-            tuple[int, dict[int, tuple[tuple[int, ...], int, bool]]],
+            BlockManager, tuple[int, dict[int, tuple[tuple[int, ...], int, bool]]]
         ] = {}
         self._prefix_cache_snapshots: tuple[
             tuple[BlockManager, dict[int, tuple[tuple[int, ...], int, bool]]], ...
         ] = ()
+        self._prefix_snapshot_age_steps = 0
         self._engine_busy = False
         self.step_stats = {"steps": 0, "prefill_tokens": 0, "decode_tokens": 0,
                            "prefill_seconds": 0.0, "decode_seconds": 0.0,
                            "decode_iterations": 0, "multi_step_decode_steps": 0,
                            "multi_step_decode_tokens": 0,
+                           "decode_burst_pressure_yields": 0,
                            # 引擎侧权威前缀复用计数（scheduler 累加），用于和准入估算对账：
                            # 每完成一次 prefill 分配，按 seq.num_prefix_cached_tokens 累加。
                            "prefix_cache_hit_tokens": 0,
@@ -179,6 +180,21 @@ class GenerationManager:
 
     def start(self) -> None:
         self.task = asyncio.create_task(self._run(), name="nanovllm-generation-loop")
+
+    def _sync_decode_burst_pressure(self) -> None:
+        """Tell a running decode burst to stop when accepted work is still queued here.
+
+        Accepted requests live in ``pending``/``incoming`` until the worker thread's
+        next ``add_request``, so ``scheduler.waiting`` cannot see them while the burst
+        is running. ``_engine_busy`` is only True while a step executes in the worker,
+        and the signal is cleared as soon as nothing is queued (or the engine is idle),
+        so a later burst is not stopped by a stale flag.
+        """
+        queued = bool(self.pending) or bool(self.deferred) or not self.incoming.empty()
+        if self._engine_busy and queued:
+            self.engine.request_decode_burst_yield()
+        else:
+            self.engine.clear_decode_burst_yield()
 
     async def submit(self, prompt_token_ids: list[int], sampling_params: SamplingParams,
                      *, stream: bool = False, submitted_at: float | None = None,
@@ -349,35 +365,107 @@ class GenerationManager:
                 self._kv_pool_peak_used[index], total - free)
 
     def _refresh_prefix_snapshot(self) -> None:
-        """Rebuild the cross-thread prefix-cache snapshot (engine idle only).
+        """Recompute the cross-thread prefix-cache snapshots (engine idle only).
 
-        Same idle-only rule as ``_refresh_kv_pool_stats``: the version check keeps
-        the cost near zero on decode-only steps, and a snapshot that is one engine
-        step stale only shifts the admission estimate by the blocks published in
-        that step.
+        ``_refresh_kv_pool_stats`` rebuilds each prefix-cache manager's snapshot when
+        its ``kv_generation`` moved, so this only has to publish the age for
+        observability; the snapshots themselves are the immutable copies admission
+        reads instead of the live tables the worker thread mutates.
         """
-        managers = self._block_managers()
+        self._prefix_snapshot_age_steps += 1
+
+    def _estimate_prefix_cache_match(
+        self, prompt_token_ids: list[int],
+    ) -> tuple[int, tuple[tuple[BlockManager, int, bool], ...]]:
+        """Block-aligned prefix reuse this prompt could get, plus the blocks it maps to.
+
+        Returns ``(cached_tokens, ((manager, block_id, in_free_block_list), ...))``
+        using the same chained block hashes as ``BlockManager.can_allocate`` against
+        the idle-time snapshots. Because the second element names the physical
+        blocks, the caller can promise each block to at most one request and stop
+        the concurrent-submission over-count that a per-request estimate alone shows.
+        Hash equality is not sufficient: a colliding entry is rejected by comparing
+        the stored token ids, exactly like ``can_allocate``.
+        """
+        managers = self._prefix_cache_managers()
         if not managers:
-            return
-        primary = managers[0]
-        version = primary.prefix_map_version()
-        if version == self._prefix_snapshot_version:
-            return
-        self._prefix_snapshot = primary.prefix_snapshot()
-        self._prefix_snapshot_version = version
+            return 0, ()
+        block_size = self.engine.config.kvcache_block_size
+        for manager, snapshot in self._prefix_cache_snapshots:
+            if not snapshot:
+                continue
+            hasher = -1
+            cached_tokens = 0
+            matched: list[tuple[BlockManager, int, bool]] = []
+            for start in range(0, len(prompt_token_ids), block_size):
+                token_ids = prompt_token_ids[start:start + block_size]
+                hasher = manager.compute_hash(token_ids, hasher)
+                entry = snapshot.get(hasher)
+                if entry is None:
+                    break
+                stored_ids, block_id, in_free = entry
+                if tuple(token_ids) != stored_ids:
+                    break  # hash collision or a stale entry
+                cached_tokens += len(token_ids)
+                matched.append((manager, block_id, in_free))
+                if len(token_ids) < block_size:
+                    break  # partial tail block already counted
+            if matched:
+                return cached_tokens, tuple(matched)
+        return 0, ()
+
+    def _projected_kv_blocks(
+        self,
+        handle: GenerationHandle,
+        match: tuple[int, tuple[tuple[BlockManager, int, bool], ...]],
+        reserved: set[tuple[BlockManager, int]],
+    ) -> int:
+        """Blocks this request would need beyond the shared prefix it can reuse.
+
+        Estimates the allocation the engine performs for the prompt remainder plus
+        the decode tail, skipping blocks another candidate has already been promised
+        (``reserved``). Only the block-counting part of ``can_allocate`` is modelled:
+        the copy-on-write block for a shared partial tail is charged explicitly, and
+        the decode tail is charged a block per boundary crossing.
+        """
+        block_size = self.engine.config.kvcache_block_size
+        cached_tokens = 0
+        last_shared = False
+        for manager, block_id, in_free in match[1]:
+            key = (manager, block_id)
+            if key in reserved:
+                break
+            reserved.add(key)
+            last_shared = not in_free
+            cached_tokens += block_size
+        cached_tokens = min(cached_tokens, handle.prefill_tokens_done
+                            if handle.prefill_tokens_done else len(handle.prompt_token_ids))
+        remaining_prompt = max(0, len(handle.prompt_token_ids) - cached_tokens)
+        blocks = (remaining_prompt + block_size - 1) // block_size
+        if last_shared and cached_tokens % block_size != 0:
+            blocks += 1  # COW for a shared partial tail block
+        # Decode appends one token per step; a new block appears whenever the length
+        # crosses a boundary (len % block_size == 1).
+        decode_tokens = max(0, handle.sampling_params.max_tokens
+                            - handle.generated_tokens - 1)
+        if decode_tokens > 0:
+            length = cached_tokens + remaining_prompt
+            boundaries = (length + 1 + decode_tokens - 2) // block_size \
+                - length // block_size
+            blocks += max(0, boundaries)
+        return blocks
 
     def _estimate_candidate_hit_tokens(self, candidate: GenerationHandle) -> int:
-        """Estimate how many prompt tokens the prefix cache can serve for a request.
+        """Block-aligned prefix reuse the cache can serve this candidate.
 
-        Uses the same chained block hashes as ``BlockManager.can_allocate`` against
-        the idle-time snapshot, so the number is the block-aligned reuse the engine
-        would commit if the cache does not change before this request is scheduled.
+        Thin wrapper over the per-request match so the admission counters and the
+        response metadata keep reporting the same number they always did.
         """
-        if not self.cache_affinity_admission or not self._prefix_snapshot:
+        if not self.cache_affinity_admission:
             return 0
-        manager = self._block_managers()[0]
-        probe = Sequence(candidate.prompt_token_ids, candidate.sampling_params)
-        return manager.estimate_cached_tokens(probe, self._prefix_snapshot)
+        cached_tokens, _matched = self._estimate_prefix_cache_match(
+            candidate.prompt_token_ids)
+        return cached_tokens
 
     def _estimate_admission(self, candidate: GenerationHandle) -> dict[str, float]:
         prefill_tokens = 0
@@ -470,7 +558,7 @@ class GenerationManager:
             "projected_work_ms": projected_work_ms,
             "projected_prefill_tokens": float(prefill_tokens),
             "candidate_prefill_tokens": float(candidate_prefill_tokens),
-            "candidate_prefix_cached_tokens": float(candidate_prefix_cached_tokens),
+            "candidate_prefix_cached_tokens": float(candidate_hit_tokens),
             "projected_prefix_cached_tokens": float(projected_prefix_cached_tokens),
             "projected_output_tokens": float(decode_tokens),
             "candidate_output_tokens": candidate_output_tokens,
@@ -531,8 +619,9 @@ class GenerationManager:
             "actual_cache_hit_tokens": self._admission_hit_actual_tokens,
             "hit_estimate_error_tokens": (self._admission_hit_estimate_tokens
                                           - self._admission_hit_actual_tokens),
-            "prefix_snapshot_version": self._prefix_snapshot_version,
-            "prefix_snapshot_entries": len(self._prefix_snapshot),
+            "prefix_snapshot_pools": len(self._prefix_cache_snapshots),
+            "prefix_snapshot_entries": sum(len(snapshot) for _manager, snapshot
+                                           in self._prefix_cache_snapshots),
             "last_estimate": dict(self._last_admission_estimate),
             "step_stats": dict(self.step_stats),
             "kv_pools": [
@@ -1167,6 +1256,7 @@ def create_app(model: str, *, engine_kwargs: dict[str, Any] | None = None,
                 "multi_step_enabled": engine.config.multi_step_decode,
                 "max_steps": engine.config.max_decode_steps,
                 "burst_yield": engine.config.decode_burst_yield,
+                "burst_yield_on_arrival": engine.config.decode_burst_yield_on_arrival,
                 "tpot_aware": engine.config.tpot_aware_scheduling,
                 "default_tpot_slo_ms": engine.config.default_tpot_slo_ms,
             },
@@ -1537,6 +1627,9 @@ def main() -> None:
     parser.add_argument("--no-decode-burst-yield", action="store_true",
                         help="disable early burst yield: run the full multi-step round "
                              "budget even when prefill work is queued (ablation path)")
+    parser.add_argument("--no-decode-burst-yield-on-arrival", action="store_true",
+                        help="disable yielding to requests that arrive while a burst is "
+                             "already running (ablation path)")
     parser.add_argument("--max-prefill-chunk-tokens", type=int, default=4096)
     parser.add_argument("--queue-depth-for-full-prefill", type=int, default=16)
     parser.add_argument("--preempt-prefill-tps", type=float, default=10000.0)
@@ -1575,6 +1668,7 @@ def main() -> None:
             "multi_step_decode": not args.no_multi_step_decode,
             "max_decode_steps": args.max_decode_steps,
             "decode_burst_yield": not args.no_decode_burst_yield,
+            "decode_burst_yield_on_arrival": not args.no_decode_burst_yield_on_arrival,
             "max_prefill_chunk_tokens": args.max_prefill_chunk_tokens,
             "queue_depth_for_full_prefill": args.queue_depth_for_full_prefill,
             "preempt_prefill_tokens_per_second": args.preempt_prefill_tps,

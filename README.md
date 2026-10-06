@@ -213,10 +213,15 @@ The scheduler enables these policies by default:
   append/COW/preemption accounting. Prefill or
   speculative work ends the burst; mixed, prefill, and speculative batches remain one forward.
   `decode_burst_yield` (default on) additionally stops a running burst when prefill work is
-  waiting, but in `mixed` mode that condition cannot trigger — requests are only submitted
-  between engine steps and a burst only starts with an empty waiting queue — so the yield path is
-  reachable only in PD mode; `--no-decode-burst-yield` is the ablation. In online streaming,
-  generated tokens are delivered together at the end of each burst.
+  waiting, but in `mixed` mode that queue check cannot trigger — requests are only submitted
+  between engine steps and a burst only starts with an empty waiting queue. The path that does
+  work there is the arrival signal (`decode_burst_yield_on_arrival`, default on): the service sets
+  it whenever an accepted request is still queued in `pending`/`incoming`, and a trace driver can
+  install `LLMEngine.set_decode_burst_yield_callback(...)`. With `max_decode_steps=8` a request
+  arriving mid-burst measured 53.6 ms p50 wall time versus 68.3 ms with the signal disabled
+  (worst round 329 ms vs 676 ms): the burst stops after its active round instead of running the
+  budget out. `--no-decode-burst-yield` and `--no-decode-burst-yield-on-arrival` are the ablation
+  flags. In online streaming, generated tokens are delivered together at the end of each burst.
 
 The policies can be changed through `LLM(...)` config fields or the equivalent
 `nanovllm-serve` / `benchmarks/bench.py` flags: `latency_aware_scheduling`,
@@ -231,7 +236,7 @@ The policies can be changed through `LLM(...)` config fields or the equivalent
 Set `max_decode_steps` (1–16) to bound each decode burst; `multi_step_decode=False`
 or `--no-multi-step-decode` provides the single-step ablation, and `decode_burst_yield=False`
 or `--no-decode-burst-yield` keeps a burst running its full round budget past newly arrived
-prefills. The benchmark accepts
+prefills (the queue-check path). The benchmark accepts
 `--max-decode-steps`, `--default-tpot-slo-ms`, and both `--no-*` ablations; the continuous
 arrival harness includes `without_tpot_aware`, `without_multi_step_decode`, and
 `without_decode_burst_yield` cases.
@@ -299,6 +304,15 @@ Two standalone checks make the estimate-vs-measured comparison easy to read:
 python benchmarks/prefix_cache_probe.py       # in-process: scheduler estimate vs committed reuse
 python benchmarks/prefix_cache_verify.py      # over HTTP against nanovllm-serve
 python benchmarks/prefix_estimate_check.py    # three requests, estimate and actual per response
+```
+
+Measure how a request that arrives *during* a decode burst is handled (this is the path the
+trace-driven ablation cannot reproduce, because it only submits between engine steps):
+
+```bash
+python benchmarks/decode_burst_server_probe.py --base-url http://127.0.0.1:8000 \
+  --prefix-sentences 5 --first-output 128 --late-output 8 --late-delay-ms 300 --rounds 8
+python benchmarks/decode_burst_arrival_probe.py    # in-process trace variant
 ```
 
 ### Current scope and known limits

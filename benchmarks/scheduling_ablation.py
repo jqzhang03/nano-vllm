@@ -112,6 +112,7 @@ def _step_stats_empty():
         "decode_burst_rounds": 0,
         "decode_burst_yields": 0,
         "decode_burst_skipped_slots": 0,
+        "decode_burst_pressure_yields": 0,
     }
 
 
@@ -332,6 +333,11 @@ def summarize_requests(metrics: dict, wall: float, args) -> dict:
         "decode_burst_yield_rate": (
             stats["decode_burst_yields"] / stats["decode_bursts"]
             if stats["decode_bursts"] else None),
+        # burst 期间"新请求到达"触发的提前收尾（服务端信号 / trace 回调）
+        "decode_burst_pressure_yields": stats["decode_burst_pressure_yields"],
+        "decode_burst_pressure_yield_rate": (
+            stats["decode_burst_pressure_yields"] / stats["decode_bursts"]
+            if stats["decode_bursts"] else None),
         "decode_burst_skipped_slots": stats["decode_burst_skipped_slots"],
         "max_queue_wait_seconds": max(queue_wait, default=0.0),
         "lifecycle": {
@@ -457,6 +463,9 @@ def parse_args():
     parser.add_argument("--no-decode-burst-yield", action="store_true",
                         help="force decode_burst_yield off in every variant "
                              "(burst runs its full round budget past newly arrived prefills)")
+    parser.add_argument("--no-decode-burst-yield-on-arrival", action="store_true",
+                        help="force decode_burst_yield_on_arrival off in every variant "
+                             "(requests that become due during a burst no longer end it)")
     parser.add_argument("--output", default=None)
     return parser.parse_args()
 
@@ -477,6 +486,9 @@ def main():
     if args.no_decode_burst_yield:
         for options in variants.values():
             options["decode_burst_yield"] = False
+    if args.no_decode_burst_yield_on_arrival:
+        for options in variants.values():
+            options["decode_burst_yield_on_arrival"] = False
     runs = {}
 
     for variant_name in args.variants:
@@ -603,17 +615,18 @@ def main():
               f"{life['deferred_free_peak_refs']:<4}")
 
     print("\nDecode burst behaviour by policy (rounds = model forwards per burst):")
-    print("variant                 bursts  rounds  rounds/burst  yields  yield%  skipped slots")
+    print("variant                 bursts  rounds  rounds/burst  queued-yield  arrival-yield  arrival%  skipped slots")
     for name, result in runs.items():
         summary = result["summary"]
         rounds_per_burst = summary["decode_burst_rounds_per_burst"]
-        yield_rate = summary["decode_burst_yield_rate"]
+        arrival_rate = summary["decode_burst_pressure_yield_rate"]
         rounds_text = ("n/a" if rounds_per_burst is None
                        else f"{rounds_per_burst:.2f}")
-        yield_text = "n/a" if yield_rate is None else f"{yield_rate * 100:.1f}%"
+        arrival_text = "n/a" if arrival_rate is None else f"{arrival_rate * 100:.1f}%"
         print(f"{name:<23} {summary['decode_bursts']:>6} "
               f"{summary['decode_burst_rounds']:>7} {rounds_text:>13} "
-              f"{summary['decode_burst_yields']:>7} {yield_text:>6} "
+              f"{summary['decode_burst_yields']:>13} "
+              f"{summary['decode_burst_pressure_yields']:>14} {arrival_text:>9} "
               f"{summary['decode_burst_skipped_slots']:>14}")
 
     if all_on:

@@ -130,7 +130,7 @@ class LLMEngine:
                     prefill_time=0.0, decode_time=0.0, decode_iterations=0,
                     multi_step_decode_steps=0, multi_step_decode_tokens=0,
                     decode_bursts=0, decode_burst_rounds=0, decode_burst_yields=0,
-                    decode_burst_skipped_slots=0,
+                    decode_burst_skipped_slots=0, decode_burst_pressure_yields=0,
                     spec_steps=0, spec_rows=0,
                     spec_verify_tokens=0, spec_draft_tokens=0, spec_accepted_drafts=0)
 
@@ -469,7 +469,7 @@ class LLMEngine:
         if (not self.config.multi_step_decode or self.config.max_decode_steps <= 1
                 or self.config.speculative != "none" or scheduler.waiting
                 or scheduler.swapped or yield_for_prefill):
-            return total_decode_tokens
+            return total_decode_tokens, finished
         self._step_stats["decode_bursts"] += 1
         rounds_done = 1  # 首轮已由 schedule() + 本步 run() 完成
 
@@ -524,7 +524,8 @@ class LLMEngine:
             self._last_step_decode_iterations += 1
             rounds_done += 1
         self._step_stats["decode_burst_rounds"] += rounds_done
-        return total_decode_tokens
+        # burst 内结束的序列必须回传给外层：它们的 per-request 计时快照在 step() 里落盘
+        return total_decode_tokens, finished
 
     def _step_pd_decode(self) -> tuple[list[Sequence], int, int, bool]:
         scheduler = self.decode_scheduler

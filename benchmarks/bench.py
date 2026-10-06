@@ -95,6 +95,8 @@ def scheduler_options(args, overrides=None):
         "multi_step_decode": not getattr(args, "no_multi_step_decode", False),
         "max_decode_steps": getattr(args, "max_decode_steps", 4),
         "decode_burst_yield": not getattr(args, "no_decode_burst_yield", False),
+        "decode_burst_yield_on_arrival": not getattr(
+            args, "no_decode_burst_yield_on_arrival", False),
         "max_prefill_chunk_tokens": getattr(args, "max_prefill_chunk_tokens", 4096),
         "queue_depth_for_full_prefill": getattr(
             args, "queue_depth_for_full_prefill", 16),
@@ -497,6 +499,8 @@ def parse_args():
                    help="每个engine step最多连续执行的纯decode轮数")
     p.add_argument("--no-decode-burst-yield", action="store_true",
                    help="关闭burst提前让出（消融）：有prefill等待时仍跑满轮数预算")
+    p.add_argument("--no-decode-burst-yield-on-arrival", action="store_true",
+                   help="关闭「burst期间新请求到达即收尾」（消融）：到达压力不再打断burst")
     p.add_argument("--max-prefill-chunk-tokens", type=int, default=4096,
                    help="自适应调度单步prefill预算上限")
     p.add_argument("--queue-depth-for-full-prefill", type=int, default=16,
