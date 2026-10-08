@@ -72,8 +72,6 @@ class Scheduler:
             if self.rolling_split:
                 assert config.speculative == "none", \
                     "split（交替窗口）模式暂不支持投机"
-                assert config.kv_swap is False, \
-                    "split 模式暂不支持 KV swap（双池缓冲未实现）"
         # split 模式（交替窗口，阶段 2b 扩展）：两个独立池
         #   block_manager（环池，rolling）：local 层，窗口内容
         #   full_block_manager（full 池，no_share）：global 层，全历史
@@ -129,7 +127,8 @@ class Scheduler:
         self.num_tpot_starved_steps = 0
         self._last_tpot_pressure = 0.0
         self.cow_pairs: list[tuple[int, int]] = []  # 本轮调度产生的COW复制对 (old_block_id, new_block_id)
-        self.swap_pairs: list[tuple[Sequence, list[int], object, str]] = []  # 本轮KV swap对 (seq, gpu块id, cpu缓冲, "out"/"in")——GPU拷贝由engine在run前执行
+        self.swap_pairs: list[tuple[Sequence, list[int] | dict[str, list[int]],
+                                    object, str]] = []  # GPU拷贝由engine在run前执行
         self._swap_buffers: dict[int, object] = {}  # seq_id → CPU 缓冲（换出时分配，换入后释放）
         # FP8 KV 在 CPU 侧按 uint8 原始字节保存并往返，避免 float8 的 CPU 算子限制。
         # TP>1 的 spawn 进程尚未实现每个 rank 的独立 offload buffer，因此仍回退 recompute。
@@ -148,13 +147,28 @@ class Scheduler:
             self._swap_fp8 = config.kv_cache_dtype == "fp8_e4m3"
             self._swap_dtype = torch.uint8 if self._swap_fp8 else hf.dtype
             itemsize = 1 if self._swap_fp8 else hf.dtype.itemsize
-            if self._swap_mla:
-                self._swap_bytes_per_block = (self._swap_layers * self.block_size
-                                              * self._swap_mla_d * itemsize)
+            if self.rolling_split:
+                from nanovllm.models.gemma2 import gemma2_layer_types
+                types = gemma2_layer_types(hf, hf.num_hidden_layers)
+                layer_counts = {
+                    "ring": sum(t == "sliding" for t in types),
+                    "full": sum(t != "sliding" for t in types),
+                }
             else:
-                self._swap_bytes_per_block = (2 * self._swap_layers * self.block_size
-                                              * self._swap_kv_heads * self._swap_head_dim
-                                              * itemsize)
+                layer_counts = {"main": self._swap_layers}
+            self._swap_pool_layers = layer_counts
+            self._swap_pool_bytes_per_block = {}
+            for pool, layers in layer_counts.items():
+                if self._swap_mla:
+                    block_bytes = (layers * self.block_size
+                                   * self._swap_mla_d * itemsize)
+                else:
+                    block_bytes = (2 * layers * self.block_size
+                                   * self._swap_kv_heads * self._swap_head_dim
+                                   * itemsize)
+                self._swap_pool_bytes_per_block[pool] = block_bytes
+            # Retain the aggregate for callers that only need an upper-bound estimate.
+            self._swap_bytes_per_block = sum(self._swap_pool_bytes_per_block.values())
         # ---- 投机解码（n-gram / Medusa） ----
         self.spec_decode = config.speculative in ("ngram", "medusa", "eagle")
         self.spec_mode = config.speculative   # "ngram" | "medusa" | "eagle"
@@ -902,9 +916,10 @@ class Scheduler:
         return recompute_tokens, recompute_seconds, swap_seconds
 
     def _preemption_plan(self, seq: Sequence) -> tuple[bool, int, float, float, int]:
-        required_bytes = (len(seq.block_table) * self._swap_bytes_per_block
-                          if self.kv_swap else 0)
-        can_swap = (self.kv_swap and not seq.is_prefill and seq.block_table
+        required_bytes = self._swap_required_bytes(seq) if self.kv_swap else 0
+        has_complete_tables = bool(seq.block_table) and (
+            self.full_block_manager is None or bool(seq.kv_table))
+        can_swap = (self.kv_swap and not seq.is_prefill and has_complete_tables
                     and self._swap_bytes + required_bytes <= self._swap_max_bytes)
         recompute_tokens, recompute_cost, swap_cost = self._estimate_preemption_cost(
             seq, required_bytes)
@@ -920,6 +935,41 @@ class Scheduler:
         reclaimable_blocks = min(reclaimable, default=0)
         selected_cost = swap_cost if use_swap else recompute_cost
         return use_swap, recompute_tokens, recompute_cost, selected_cost, reclaimable_blocks
+
+    def _swap_required_bytes(self, seq: Sequence) -> int:
+        if not self.kv_swap:
+            return 0
+        if self.rolling_split:
+            return (len(seq.block_table) * self._swap_pool_bytes_per_block["ring"]
+                    + len(seq.kv_table) * self._swap_pool_bytes_per_block["full"])
+        return len(seq.block_table) * self._swap_pool_bytes_per_block["main"]
+
+    @staticmethod
+    def swap_buffer_nbytes(buffer: torch.Tensor | dict[str, torch.Tensor]) -> int:
+        """Return host storage bytes for a regular or split-pool swap payload."""
+        buffers = buffer.values() if isinstance(buffer, dict) else (buffer,)
+        return sum(tensor.numel() * tensor.element_size() for tensor in buffers)
+
+    def _new_swap_buffer(self, num_blocks: int, pool: str) -> torch.Tensor:
+        layers = self._swap_pool_layers[pool]
+        if self._swap_mla:
+            return torch.empty(self._swap_layers, num_blocks, self.block_size,
+                               self._swap_mla_d, dtype=self._swap_dtype)
+        # Split pools differ only in layer count; keeping the same six-dimensional
+        # layout lets ModelRunner copy either pool with the same indexing code.
+        return torch.empty(2, layers, num_blocks, self.block_size,
+                           self._swap_kv_heads, self._swap_head_dim,
+                           dtype=self._swap_dtype)
+
+    def _swap_in_required_blocks(self, seq: Sequence, manager: BlockManager) -> int:
+        cached_blocks = (seq.num_cached_tokens + self.block_size - 1) // self.block_size
+        if manager.rolling:
+            cached_blocks = max(1, cached_blocks - seq.kv_j0)
+        needs_append = len(seq) % self.block_size == 1
+        if needs_append and not (manager.rolling and
+                                 manager._front_dead(seq, len(seq) + 1)):
+            cached_blocks += 1
+        return cached_blocks
 
     def _choose_preemption_victim(self, candidates) -> Sequence:
         if not self.recompute_aware_preemption:
@@ -985,32 +1035,39 @@ class Scheduler:
         seq.is_prefill = False       # 恢复时直接 decode，不是 prefill
         seq.draft_tokens = None
         seq.swapped = True
-        n_blocks = len(seq.block_table)
-        assert n_blocks >= 1
         # 注意：decode 序列最后 token 的块可能未分配（can_append 失败正是缺这块）
-        # → 缓冲只拷已分配的块（KV 已写入部分）；恢复后本步 decode 正常写最后 token
-        # CPU 缓冲（不用 pin_memory：WSL2 下 GPU→pinned CPU 的大块 D2H 拷贝实测会
-        # 崩 VM（cudaHostAlloc 支持有限）；普通 CPU 内存的 D2H/H2D 拷贝正确且稳定，
-        # 只是 H2D 略慢——swap 频率低，可接受）。FP8 用 uint8 保存原始字节。
-        # 布局与 kv_cache 一致：MHA [2, L, n, B, kvh, hd]；MLA fused [L, n, B, D]
-        if self._swap_mla:
-            buf = torch.empty(self._swap_layers, n_blocks, self.block_size,
-                              self._swap_mla_d, dtype=self._swap_dtype)
+        # → 只换出已有块；恢复后本步 decode 正常追加。普通模式只有一个 KV 池；
+        # Gemma-2 split rolling 模式需要同时快照 local 环池和 global full 池。
+        if self.rolling_split:
+            block_ids = {
+                "ring": list(seq.block_table),
+                "full": list(seq.kv_table),
+            }
+            buffers = {
+                "ring": self._new_swap_buffer(len(block_ids["ring"]), "ring"),
+                "full": self._new_swap_buffer(len(block_ids["full"]), "full"),
+            }
+            assert block_ids["ring"] and block_ids["full"]
         else:
-            buf = torch.empty(2, self._swap_layers, n_blocks, self.block_size,
-                              self._swap_kv_heads, self._swap_head_dim,
-                              dtype=self._swap_dtype)
-        gpu_block_ids = list(seq.block_table)
-        actual_bytes = buf.numel() * buf.element_size()
-        assert actual_bytes == n_blocks * self._swap_bytes_per_block
+            block_ids = list(seq.block_table)
+            assert block_ids
+            buffers = self._new_swap_buffer(len(block_ids), "main")
+        actual_bytes = self.swap_buffer_nbytes(buffers)
+        assert actual_bytes == self._swap_required_bytes(seq)
         self._swap_bytes += actual_bytes
-        self._swap_buffers[seq.seq_id] = buf
-        self.swap_pairs.append((seq, gpu_block_ids, buf, "out"))
+        self._swap_buffers[seq.seq_id] = buffers
+        self.swap_pairs.append((seq, block_ids, buffers, "out"))
         self.swapped.appendleft(seq)
 
-    def finish_swap_out(self, seq: Sequence, block_ids: list[int]):
+    def finish_swap_out(self, seq: Sequence,
+                        block_ids: list[int] | dict[str, list[int]]) -> None:
         """engine 完成 GPU→CPU 拷贝后：释放块、清块表（num_cached_tokens 保留=num_tokens）。"""
-        self.block_manager.release_blocks(block_ids)
+        if self.rolling_split:
+            self.block_manager.release_blocks(block_ids["ring"])
+            self.full_block_manager.release_blocks(block_ids["full"])
+            seq.kv_table.clear()
+        else:
+            self.block_manager.release_blocks(block_ids)
         seq.block_table.clear()
 
     def swap_in(self, seq: Sequence):
@@ -1021,13 +1078,18 @@ class Scheduler:
         # 导致 CPU 缓冲峰值超过 kv_swap_space_gb。
         buf = self._swap_buffers[seq.seq_id]
         self.block_manager.allocate_private(seq)  # 全新私有块（num_cached_tokens 保留）
-        self.swap_pairs.append((seq, list(seq.block_table), buf, "in"))
+        if self.rolling_split:
+            self.full_block_manager.allocate_private(seq)
+            block_ids = {"ring": list(seq.block_table), "full": list(seq.kv_table)}
+        else:
+            block_ids = list(seq.block_table)
+        self.swap_pairs.append((seq, block_ids, buf, "in"))
         self.running.appendleft(seq)
 
     def finish_swap_in(self, seq: Sequence):
         """engine 完成 CPU→GPU 拷贝后释放 host buffer 并更新预算。"""
         buf = self._swap_buffers.pop(seq.seq_id)
-        self._swap_bytes -= buf.numel() * buf.element_size()
+        self._swap_bytes -= self.swap_buffer_nbytes(buf)
 
     def _try_swap_in(self):
         """把 swapped 队列里 KV 足够的序列换回 GPU（free 块够一个换一个）。
@@ -1040,7 +1102,13 @@ class Scheduler:
         remaining = deque()
         while self.swapped:
             seq = self.swapped.popleft()
-            if len(self.block_manager.free_block_ids) >= seq.num_blocks + 1:
+            ring_need = self._swap_in_required_blocks(seq, self.block_manager)
+            can_swap_in = len(self.block_manager.free_block_ids) >= ring_need
+            if self.full_block_manager is not None:
+                full_need = self._swap_in_required_blocks(seq, self.full_block_manager)
+                can_swap_in = (can_swap_in and
+                               len(self.full_block_manager.free_block_ids) >= full_need)
+            if can_swap_in:
                 self.swap_in(seq)
             else:
                 remaining.append(seq)

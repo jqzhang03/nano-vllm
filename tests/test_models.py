@@ -79,13 +79,25 @@ def test_attention_window_flash_params():
     assert a2._flash_softcap == 50.0
 
 
-def test_attention_softcap_fp8_conflict():
-    """softcap 层不允许 fp8 KV（自研 fp8 内核无 softcap）——forward 断言。"""
+def test_attention_softcap_fp8_decode_dispatch(monkeypatch):
+    """Gemma-2 softcap must reach the FP8 paged decode kernel."""
+    import torch
     from nanovllm.layers.attention import Attention
+    import nanovllm.layers.attention as attention_module
+
     a = Attention(8, 128, 128 ** -0.5, 4, logit_softcapping=50.0)
     a.use_fp8 = True
-    with pytest.raises(AssertionError):
-        a.forward(None, None, None)
+    observed = {}
+
+    def fake_fp8_decode(q, *args, **kwargs):
+        observed.update(kwargs)
+        return q
+
+    monkeypatch.setattr(attention_module, "paged_decode_attention_fp8",
+                        fake_fp8_decode)
+    q = torch.empty(1, 8, 128)
+    assert a.forward(q, None, None) is q
+    assert observed["softcap"] == 50.0
 
 
 def test_mistral_gemma2_construct_cpu():

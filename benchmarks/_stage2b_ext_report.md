@@ -2,7 +2,7 @@
 
 日期/硬件：RTX 5060 Ti 16GB（sm_120）/ WSL2（RAM 11GB+4GB swap，前 7GB 反复 OOM 后调大）
 
-> **当前状态说明（2026-10-05）**：本报告记录 MLA/rolling-cache 的组合验证，不含后续 HTTP 服务、会话管理或在线调度策略的性能数据。本文的 Gemma-2 split 是单个 ModelRunner/GPU 内的 local/global 两个 KV 池，**不是** Prefill/Decode 双 GPU 分离。当前系统状态和 PD 限制见仓库根目录 `README.md` / `INTERVIEW.md`。
+> **阶段快照说明（2026-10-05）**：本报告记录当时 MLA/rolling-cache 的组合验证，不含后续 HTTP 服务、会话管理或在线调度策略的性能数据。本文的 Gemma-2 split 是单个 ModelRunner/GPU 内的 local/global 两个 KV 池，**不是** Prefill/Decode 双 GPU 分离。2026-10-08 代码状态更新：Gemma-2 soft-cap + FP8 KV、rolling/split KV swap 与 decode/mixed Graph 已接通，但本报告没有覆盖这些组合，尚待 RTX 5060 Ti/WSL2 实测。当前系统状态和 PD 限制见仓库根目录 `README.md` / `INTERVIEW.md`。
 
 ## 1. 新增能力（相对 2b 的断言关）
 
@@ -49,7 +49,7 @@
   int4 内核 K 尾块（10944 非 128 倍数漏算 64 列 → 引擎 logits 灾难性漂移 +NaN）→ 尾 K 掩码 + 组粒度静态展开（128 组路径逐位不变，64 组路径 vs 反量化逐位一致）；
   transformers 5.15 的 MoE `torch._grouped_mm` 仅 sm_90 → 本机无法用 HF-GPU 直连做真实权重对照（记录，不用引擎侧代码绕开）。
 
-## 3. 组合矩阵（现行断言）
+## 3. 组合矩阵（本报告对应的 2026-10-05 checkout）
 
 | 组合 | 状态 |
 |---|---|
@@ -57,11 +57,11 @@
 | ring + ngram spec（bf16/fp8 KV） | ✅（eager verify，α=0 路径验证） |
 | ring + medusa/eagle spec | ❌ 断言关 |
 | gemma2 交替窗口 ring（split, auto KV；本实测为 bf16；no-spec, eager） | ✅ |
-| split + fp8 KV / spec / graph / swap | ❌ 断言关（fp8 与 softcap 冲突等） |
+| split + fp8 KV / spec / graph / swap | ❌ 当时断言关或未实现（FP8 与 softcap 冲突等） |
 | MLA fp8 KV（decode 内核/稠密装配/吸收式） | ✅ toy；真实模型未跑（fp8 KV 与真实 V2-Lite 时间成本未覆盖） |
 | MLA 纯 int4/fp8 权重 decode | ✅（kv_b 反量化副本；稠密兜底仅剩 w8a8/sparse24 情形） |
 | 滚动模型前缀缓存 | ❌ 停用（重复 prompt 代价，refcount 守卫） |
-| KV swap + ring / split | 未验证组合（测试基准均显式关闭） |
+| KV swap + ring / split | 当时未验证（测试基准均显式关闭） |
 
 ## 4. 复现
 

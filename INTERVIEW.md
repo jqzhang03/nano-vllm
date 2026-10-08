@@ -12,7 +12,7 @@
 > conda `nano-vllm`（torch 2.8.0+cu128、triton 3.4.0、flash-attn 2.8.3.post1）/ bf16 /
 > Qwen3-0.6B 为主，除非另注模型。WSL 内存 11GB + 4GB swap（`C:\Users\admin\.wslconfig`）。
 >
-> **实现状态快照（2026-10-06）**：代码已包含 OpenAI 风格在线服务与 SSE、进程内会话文本/截断/可选摘要、每会话 prompt token 预算和累计前缀命中统计、持续请求接收、动态准入与背压、Top-W cache-affinity、aging、recompute-aware 抢占、TTFT SLO 感知调度与自适应 prefill 配额、TP=1 的 auto/FP8 KV CPU swap，以及实验性本机 PD 分离。Prefix feature context 只为 Top-W 排序/配额候选懒解析，并按 BlockManager 的 `kv_generation` 失效；`prefix_feature_cache=False` 可保留亲和策略但改为每次解析，作为独立消融。CPU 生命周期测试覆盖特征失效、LRU/容量淘汰、swap 释放、共享 deferred-free 提交与计数重置；benchmark 记录 parse/reuse、stale reparse、generation mutation、eviction 和 deferred-free 排队/提交引用数及峰值唯一块数/引用数。缓存回收优先消耗未缓存空闲块，再按真实缓存复用 LRU 淘汰空闲前缀块，完成批次的 deferred-free 在 postprocess 结束后统一提交。普通 MHA mixed Prefill/Decode batch 增加了按形状惰性捕获、有限 LRU 图缓存的 CUDA Graph，MLA、rolling/split 和 spec-mixed 路径继续 eager。新增 `benchmarks/context_concurrency.py` 提供并发 × 上下文长度压测和实际 KV 池容量账本；`benchmarks/kv_fp8_calibrate.py` 生成真实文本校准 token，并按 scale margin 对比 FP8 与 auto KV 的 held-out decode logits。动态准入通过引擎空闲时的不可变 prefix-cache 快照估算命中 token、prefill 工作量与增量 KV 块，并结合输出长度全局 EWMA、实测 Prefill/Decode 速率、队列压力；过载时有限时 FIFO 延迟，超时/硬上限时返回 429。KV 容量预测仍按最大输出上限保守预留。单卡 `auto` 选择 mixed；多卡只有在配置兼容时才选 PD。PD 仍是单进程、双模型/KV 池、主机内存交接和串行阶段执行。
+> **实现状态快照（2026-10-08）**：代码已包含 OpenAI 风格在线服务与 SSE、进程内会话文本/截断/可选摘要、每会话 prompt token 预算和累计前缀命中统计、持续请求接收、动态准入与背压、Top-W cache-affinity、aging、recompute-aware 抢占、TTFT SLO 感知调度与自适应 prefill 配额、TP=1 的 auto/FP8 KV CPU swap，以及实验性本机 PD 分离。Prefix feature context 只为 Top-W 排序/配额候选懒解析，并按 BlockManager 的 `kv_generation` 失效；`prefix_feature_cache=False` 可保留亲和策略但改为每次解析，作为独立消融。CPU 生命周期测试覆盖特征失效、LRU/容量淘汰、swap 释放、共享 deferred-free 提交与计数重置；benchmark 记录 parse/reuse、stale reparse、generation mutation、eviction 和 deferred-free 排队/提交引用数及峰值唯一块数/引用数。缓存回收优先消耗未缓存空闲块，再按真实缓存复用 LRU 淘汰空闲前缀块，完成批次的 deferred-free 在 postprocess 结束后统一提交。MHA mixed Prefill/Decode batch 的惰性 CUDA Graph 已扩展到 Mistral rolling 与 Gemma-2 split（ring/full 表和槽位作为动态图输入）；Gemma-2 soft-cap 已接入 FP8 KV decode/varlen 内核，双池 swap 保存并恢复两类 KV。MLA、spec-mixed 仍 eager；sparse24 保留量化但 CUDA Graph 下回退 eager。新增 `benchmarks/context_concurrency.py` 提供并发 × 上下文长度压测和实际 KV 池容量账本，并支持组合 FP8 KV、权重量化、rolling、swap 与 mixed Graph；`benchmarks/kv_fp8_calibrate.py` 支持 Gemma-2 soft-cap FP8 KV 校准。上述新组合尚无 RTX 5060 Ti/WSL2 实测结果。动态准入通过引擎空闲时的不可变 prefix-cache 快照估算命中 token、prefill 工作量与增量 KV 块，并结合输出长度全局 EWMA、实测 Prefill/Decode 速率、队列压力；过载时有限时 FIFO 延迟，超时/硬上限时返回 429。KV 容量预测仍按最大输出上限保守预留。单卡 `auto` 选择 mixed；多卡只有在配置兼容时才选 PD。PD 仍是单进程、双模型/KV 池、主机内存交接和串行阶段执行。
 >
 > **本轮实测（2026-10-06，RTX 5060 Ti / WSL2，Qwen3-0.6B，mixed 单卡）**：**⑤ 复跑修订（当日第二次）**：上一轮把 `without_decode_burst_yield` 判为"结构上不可达"，方向对但结论不完整——那次运行里新功能只写了一半：`_run_decode_burst` 收集了 `finished` 却没返回（调用点解包 2 元组 → 任何进入 burst 的 step 直接 `TypeError`）、`Config` 缺 `decode_burst_yield_on_arrival`、服务端调用的 `_sync_decode_burst_pressure()` 未定义、准入用的 `_estimate_prefix_cache_match()`/`_projected_kv_blocks()` 未定义、`_estimate_admission` 里返回键引用了不存在的变量。补齐后重跑：**burst 中途到达确实能打断后续轮次**（服务端实测 8/8 轮让出，迟到请求尾延迟 68.3 → 53.6 ms，最差轮 676 → 329 ms，§10.3.11），原命令重跑结论不变（TPOT 配额仍是 collapse 根因，§10.3.10）；CPU 用例 `tests/test_decode_burst_yield.py` 钉住返回 arity 与到达压力谓词。**⑥ 指标正确性与 TPOT 饥饿修复（当日第三轮）**：①per-request 指标对 burst 内完成的序列重复落盘，128 请求只统计到 95 个不同 seq_id（另 38 条重复），驱动侧据此**提前结束跑批**——已改 `_record_once()` 幂等 + `reset_benchmark_metrics()` + harness 断言，所有变体现为 128/128 唯一；②TPOT 预填配额收缩加**死区**与**队列深度门限**（`tpot_prefill_throttle_margin=0.5` / `tpot_throttle_max_waiting=16`），把 self-locking 的 floor 钉死解开：128 请求 / 16 req/s / 20 ms 目标下 all_on 350 → **1140 tok/s**、TTFT p50 44.5 s → **1.6 s**、TPOT p50 173 → **82 ms**；③准入校准换到会打穿 SLO 的负载（24 req/s、128 请求）：关闭准入时只有 **26.6%** 的请求在 2 s 内拿到首 token，开准入（感知缓存）后接受 15.6% 请求、被服务者 **95%** 达标、吞吐 777 tok/s（不感知缓存仅 617）。①**前缀命中估算已与实测对齐**——准入现在按 `BlockManager.prefix_snapshot()`（engine 空闲时物化的不可变哈希表副本 + `prefix_map_version()` 失效）用候选请求的链式块哈希估算可复用 token，`cache_affinity_admission=False` 时恒为 0（"不感知缓存"消融）。进程内探针 `benchmarks/prefix_cache_probe.py` 10/10 请求估算==实际（0/256/512 三档，绝对误差 0，全部块对齐）；HTTP `benchmarks/prefix_cache_verify.py` 8/8 请求 `admission.estimated_cache_hit_tokens == context.prefix_cache_hit_tokens`（冷启动服务：首发 0/0、复用 512/512，Δ=0）。②**准入消融**（`admission_ablation.py` 三档：关闭 / 开但不感知缓存 / 开且感知缓存，同一到达 trace）：1 req/s、32 请求、共享前缀 512 时三档吞吐 264.9/264.5/264.6 tok/s、**0 拒绝 0 延迟**——低费率下准入根本不触发，缓存感知只把命中估算误差从 -496 token 修正到 0。4/8/16 req/s poisson、64 请求下：**缓存感知在 4-8 req/s 稳定有用**（比不感知多接受 4~13 个请求、吞吐 +4.9%~+51%，估算误差 -490 → -10~0 token），但**默认准入阈值整体是净损失**——相对关闭准入吞吐 -12.4%（4 req/s）、-12.2%~-54.0%（8 req/s，3 seed）、-45.0%（16 req/s），越忙越亏；16 req/s 饱和点上感知与不感知打平（接受数相同）。费率带宽、多种子重复与逐请求命中对照见 `results/admission_ablation_*.json`。③**decode burst 让出**：`decode_burst_yield`（默认开）新增为独立消融项 `without_decode_burst_yield`（关掉后 burst 即使有新 prefill 到达也跑满 `max_decode_steps`），并新增 `decode_bursts/rounds/yields/skipped_slots` 计数。④**修掉两处"跑不通"**：`Qwen3/Qwen2/Llama3Attention` 直接用 `dist.get_world_size()`，TP=1 时进程组未初始化 → 模型构造即崩（服务与离线路径都受影响，改用 `tp_size()` 回退）；`admission_ablation.py` 未在变体之间 `gc.collect()+empty_cache()` → 第二个变体 KV 分配断言失败。新实现尚未在 RTX 5060 Ti/WSL2 上验证收益，不作为性能结论。
 >
@@ -179,8 +179,8 @@
 |---|---|---|
 | **Mixtral 端口** | MoE 层已通（1.5），但 mixtral 具体端口（router + top-k norm_topk + aux loss 的 HF 对齐）未做 | registry 占位报错；本机无小 MoE 真模型可对照（DeepSeek-V2-Lite 已覆盖 MoE 真模型验证） |
 | **rope_scaling 其余变体** | YaRN / linear / dynamic | 已支持：无操作（default）+ llama3 变体（波长分段，单元对照 HF 0 误差）；其余构造时报错 |
-| **滚动环 × KV swap / ring × medusa/eagle** | 组合验证与记账 | 断言关（§8 阶段 2 诚实边界）；KV swap × ring/split 未验证 |
-| **split 双池 CUDA graph** | gemma2 split 模式 decode 入图 | 现为 eager（动态 python 路径烘焙即错）；softcap 层禁 fp8 KV |
+| **FP8/量化/rolling/KV swap/CUDA Graph 组合实测** | 用目标卡对代表性配置跑端到端和精度基准 | Mistral rolling 与 Gemma-2 split、FP8 soft-cap、双池 swap、ring/full graph 输入现已实现；组合正确性和性能尚待 RTX 5060 Ti/WSL2 实测。sparse24 在图启用时自动走 eager |
+| **rolling + Medusa/EAGLE / Gemma-2 split + speculative** | 定义 verify 行对环窗口与双池的语义 | 仍不支持；Mistral rolling 可用 n-gram，但 verify 走 eager |
 | **准入估算校准** | 按模型/批大小拟合 service rate、减少误拒和漏控 | 前缀命中预测已完成并与实测逐请求一致（§10.3.9）；仍未按模型/批大小校准 `admission_work_budget_ms`/`admission_soft_pressure`，2026-10-06 扫描显示关闭准入反而更快（4 req/s -12%、8 req/s -12~-54%、16 req/s -45%） |
 | **multi-step decode / TPOT 调度** | 扩大支持到 mixed/spec decode、改善目标硬件效果 | 纯非投机 decode burst 与 request-level TPOT 排序/配额已实现；burst 上限默认 4；`decode_burst_yield` 默认开（有 prefill 等待即提前收尾），`without_decode_burst_yield` 为独立消融；mixed/spec 仍单步。RTX 5060 Ti/WSL2 效果尚未实测，TPOT 是启发式软目标 |
 | **PD 生产化** | 异步重叠、远端 worker、网络/RDMA KV 传输、多卡基准 | 当前仅本地两卡、同步主机内存交接和串行阶段；单卡环境无法验证 |
@@ -345,8 +345,10 @@ KV swap 支持 TP=1 的 MHA/MLA 缓存，KV dtype 为模型原生 `auto` 或 FP8
 测量 bit-exact 0 误差、96×512 压力 699 次换出、27.8s vs recompute 11.8s；滚动环真实 Mistral-7B
 5050-token（>W=4096）环 vs 掩码 fp8 KV **全程逐位一致**，真实 gemma-2-2b-it split 环池表长
 到 cap(18) 封顶而 full/掩码继续线性增长（§8 阶段 2）。
-**诚实结论**：Mistral 统一窗口 rolling decode 可用 CUDA Graph；rolling+ngram verify 支持但走 eager；
-Gemma-2 split 双池仅 auto KV、无投机、无 KV swap，decode eager；KV swap × rolling/split 尚未验证。
+**现行实现状态（2026-10-08）**：Mistral rolling 与 Gemma-2 split decode/mixed 可走 CUDA Graph；FP8 KV
+soft-cap 与 split 双池 swap 已接通。Gemma-2 split 仍不支持投机，Mistral rolling+n-gram verify 走 eager。
+新接通的 FP8/量化/swap/Graph 组合尚未在 RTX 5060 Ti/WSL2 上验证，不能把旧报告的 eager/auto-only
+限制当成现行代码状态。
 **追问应对**：被问"前缀缓存怎么失效"→ 内容哈希链式、被拒草稿永不进
 哈希（投机）、COW 副本重新发布哈希、滚动模型整体退出。
 
@@ -375,9 +377,10 @@ Gemma-2 split 双池仅 auto KV、无投机、无 KV swap，decode eager；KV sw
   N≥16，8× 计算浪费换内存效率——decode 是 memory-bound）；④BLOCK_T=32/warps=1（跨 warp 归约
   顺序变化放大误差）。归因：有效 KV 读带宽 517-529 GB/s（超过 copy 370 的双向口径）。
 - **Q：CUDA graph 的坑？** A：形状必须静态（按容量族）；共享内存池避免碎片；spec 图用尾部重复
-  cu_seqlens 的空行填充（bit-exact 用 probe 验证过）；只有特定动态图路径需 eager：MLA 的稠密兜底、
-  Gemma-2 split 双池；Mistral rolling decode 和覆盖容量族的纯 spec（含 FP8 KV）有 graph 路径，
-  mixed/超容量 spec 会回退 eager。
+  cu_seqlens 的空行填充（bit-exact 用 probe 验证过）。Mistral rolling 与 Gemma-2 split 的普通
+  decode/mixed 路径现在把 ring/full 表与槽位作为动态图输入；Mistral rolling verify、Gemma-2
+  split speculative、MLA mixed、spec-mixed、超容量批次仍走 eager。sparse24 保留量化但图前向回退
+  eager，其他已接通的量化路径可与 decode/mixed graph 组合；新增组合仍待目标卡实测。
 - **Q：MLA decode 内核的形态？** A：吸收式：W_UK 折进 q（q_abs）、W_UV 折进输出——每 token
   只读 fused 576 元素而非重建稠密 K/V；kv_b 对 int4/fp8 特意保留小型 `w_deq` 视图（约占参数
   1%），因此纯 int4/fp8 可继续走吸收式路径；w8a8/sparse24 等无 float 视图的路径仍回退稠密兜底并强制 eager。
@@ -551,7 +554,8 @@ W_UK→q（q_abs）、W_UV→输出，每 token 只读 576 元素，重建不出
 真实 DeepSeek-V2-Lite 27 层流式 int4：启动 55s、权重 ~5GB 常驻（int4 + kv_b w_deq 113MB）、
 decode ~2.8 tok/s（3 并发、MoE eager、纯 int4）、中英连贯（§8 阶段 2b-ext 完整表）。
 **诚实边界**：fp8 KV×MLA 的组合路径有 toy 覆盖，但真实 V2-Lite 尚未测 FP8 KV；ring+medusa/eagle
-断言关；Gemma-2 split 仅 auto KV/无投机/无 swap/eager；KV swap×rolling 尚未验证；MLA spec
+仍有限制（Mistral rolling+n-gram verify eager，Medusa/EAGLE 不支持）；Gemma-2 split 的 FP8 KV、双池
+swap 与 CUDA Graph 路径已实现但未做目标 GPU 组合验证；MLA spec
 （投机 verify 的吸收式路径）未做。
 **追问应对**：被问"V3/V3.1 的 MLA 变体"→ 官方 576 口径推导、多 token 预测（MTP）未实现、EP 专家
 并行理论（§8 阶段 5）。
@@ -588,7 +592,7 @@ decode ~2.8 tok/s（3 并发、MoE eager、纯 int4）、中英连贯（§8 阶�
 | 模型吞吐 | Llama-3.1-8B 303.5 tok/s（bs=16）；Mistral-7B 311.4（bs=32，2026-08-24）；Gemma-2-2B 782.7-836.6（bs=64，2026-09-07 复测 ×2；08-24 首测 1094.7） | int4；WSL run 间波动 ±25% 级别 |
 | MLA | fused [c_kv\|k̃_pe] **576 元素**/token/层（**7.11×**，修正口径）；decode 内核 vs 稠密**位级 0 误差**；引擎 parity top-1 100% | DeepSeek-V2；V2-Lite 27 层流式 int4 decode ~2.8 tok/s（3 并发、MoE eager） |
 | 滚动环（2b） | 稳态 KV = 窗口+B/seq；真实 Mistral-7B 5050-token 环 vs 掩码 fp8 **逐位一致** | 环表 ≤ cap；滚动模型停用前缀缓存 |
-| split 双池（2b-ext） | gemma-2-2b-it 真实 split：环池 cap 18 封顶 vs full/掩码线性增长；30/30 稀疏步 | 仅 bf16/无投机/eager；softcap 层禁 fp8 KV |
+| split 双池（2b-ext，2026-10-05 实测） | gemma-2-2b-it 真实 split：环池 cap 18 封顶 vs full/掩码线性增长；30/30 稀疏步 | 该次实验仅 bf16/无投机/eager；不代表当前 FP8/swap/Graph 支持状态 |
 | 精度方法论 | 8-prompt KL 与 ppl 结论相反 → 用 3000+ token 困惑度；语料随机 → 只比同批 | 样本量决定结论方向 |
 
 ---
@@ -757,9 +761,12 @@ clamp±448、内核与稠密装配双路反量化）；② 投机(ngram)+环：B
 **顺带修复的真实 bug**：MLA decode 内核真实尺寸共享内存超限（BLOCK_T 32→16/warps 8）；int4
 内核 K 尾块漏算（10944=64×171 丢 64 列 → logits 漂移+NaN，掩码修复）；streaming 判定 meta
 实建数参数（旧通用公式漏 MoE/MLA 专家 → 曾把 33GB 当小模型直建 OOM）。
-**诚实边界（现行）**：Gemma-2 split 双池仅 auto KV、无投机/无 KV swap、decode eager（softcap 层禁
-fp8 KV；双池 CUDA graph 未实现）；ring+medusa/eagle 断言关；滚动模型停用前缀缓存（重复 prompt 代价）；
-KV swap×ring/split 未验证；fp8 KV×MLA 的组合路径有 toy 覆盖（真实 V2-Lite 尚未测 FP8 KV）；fp8 权重×MLA 与 kv_b
+**阶段 2b-ext 边界（报告快照截至 2026-10-05，不代表当前 checkout）**：当时 Gemma-2 split 双池仅
+auto KV、无投机/无 KV swap、decode eager（softcap 层禁 fp8 KV；双池 CUDA graph 未实现）；rolling 模型
+停用前缀缓存（重复 prompt 代价）；KV swap×ring/split 未验证。**当前代码更新（2026-10-08）**：Gemma-2
+soft-cap FP8 KV、Mistral/Gemma-2 rolling/split 的 swap，以及 decode/mixed Graph 输入已实现，但均待目标
+RTX 5060 Ti/WSL2 组合验证；sparse24 的图前向回退 eager。ring+medusa/eagle 仍受模型/调度约束；fp8 KV×MLA
+的组合路径有 toy 覆盖（真实 V2-Lite 尚未测 FP8 KV）；fp8 权重×MLA 与 kv_b
 同机制但无单独探针；真实模型对照的采样步一致性受"异内核数值差在近并列处翻转"限制（同内核
 位级、异内核 top-1 噪声带内，用稀疏步手工参考论证）；transformers 5.15 MoE `torch._grouped_mm`
 仅 sm_90 → 本机无 HF-GPU 直连真权重对照（nano fp16 稠密参考替代）。
@@ -861,8 +868,8 @@ step() [llm_engine.py]
  ├─ model_runner.call("run", seqs, kind)
  │   ├─ prepare_prefill /mixed /decode /spec  → set_context() [context.py]
  │   ├─ run_model(input_ids, positions, kind)
- │   │   ├─ kind=spec → 支持的纯批次走 spec CUDA graph；MLA/rolling/spec-mixed eager
- │   │   ├─ kind=mixed → 普通 MHA 按精确形状懒捕获/重放 mixed CUDA Graph；不支持时 eager
+ │   │   ├─ kind=spec → 支持的非 MLA、非 rolling 纯批次走 spec CUDA graph；其余 eager
+ │   │   ├─ kind=mixed → MHA 按精确形状懒捕获/重放 mixed CUDA Graph（含 Mistral rolling / Gemma-2 split）；不支持时 eager
  │   │   ├─ kind=decode 且 bs≤512 且非 eager → decode CUDA graph 重放
  │   │   └─ 否则 eager：model(input_ids, positions)
  │   ├─ model.compute_logits(hidden)                   # LM Head（图外）
@@ -1050,9 +1057,9 @@ python benchmarks/prefix_cache_verify.py --base-url http://127.0.0.1:8000   # HT
 python benchmarks/prefix_estimate_check.py                     # 三条最小对，直接读响应字段
 ```
 
-并发矩阵每个点把一批请求同时交给在线 `GenerationManager`，默认关闭预测准入以测调度与 KV 容量；`--dynamic-admission` 可把接收/延迟/拒绝策略纳入压测。每个请求的输出长度固定，因此输出速率与 TPOT 分布可横向比较。JSON 保留逐请求结果，并汇总 TTFT/TPOT SLO 达成率、admission 估计与等待、吞吐、抢占、swap、prefix hit、KV pool 峰值和显存峰值；CSV 汇总每个矩阵点。容量账本直接从 MHA/MLA cache tensor 字节数和 BlockManager 页数计算：full-history 池按 `(prompt tokens + max output tokens)` 预留整块页数；rolling 池按 prefill 的完整 prompt 分配峰值与生成期 `ring_cap` 占用中的较大值估算，split rolling/full 模型分别报告两池容量。它不包含 CPU swap，也不代表同延迟服务能力。CUDA peak 包括 engine 初始化后当前分配基线和本次场景峰值，JSON 同时保留 peak delta。
+并发矩阵每个点把一批请求同时交给在线 `GenerationManager`，默认关闭预测准入以测调度与 KV 容量；`--dynamic-admission` 可把接收/延迟/拒绝策略纳入压测。每个请求的输出长度固定，因此输出速率与 TPOT 分布可横向比较。JSON 保留逐请求结果，并汇总 TTFT/TPOT SLO 达成率、admission 估计与等待、吞吐、抢占、swap、prefix hit、KV pool 峰值、显存峰值，以及 decode/mixed CUDA Graph 的 replay、eager fallback 和 fallback reason；CSV 汇总每个矩阵点的吞吐、swap 与 graph 计数。容量账本直接从 MHA/MLA cache tensor 字节数和 BlockManager 页数计算：full-history 池按 `(prompt tokens + max output tokens)` 预留整块页数；rolling 池按 prefill 的完整 prompt 分配峰值与生成期 `ring_cap` 占用中的较大值估算，split rolling/full 模型分别报告两池容量。它不包含 CPU swap，也不代表同延迟服务能力。CUDA peak 包括 engine 初始化后当前分配基线和本次场景峰值，JSON 同时保留 peak delta。该脚本可用 `--kv-cache-dtype`、`--quantization`、`--rolling-cache`、默认开启的 KV swap、`--enforce-eager` 和 `--no-mixed-cudagraph` 组成单次配置；JSON `config` 会记录对应开关。FP8/量化/rolling/swap/Graph 新组合仍需在目标 GPU 做精度与性能验证。
 
-FP8 校准输入支持 JSONL 的 `prompt`/`text` 字段或纯文本；省略语料时使用脚本内置小语料，并把每条短 prompt 重复到 1024 token 以覆盖长一些的 KV 历史；用户语料默认保留原始长度，可用 `--calibration-context-length` / `--eval-context-length` 显式扩展。Gemma-2 的 attention logit soft-cap 当前不兼容 FP8 KV。报告的 range utilization 是 held-out 每层/每段 activation 最大绝对值除以 `448 × calibrated_scale`；大于 1 表示观测到的最大值被 clamp，不是逐元素饱和比例。logit 精度指标只纳入首 token 一致的 prompt，确保对比 decode 时两侧历史相同；实际部署评估应覆盖真实请求分布，并把校准与验证语料分开。
+FP8 校准输入支持 JSONL 的 `prompt`/`text` 字段或纯文本；省略语料时使用脚本内置小语料，并把每条短 prompt 重复到 1024 token 以覆盖长一些的 KV 历史；用户语料默认保留原始长度，可用 `--calibration-context-length` / `--eval-context-length` 显式扩展。Gemma-2 logit soft-cap 已实现于 FP8 paged decode/varlen 内核，校准脚本不再拒绝 Gemma-2；新组合的精度与性能仍需目标 GPU 验证。报告的 range utilization 是 held-out 每层/每段 activation 最大绝对值除以 `448 × calibrated_scale`；大于 1 表示观测到的最大值被 clamp，不是逐元素饱和比例。logit 精度指标只纳入首 token 一致的 prompt，确保对比 decode 时两侧历史相同；实际部署评估应覆盖真实请求分布，并把校准与验证语料分开。
 
 ### 10.3 归档实测结果（截至各表日期；每张表自带 workload，跨表数字只作量级参考）
 
@@ -1240,7 +1247,8 @@ NaN/崩溃；attn soft-cap 量级（cap=50 的 tanh 在层 0 原始 logits ±11 
 原生 softcap 精确实现；final cap=30 压 logits ±30+，必须实现）。**诚实记录**：gemma2 双路径
 09-07 两轮复测一致地比 08-24 首测慢 ~25-30%（同 workload 同 seed、KV 220 块逐 token 复现）；
 原因未定位（环境波动或 2b 解码路径改动），跨日期比较以 09-07 为准、首测数字仅作对照。mistral
-行仍为 08-24 数据（未复测）。gemma2 softcap 层不支持 fp8 KV（断言拦截）；全部条件：WSL2 单卡、
+行仍为 08-24 数据（未复测）。该批次只测了 bf16 KV，未覆盖 Gemma-2 FP8 KV；后续代码已接通 softcap
+FP8 kernel 路径，但组合结果待复测。全部条件：WSL2 单卡、
 bf16、flash-attn 2.8.3.post1。
 
 #### 10.3.8 阶段 2 组合（MLA / 滚动环 / 2b-ext）关键数字

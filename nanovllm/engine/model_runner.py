@@ -29,6 +29,15 @@ class ModelRunner:
         self.mixed_cudagraph_capture_count = 0
         self.mixed_cudagraph_replay_count = 0
         self.mixed_cudagraph_eager_fallbacks = 0
+        self.decode_cudagraph_replay_count = 0
+        self.decode_cudagraph_eager_fallbacks = 0
+        # The engine-level sparse24 probe found replay mismatches with CUDA Graph.
+        # Keep the quantized model enabled and run its forward eagerly until the
+        # replay path is corrected and revalidated.
+        self.cudagraph_quantization_supported = config.quantization != "sparse24"
+        self.cudagraph_disabled_reason = (
+            "sparse24 engine probe found graph replay mismatches" if
+            not self.cudagraph_quantization_supported else None)
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
@@ -109,13 +118,18 @@ class ModelRunner:
         self.allocate_kv_cache()
         # 若没有强制eager模式，则使用CUDA图优化加速decode阶段
         if not self.enforce_eager:
-            self.capture_cudagraph()
+            if self.cudagraph_quantization_supported:
+                self.capture_cudagraph()
+            else:
+                print("[cuda-graph] sparse24 使用 eager 前向（Triton 重放正确性尚未确认）",
+                      flush=True)
             # 投机解码：再捕获verify前向（varlen）的graph族（固定容量+空行填充）
             # MLA 模型跳过：verify 行走 cache 稠密化组装的 python 路径（动态行
             # 长度按捕获时的零值烘焙 → 重放即错）；MLA spec 步保持 eager。
             # 滚动模型跳过：verify 行走环内装配（同样动态 python 路径）→ eager。
-            if config.speculative in ("ngram", "medusa", "eagle") \
-                    and not self._mla_model and not self._rolling:
+            if (self.cudagraph_quantization_supported
+                    and config.speculative in ("ngram", "medusa", "eagle")
+                    and not self._mla_model and not self._rolling):
                 self.capture_spec_graph()
 
         torch.set_default_device("cpu")
@@ -143,7 +157,8 @@ class ModelRunner:
                 self.shm.unlink()
         # 删除存储的CUDA Graph对象和内存池，释放显存
         if not self.enforce_eager:
-            del self.graphs, self.graph_pool
+            if hasattr(self, "graphs"):
+                del self.graphs, self.graph_pool
             if hasattr(self, "spec_graphs"):
                 del self.spec_graphs, self.spec_graph_pool, self.spec_graph_vars
             if hasattr(self, "mixed_graphs"):
@@ -225,25 +240,43 @@ class ModelRunner:
         else:
             self.kv_cache[:, :, new_block_id] = self.kv_cache[:, :, old_block_id]
 
-    def swap_out(self, block_ids: list[int], cpu_buffer: torch.Tensor):
+    def swap_out(self, block_ids: list[int] | dict[str, list[int]],
+                 cpu_buffer: torch.Tensor | dict[str, torch.Tensor]) -> None:
         """KV swap 换出：GPU KV 块拷到 CPU 缓冲（bit-exact）。
 
         cpu_buffer 与 self.kv_cache 同布局（MHA [2, layers, n, B, kvh, hd] /
         MLA [layers, n, B, kv_lora+rope]）；FP8 缓冲为等形状 uint8。
         """
-        if self._kv_mla:
-            gpu = self.kv_cache[:, block_ids]          # [L, n, B, D]
+        if isinstance(block_ids, dict):
+            if not isinstance(cpu_buffer, dict):
+                raise TypeError("split KV swap requires one host buffer per KV pool")
+            for pool, ids in block_ids.items():
+                cache = self._swap_pool_cache(pool)
+                self._swap_out_cache(cache, ids, cpu_buffer[pool], mla=False)
         else:
-            gpu = self.kv_cache[:, :, block_ids]       # [2, L, n, B, kvh, hd]
+            self._swap_out_cache(self.kv_cache, block_ids, cpu_buffer,
+                                 mla=self._kv_mla)
+        torch.cuda.synchronize()  # 确保换出完成（缓冲在 CPU 侧后续由调度器管理）
+
+    def _swap_pool_cache(self, pool: str) -> torch.Tensor:
+        if pool in ("main", "ring"):
+            return self.kv_cache
+        if pool == "full" and hasattr(self, "kv_cache_full"):
+            return self.kv_cache_full
+        raise ValueError(f"unknown or unavailable KV swap pool: {pool!r}")
+
+    def _swap_out_cache(self, cache: torch.Tensor, block_ids: list[int],
+                        cpu_buffer: torch.Tensor, *, mla: bool) -> None:
+        gpu = cache[:, block_ids] if mla else cache[:, :, block_ids]
         payload = self._kv_swap_payload(gpu)
         if payload.shape != cpu_buffer.shape or payload.dtype != cpu_buffer.dtype:
             raise ValueError(
                 f"KV swap buffer has shape/dtype {tuple(cpu_buffer.shape)}/{cpu_buffer.dtype}, "
                 f"expected {tuple(payload.shape)}/{payload.dtype}")
         cpu_buffer.copy_(payload)
-        torch.cuda.synchronize()  # 确保换出完成（缓冲在 CPU 侧后续由调度器管理）
 
-    def swap_in(self, block_ids: list[int], cpu_buffer: torch.Tensor):
+    def swap_in(self, block_ids: list[int] | dict[str, list[int]],
+                cpu_buffer: torch.Tensor | dict[str, torch.Tensor]) -> None:
         """KV swap 换入：CPU 缓冲拷回 seq 的（新分配的私有）GPU KV 块。
 
         缓冲只含换出时已分配的块（decode 序列最后 token 的块换出时未分配，
@@ -251,21 +284,29 @@ class ModelRunner:
         **必须用 index_copy_ 原位写**：高级索引（list）返回临时副本，copy_ 只写
         副本不写回缓存（静默产生垃圾 KV）。
         """
-        src = cpu_buffer.to(device=self.kv_cache.device)
+        if isinstance(block_ids, dict):
+            if not isinstance(cpu_buffer, dict):
+                raise TypeError("split KV swap requires one host buffer per KV pool")
+            for pool, ids in block_ids.items():
+                cache = self._swap_pool_cache(pool)
+                self._swap_in_cache(cache, ids, cpu_buffer[pool], mla=False)
+        else:
+            self._swap_in_cache(self.kv_cache, block_ids, cpu_buffer,
+                                mla=self._kv_mla)
+
+    def _swap_in_cache(self, cache: torch.Tensor, block_ids: list[int],
+                       cpu_buffer: torch.Tensor, *, mla: bool) -> None:
+        src = cpu_buffer.to(device=cache.device)
         if self.config.kv_cache_dtype == "fp8_e4m3":
             if src.dtype != torch.uint8:
                 raise ValueError(f"FP8 KV swap buffer must be uint8, got {src.dtype}")
-            src = src.view(self.kv_cache.dtype)
-        elif src.dtype != self.kv_cache.dtype:
-            src = src.to(dtype=self.kv_cache.dtype)
-        if self._kv_mla:
-            n = cpu_buffer.shape[1]
-            ids = torch.tensor(block_ids[:n], device=self.kv_cache.device)
-            self.kv_cache.index_copy_(1, ids, src)
-        else:
-            n = cpu_buffer.shape[2]
-            ids = torch.tensor(block_ids[:n], device=self.kv_cache.device)
-            self.kv_cache.index_copy_(2, ids, src)
+            src = src.view(cache.dtype)
+        elif src.dtype != cache.dtype:
+            src = src.to(dtype=cache.dtype)
+        block_dim = 1 if mla else 2
+        n = cpu_buffer.shape[block_dim]
+        ids = torch.tensor(block_ids[:n], device=cache.device)
+        cache.index_copy_(block_dim, ids, src)
 
     def warmup_model(self):
         torch.cuda.empty_cache()
@@ -680,7 +721,7 @@ class ModelRunner:
         - **统一窗口**（mistral）：全层 rolling=True，bf16/fp8 KV + 无投机/ngram；
         - **交替窗口 split**（gemma2 local/global）：local 层 rolling=True（环池），
           global 层 split_full=True（full 池，全历史、普通分页）——双池分配在
-          allocate_kv_cache；spec 关、kv 仅 auto、decode 强制 eager（双池图未实现）。
+          allocate_kv_cache；spec 关闭，decode/mixed 可使用带双池索引的 CUDA Graph。
         """
         cfg = self.config
         self._rolling = cfg.rolling_cache
@@ -701,9 +742,8 @@ class ModelRunner:
         assert attns, "滚动模型缺注意力层"
         windows = {m.window_size for m in attns}
         if windows == {None, W}:
-            assert hf.model_type == "gemma2" and cfg.speculative == "none" \
-                and cfg.kv_cache_dtype == "auto", \
-                "split（交替窗口）模式：仅 gemma2、无投机、kv auto"
+            assert hf.model_type == "gemma2" and cfg.speculative == "none", \
+                "split（交替窗口）模式：仅 gemma2 且不支持投机解码"
             self._ring_split = True
             self._ring_layers = [m for m in attns if m.window_size == W]
             self._full_layers = [m for m in attns if m.window_size is None]
@@ -715,11 +755,6 @@ class ModelRunner:
             for m in self._full_layers:
                 m.rolling = False
                 m.split_full = True
-            if not self.enforce_eager:
-                print("[ring-split] 交替窗口滚动 decode 走 eager"
-                      "（双池 CUDA graph 捕获未实现）→ 强制 enforce_eager",
-                      flush=True)
-                self.enforce_eager = True
             return
         assert windows == {W}, f"滚动窗口模式未覆盖（{windows}）"
         for m in attns:
@@ -1273,6 +1308,7 @@ class ModelRunner:
         # 选stride家族（低γ步用stride-3图，容量=3×行数，减少填充浪费）。
         # fp8也入图：fp8 verify走自研varlen内核（直接读fp8缓存，无反量化）。
         if (kind == "spec" and not self.enforce_eager
+                and self.cudagraph_quantization_supported
                 and getattr(self, "spec_graphs", None)):
             context = get_context()
             rows = context.cu_seqlens_q.size(0) - 1
@@ -1284,7 +1320,8 @@ class ModelRunner:
                 logits = self.model.compute_logits(hidden)
                 return (logits, hidden) if return_hidden else logits
         if kind == "mixed":
-            if (not self.enforce_eager and self.config.mixed_cudagraph
+            if (not self.enforce_eager and self.cudagraph_quantization_supported
+                    and self.config.mixed_cudagraph
                     and self._mixed_graph_supported(input_ids)):
                 context = get_context()
                 hidden = self._mixed_graph_hidden(input_ids, positions, context)
@@ -1293,7 +1330,11 @@ class ModelRunner:
             self.mixed_cudagraph_eager_fallbacks += 1
         # 只有纯decode批次且非强制eager且batch<=512时走CUDA graph；
         # prefill与不支持的mixed批次走eager。
-        if kind != "decode" or self.enforce_eager or input_ids.size(0) > 512:
+        if (kind != "decode" or self.enforce_eager
+                or not self.cudagraph_quantization_supported
+                or input_ids.size(0) > 512):
+            if kind == "decode":
+                self.decode_cudagraph_eager_fallbacks += 1
             hidden = self.model(input_ids, positions)
             logits = self.model.compute_logits(hidden)
             return (logits, hidden) if return_hidden else logits
@@ -1324,8 +1365,15 @@ class ModelRunner:
                 graph_vars["chunk_starts"][:bs] = context.chunk_starts
             # 将block_tables拷贝至图张量相应位置
             graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
+            if context.full_block_tables is not None:
+                graph_vars["full_block_tables"][:bs, :context.full_block_tables.size(1)] = (
+                    context.full_block_tables)
+            if context.full_slot_mapping is not None:
+                graph_vars["full_slot_mapping"].fill_(-1)
+                graph_vars["full_slot_mapping"][:bs] = context.full_slot_mapping
             # 重放CUDA Graph，执行模型前向
             graph.replay()
+            self.decode_cudagraph_replay_count += 1
             # 从图输出张量中取出前batch_size个隐藏状态，计算完logits后返回
             hidden = graph_vars["outputs"][:bs]
             logits = self.model.compute_logits(hidden)
@@ -1420,14 +1468,10 @@ class ModelRunner:
     def _mixed_graph_supported(self, input_ids: torch.Tensor) -> bool:
         context = get_context()
         return (context.is_mixed and not context.is_spec
-                and not self._mla_model and not self._rolling and not self._ring_split
+                and not self._mla_model
                 and input_ids.numel() <= self.config.mixed_cudagraph_max_tokens
-                and context.chunk_starts is None
                 and context.mla_pre_starts is None
                 and context.mla_dec_starts is None
-                and context.full_block_tables is None
-                and context.full_prefill_block_tables is None
-                and context.full_slot_mapping is None
                 and context.cu_seqlens_q is not None
                 and context.cu_seqlens_k is not None
                 and context.slot_mapping is not None
@@ -1439,11 +1483,21 @@ class ModelRunner:
     def _mixed_graph_key(input_ids: torch.Tensor, context) -> tuple:
         prefill_table_shape = (None if context.prefill_block_tables is None else
                                tuple(context.prefill_block_tables.shape))
+        chunk_starts_shape = (None if context.chunk_starts is None else
+                              tuple(context.chunk_starts.shape))
+        full_table_shape = (None if context.full_block_tables is None else
+                            tuple(context.full_block_tables.shape))
+        full_prefill_table_shape = (
+            None if context.full_prefill_block_tables is None else
+            tuple(context.full_prefill_block_tables.shape))
+        full_slot_shape = (None if context.full_slot_mapping is None else
+                           tuple(context.full_slot_mapping.shape))
         return (
             tuple(input_ids.shape), tuple(context.cu_seqlens_q.shape),
             tuple(context.cu_seqlens_k.shape), tuple(context.slot_mapping.shape),
             tuple(context.context_lens.shape), tuple(context.block_tables.shape),
-            prefill_table_shape, context.n_prefill_tokens,
+            prefill_table_shape, chunk_starts_shape, full_table_shape,
+            full_prefill_table_shape, full_slot_shape, context.n_prefill_tokens,
             context.max_seqlen_q, context.max_seqlen_k,
         )
 
@@ -1455,8 +1509,10 @@ class ModelRunner:
         for name in ("cu_seqlens_q", "cu_seqlens_k", "slot_mapping",
                      "context_lens", "block_tables"):
             variables[name].copy_(getattr(context, name))
-        if context.prefill_block_tables is not None:
-            variables["prefill_block_tables"].copy_(context.prefill_block_tables)
+        for name in ("prefill_block_tables", "chunk_starts", "full_block_tables",
+                     "full_prefill_block_tables", "full_slot_mapping"):
+            if getattr(context, name) is not None:
+                variables[name].copy_(getattr(context, name))
 
     @torch.inference_mode()
     def _capture_mixed_graph(self, input_ids: torch.Tensor,
@@ -1473,6 +1529,11 @@ class ModelRunner:
         if context.prefill_block_tables is not None:
             variables["prefill_block_tables"] = torch.empty_like(
                 context.prefill_block_tables)
+        for name in ("chunk_starts", "full_block_tables",
+                     "full_prefill_block_tables", "full_slot_mapping"):
+            value = getattr(context, name)
+            if value is not None:
+                variables[name] = torch.empty_like(value)
         self._copy_mixed_graph_inputs(variables, input_ids, positions, context)
 
         saved_context = context
@@ -1484,6 +1545,10 @@ class ModelRunner:
             variables["block_tables"], is_mixed=True,
             prefill_block_tables=variables.get("prefill_block_tables"),
             n_prefill_tokens=context.n_prefill_tokens,
+            chunk_starts=variables.get("chunk_starts"),
+            full_block_tables=variables.get("full_block_tables"),
+            full_prefill_block_tables=variables.get("full_prefill_block_tables"),
+            full_slot_mapping=variables.get("full_slot_mapping"),
         )
         try:
             self.model(variables["input_ids"], variables["positions"])
@@ -1560,6 +1625,10 @@ class ModelRunner:
         context_lens = torch.zeros(max_bs, dtype=torch.int32)
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
         chunk_starts = torch.zeros(max_bs, dtype=torch.int32)   # SWA 环 decode
+        full_block_tables = (torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
+                             if self._ring_split else None)
+        full_slot_mapping = (torch.zeros(max_bs, dtype=torch.int32)
+                             if self._ring_split else None)
         outputs = torch.zeros(max_bs, hf_config.hidden_size)
         # 定义需要捕获的batch_size列表，初始时内存池为空
         self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
@@ -1573,7 +1642,11 @@ class ModelRunner:
             set_context(False, slot_mapping=slot_mapping[:bs],
                         context_lens=context_lens[:bs],
                         block_tables=block_tables[:bs],
-                        chunk_starts=chunk_starts[:bs])
+                        chunk_starts=chunk_starts[:bs],
+                        full_block_tables=(full_block_tables[:bs]
+                                           if full_block_tables is not None else None),
+                        full_slot_mapping=(full_slot_mapping[:bs]
+                                           if full_slot_mapping is not None else None))
             # 运行一次作为warmup，分配所需显存并初始化静态缓冲
             outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # warmup
             # CUDA Graph捕获，若已有pool则复用
@@ -1600,5 +1673,7 @@ class ModelRunner:
             context_lens=context_lens,
             block_tables=block_tables,
             chunk_starts=chunk_starts,
+            full_block_tables=full_block_tables,
+            full_slot_mapping=full_slot_mapping,
             outputs=outputs,
         )

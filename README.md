@@ -12,7 +12,7 @@ A from-scratch, vLLM-style inference engine for offline generation and local onl
 * 📖 **Paged KV cache** — block size 256; chained-hash **prefix cache** (partial blocks included) with copy-on-write safety, generation-invalidated lazy Top-W scheduling features, and free-block LRU reclamation; **SWA rolling cache** (`rolling_cache=True`, per-sequence ring eviction to window+B — bounded decode KV, Mistral full-window / Gemma-2 local layers) incl. a split dual-pool mode for Gemma-2's alternating local/global windows.
 * ⚡ **Kernels** — custom Triton attention kernels for **FP8 KV cache** (paged decode + varlen/verify), plus Triton GEMMs for w8a8 / int4 / fp8 / 2:4-sparse weights.
 * 🎛️ **Weight quantization** — `--quantization none|w8a8|int4|awq|fp8|sparse24`: per-group int8 + SmoothQuant; int4 with an adaptive **dual-path router** (int4 kernel for bandwidth-bound small-M GEMMs, dequantized-cuBLAS elsewhere); AWQ per-layer α search; fp8 via hardware `torch._scaled_mm` on prefill; honest accuracy/perf ledger (real-text PPL, run-to-run variance documented).
-* 🤖 **Speculative decoding** — n-gram / Medusa / EAGLE-1; verify uses prefix-reusing varlen prefill. Eligible pure-spec batches use fixed-capacity CUDA Graphs (including FP8 KV); ordinary MHA mixed Prefill/Decode batches use bounded, lazy shape-keyed CUDA Graphs. MLA, rolling/split-cache, and spec-mixed batches fall back to eager. Acceptance preserves the target sampler's distribution.
+* 🤖 **Speculative decoding** — n-gram / Medusa / EAGLE-1; verify uses prefix-reusing varlen prefill. Eligible non-rolling pure-spec batches use fixed-capacity CUDA Graphs (including FP8 KV); ordinary MHA mixed Prefill/Decode batches use bounded, lazy shape-keyed CUDA Graphs, including Mistral rolling and Gemma-2 split-cache inputs. MLA and spec-mixed batches fall back to eager. sparse24 keeps its quantized Triton GEMM but uses eager forward because graph replay has produced mismatches in the engine probe. Acceptance preserves the target sampler's distribution.
 * 🧩 **Model zoo** — registry dispatch by `hf_config.model_type`; streaming layer-wise load + quantize-on-load (7B+ on 16GB).
 * 🌐 **Tensor parallelism** — NCCL + shared-memory command channel, `weight_loader`-based sharding.
 * 🔀 **PD stage separation (experimental)** — separate Prefill and Decode model/KV pools on two GPUs; prompt KV moves through host memory.
@@ -103,8 +103,10 @@ FP8 values are staged as raw `uint8` bytes so the E4M3 bit patterns are preserve
 Weight quantization is independent of the KV cache dtype. The configured `kv_swap_space_gb`
 is a hard buffer budget: if the next sequence will exceed it, the scheduler uses recompute
 preemption instead. KV swap currently requires `tensor_parallel_size=1`; TP>1 continues to
-use recompute preemption. In PD mode, KV swap applies to the Decode pool. Gemma-2's split
-rolling-cache mode still requires `kv_swap=False`.
+use recompute preemption. In PD mode, KV swap applies to the Decode pool. Mistral rolling
+cache snapshots its active ring blocks; Gemma-2 split rolling snapshots both the local ring
+and global full-history pools. FP8 KV is transferred as raw bytes. Weight quantization is
+independent of KV storage dtype.
 Transfers use ordinary CPU memory and are synchronous; this is a memory-pressure fallback,
 not asynchronous layer-wise offload.
 
@@ -285,11 +287,17 @@ Raw per-request data and the shared arrival trace are saved as JSON under `resul
 `--no-prefix-feature-cache`, `--no-recompute-aware-preemption`, `--no-slo-aware-scheduling`, and
 `--no-mixed-cudagraph` for manual single-run comparisons. Mixed graph capture is lazy and
 retains at most four batch shapes by default; `--mixed-cudagraph-max-graphs` changes that
-bound. Batches above 4096 tokens stay eager by default to bound capture memory;
+bound. Rolling and Gemma-2 split batches copy their ring/full-pool tables and slot mappings
+through the graph's static inputs. sparse24 keeps the configuration enabled but uses an
+observable eager fallback because the custom Triton path's graph replay is not currently
+trusted. Batches
+above 4096 tokens stay eager by default to bound capture memory;
 `--mixed-cudagraph-max-tokens` changes that threshold. `LLMEngine.collect_metrics()` reports
 parse/reuse counts and rates, stale-generation reparses, KV-generation mutations, cache
 evictions, deferred-free lifecycle counters, mixed graph captures/replays/fallbacks, and
-per-request prefix-hit tokens.
+decode graph batch shapes/replays/fallbacks, plus per-request prefix-hit tokens. The
+`context_concurrency.py` JSON and CSV also retain decode/mixed graph replay and eager-fallback
+counts for each workload point.
 
 Compare the three admission variants (off / on without cache awareness / on with cache
 awareness) against one shared arrival trace with:
@@ -346,8 +354,36 @@ executed, and several token IDs may arrive in one SSE text chunk. TPOT
 control uses a request-local EWMA with a configurable fallback, so it is a heuristic rather than
 a hard real-time guarantee. Run the
 same-trace scheduling ablation on the target GPU before drawing conclusions.
-KV swap combined with rolling-cache modes is not verified; Gemma-2 split rolling-cache requires
-KV swap to be disabled.
+The current implementation composes FP8 KV, graph-compatible weight quantization, rolling
+cache, KV swap and CUDA Graphs for supported Mistral and Gemma-2 sliding-window models. It does
+not make every Cartesian-product combination valid: rolling cache depends on sliding-window
+semantics, Gemma-2 split rolling disables speculative decoding, and sparse24 stays quantized but
+falls back to eager model execution under CUDA Graphs. These combined paths still need a
+same-trace GPU run on the target card; archived combination reports below are earlier
+measurements and do not validate the new FP8/soft-cap, split-pool swap, or rolling/split graph
+combinations. Use `benchmarks/context_concurrency.py` to exercise a combination, for example:
+
+```bash
+python benchmarks/context_concurrency.py --model ~/huggingface/Mistral-7B-v0.1 \
+  --kv-cache-dtype fp8_e4m3 --quantization int4 --rolling-cache \
+  --context-lengths 4096,8192 --concurrency 1,2,4 --repeats 1
+```
+
+KV swap only runs when decode KV pressure triggers preemption. For a swap-path run, raise
+concurrency or context length until the JSON reports `swaps > 0`; otherwise that run measures
+the enabled policy without exercising a transfer.
+
+KV swap is on by default; `--no-swap-kv` disables it. `--enforce-eager` disables CUDA Graphs,
+and `--no-mixed-cudagraph` disables only the mixed-batch graph family. Gemma-2 split rolling
+supports FP8 KV and both decode/mixed graphs, but still requires speculative decoding off.
+sparse24 falls back to eager even when graph capture is otherwise enabled. These are code paths
+available for measurement, not claims that every combination has been verified on the target GPU.
+
+Combination boundaries: KV swap is active only for TP=1 and otherwise uses recompute; PD mode
+still requires `kv_cache_dtype="auto"` and does not support rolling cache. Mixed graphs cover MHA
+paths up to the configured token cap; MLA and spec-mixed batches stay eager. Mistral rolling with
+n-gram verification also uses eager verification, while its ordinary decode and mixed batches can
+use graphs.
 
 The scheduler policies and admission controller have ablation harnesses, but the performance
 table below predates those changes. It records earlier single-GPU runs and does not establish
@@ -408,7 +444,8 @@ first decode logits only when the baseline and FP8 runs emitted the same first t
 top-1 agreement, top-5 overlap, cosine similarity, and max/mean/RMSE logit error. Held-out
 activation range utilization above 1 means an observed maximum is beyond that layer's E4M3 scale
 limit and will be clamped; it is not an elementwise saturation percentage. Gemma-2's attention
-logit soft-cap is not supported by the current FP8 KV attention path.
+logit soft-cap is implemented in the FP8 paged decode and varlen attention kernels; Gemma-2 FP8
+KV calibration and end-to-end combination performance still need target-GPU verification.
 
 Use the generated calibration file in a throughput run with:
 

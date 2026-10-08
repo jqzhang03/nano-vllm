@@ -72,8 +72,8 @@ def paged_decode_attention_fp8_kernel(
     阶段2b 扩展（滚动缓冲/SWA 环）：chunk_starts[r] = 行首现存逻辑块序号 j0
     （非滚动行为 j0=0，与原语义一致）。滚动行的块表只含窗口内容，第 b 项 =
     逻辑块 j0+b：key_pos = (j0+b)·B + 块内偏移；读块数 = ceil(seqlen/B) − j0。
-    fp8 缓存不变（fp8+环 未实现，见 runner 断言）——本内核同时服务 bf16 环
-    decode（scale=1 + bf16 cache，见 paged_decode_attention_bf16）。
+    本内核同时服务 FP8 KV（含 rolling ring）、bf16 环（scale=1，见
+    paged_decode_attention_bf16）以及带 logit soft-cap 的 Gemma-2 注意力层。
     """
     pid = tl.program_id(0)
     seq_id = pid // kv_heads
@@ -244,7 +244,7 @@ def paged_varlen_attention_fp8_kernel(
     max_blocks, num_heads, kv_heads,
     head_dim: tl.constexpr, num_groups: tl.constexpr, QPAD: tl.constexpr,
     BLOCK_SIZE: tl.constexpr, BLOCK_T: tl.constexpr,
-    WINDOW: tl.constexpr,
+    WINDOW: tl.constexpr, SOFTCAP: tl.constexpr,
 ):
     """Paged varlen attention over an FP8 (E4M3) KV cache（v7，verify步用）。
 
@@ -291,6 +291,8 @@ def paged_varlen_attention_fp8_kernel(
             k_ptrs = k_cache_ptr + base + offs_t[:, None] * (kv_heads * head_dim) + offs_d[None, :]
             k16 = (tl.load(k_ptrs).to(tl.float32) * k_scale).to(tl.float16)  # [T, D]
             s = tl.dot(k16, q16, out_dtype=tl.float32) * softmax_scale       # [T, QPAD]
+            if SOFTCAP > 0:
+                s = SOFTCAP * _TANH(s / SOFTCAP)
             s = tl.where(tok_mask & c_valid[None, :], s, float("-inf"))
             m_new = tl.maximum(m, tl.max(s, axis=0)[None, :])
             alpha = tl.exp(m - m_new)
@@ -310,7 +312,7 @@ def paged_varlen_attention_fp8(q: torch.Tensor, k_cache: torch.Tensor, v_cache: 
                                cu_seqlens_q: torch.Tensor, key_lens: torch.Tensor,
                                block_table: torch.Tensor,
                                k_scale: float, v_scale: float, softmax_scale: float,
-                               window: int = 0) -> torch.Tensor:
+                               window: int = 0, softcap: float = 0.0) -> torch.Tensor:
     """verify步（Q=γ+1≤5的varlen多查询）fp8 paged attention。"""
     total, num_heads, head_dim = q.shape
     n_seqs = cu_seqlens_q.size(0) - 1
@@ -324,7 +326,7 @@ def paged_varlen_attention_fp8(q: torch.Tensor, k_cache: torch.Tensor, v_cache: 
         block_table.shape[1], num_heads, kv_heads,
         head_dim=head_dim, num_groups=num_groups, QPAD=16,
         BLOCK_SIZE=k_cache.shape[1], BLOCK_T=32,
-        WINDOW=window,
+        WINDOW=window, SOFTCAP=softcap,
         num_warps=1,
     )
     return o
@@ -375,11 +377,6 @@ class Attention(nn.Module):
         self.cal_max_v = 0.0
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
-        # logit soft-cap（Gemma-2）依赖 flash-attn 的 softcap 参数（内核内 tanh）——
-        # 自研 fp8 内核无 softcap → 软上限层必须用 fp16 KV
-        assert not (self.use_fp8 and self.logit_softcapping), (
-            "attn logit softcapping (Gemma-2) 不支持 fp8 KV cache "
-            "（自研 fp8 内核无 softcap；请用 kv_cache_dtype=auto）")
         context = get_context()
         k_cache, v_cache = self.k_cache, self.v_cache
         # split（交替窗口）模式：full 池层（global）用 full_* 上下文侧
@@ -462,7 +459,8 @@ class Attention(nn.Module):
                                                        context.cu_seqlens_q, key_lens,
                                                        bt,
                                                        self.k_scale, self.v_scale, self.scale,
-                                                       window=self.window_size or 0)
+                                                       window=self.window_size or 0,
+                                                       softcap=self._flash_softcap)
                         return o
                     # 普通prefill（前缀复用）：反量化成模型dtype再交给flash-attn
                     # （prefill步少，全缓存反量化的代价可接受）
@@ -517,16 +515,21 @@ class Attention(nn.Module):
         - bf16 非滚动：flash-attn kvcache（沿用）。
         """
         k_cache, v_cache = self.k_cache, self.v_cache
+        tables = (context.full_block_tables if self.split_full
+                  else context.block_tables)
         if self.use_fp8:
             # fp8+环（阶段 2b 扩展）：fp8 内核同样从表下标推位置，环表必须传每行
-            # 首块序号 chunk_starts（非滚动行 = None → 内核全 0，语义不变）。
+            # 首块序号 chunk_starts。split full 层使用 full 表，逻辑块从 0 开始，
+            # 不能沿用 local 环层的 kv_j0。
             return paged_decode_attention_fp8(q, k_cache, v_cache,
-                                              context.block_tables,
+                                              tables,
                                               context.context_lens,
                                               self.k_scale, self.v_scale,
                                               self.scale,
                                               window=self.window_size or 0,
-                                              chunk_starts=context.chunk_starts)
+                                              chunk_starts=(context.chunk_starts
+                                                            if self.rolling else None),
+                                              softcap=self._flash_softcap)
         if self.rolling and context.chunk_starts is not None:
             # 环 decode（local 层）：自研 paged 内核 + 行首块序号；Gemma-2
             # split 的 local 层带 attn logit soft-cap → 内核内 cap·tanh
@@ -537,8 +540,6 @@ class Attention(nn.Module):
                 chunk_starts=context.chunk_starts,
                 softcap=self._flash_softcap)
         # split 模式 global 层：full 池普通分页（表项 = 逻辑块，flash 语义成立）
-        tables = (context.full_block_tables if self.split_full
-                  else context.block_tables)
         return flash_attn_with_kvcache(q.unsqueeze(1), k_cache, v_cache,
                                        cache_seqlens=context.context_lens,
                                        block_table=tables,

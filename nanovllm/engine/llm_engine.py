@@ -177,6 +177,14 @@ class LLMEngine:
         for scheduler in ((self.prefill_scheduler, self.decode_scheduler) if self._pd
                           else (self.scheduler,)):
             scheduler.reset_metrics()
+        graph_runners = ([self.prefill_runner, self.decode_runner] if self._pd
+                         else [self.model_runner])
+        for runner in graph_runners:
+            runner.mixed_cudagraph_capture_count = 0
+            runner.mixed_cudagraph_replay_count = 0
+            runner.mixed_cudagraph_eager_fallbacks = 0
+            runner.decode_cudagraph_replay_count = 0
+            runner.decode_cudagraph_eager_fallbacks = 0
 
     def exit(self):
         # 幂等：显式调用与atexit可能都触发，且同一进程可能先后创建多个引擎（如精度对比）
@@ -243,7 +251,7 @@ class LLMEngine:
                 if seq.swapped:
                     buf = scheduler._swap_buffers.pop(seq.seq_id, None)
                     if buf is not None:
-                        scheduler._swap_bytes -= buf.numel() * buf.element_size()
+                        scheduler._swap_bytes -= scheduler.swap_buffer_nbytes(buf)
                     seq.swapped = False
                 if seq.block_table:
                     scheduler.block_manager.deallocate(seq)
@@ -542,7 +550,7 @@ class LLMEngine:
             for old_id, new_id in scheduler.cow_pairs:
                 runner.call("cow_block", old_id, new_id)
             for seq, block_ids, buf, direction in scheduler.swap_pairs:
-                transfer_bytes = buf.numel() * buf.element_size()
+                transfer_bytes = scheduler.swap_buffer_nbytes(buf)
                 transfer_started = perf_counter()
                 if direction == "out":
                     runner.call("swap_out", block_ids, buf)
@@ -585,7 +593,7 @@ class LLMEngine:
         for old_id, new_id in scheduler.cow_pairs:
             self.decode_runner.call("cow_block", old_id, new_id)
         for seq, block_ids, buf, direction in scheduler.swap_pairs:
-            transfer_bytes = buf.numel() * buf.element_size()
+            transfer_bytes = scheduler.swap_buffer_nbytes(buf)
             transfer_started = perf_counter()
             if direction == "out":
                 self.decode_runner.call("swap_out", block_ids, buf)
@@ -688,7 +696,7 @@ class LLMEngine:
         # 换出对在拷贝完成后释放块（finish_swap_out）——块在拷贝前保持占用，
         # 避免本步内被重分配覆盖内容。TP=1 时启用；FP8 在 CPU 端按 uint8 原始字节暂存。
         for seq, block_ids, buf, direction in self.scheduler.swap_pairs:
-            transfer_bytes = buf.numel() * buf.element_size()
+            transfer_bytes = self.scheduler.swap_buffer_nbytes(buf)
             transfer_started = perf_counter()
             if direction == "out":
                 self.model_runner.call("swap_out", block_ids, buf)
@@ -845,6 +853,8 @@ class LLMEngine:
             runner.mixed_cudagraph_capture_count = 0
             runner.mixed_cudagraph_replay_count = 0
             runner.mixed_cudagraph_eager_fallbacks = 0
+            runner.decode_cudagraph_replay_count = 0
+            runner.decode_cudagraph_eager_fallbacks = 0
         self._collect_logits = collect_logits
         self._collect_decode_logits_only = collect_decode_logits_only
         self.collected_logits = []
@@ -907,7 +917,8 @@ class LLMEngine:
           （α = spec_accepted_drafts / spec_draft_tokens）。
         - num_preemptions: 本次generate中的KV cache抢占次数。
         - prefix feature/cache lifecycle: parse/reuse由scheduler统计；generation失效、KV
-          mutation、LRU eviction与deferred-free refs/flush/peak由BlockManager统计。
+          mutation、LRU eviction与deferred-free refs/flush/peak由BlockManager统计；
+          decode/mixed CUDA Graph 分别报告 batch shape、replay 与 eager fallback。
         """
         schedulers = ((self.prefill_scheduler, self.decode_scheduler) if self._pd
                       else (self.scheduler,))
@@ -918,6 +929,9 @@ class LLMEngine:
         slo_steps = sum(s.num_slo_prefill_steps for s in schedulers)
         tpot_steps = sum(s.num_tpot_prefill_steps for s in schedulers)
         graph_runner = self.decode_runner if self._pd else self.model_runner
+        graph_backend_enabled = (
+            not graph_runner.enforce_eager
+            and graph_runner.cudagraph_quantization_supported)
         return {
             "per_request": list(self._req_metrics),
             "step_stats": dict(self._step_stats),
@@ -965,13 +979,23 @@ class LLMEngine:
             "deferred_free_pending_refs": sum(
                 len(manager.deferred_free_block_ids) for manager in block_managers),
             "mixed_cudagraph": {
-                "enabled": self.config.mixed_cudagraph and not self.config.enforce_eager,
+                "enabled": self.config.mixed_cudagraph and graph_backend_enabled,
                 "max_graphs": self.config.mixed_cudagraph_max_graphs,
                 "max_tokens": self.config.mixed_cudagraph_max_tokens,
                 "cached_shapes": len(getattr(graph_runner, "mixed_graphs", {})),
                 "captures": graph_runner.mixed_cudagraph_capture_count,
                 "replays": graph_runner.mixed_cudagraph_replay_count,
                 "eager_fallbacks": graph_runner.mixed_cudagraph_eager_fallbacks,
+                "fallback_reason": graph_runner.cudagraph_disabled_reason,
+            },
+            "decode_cudagraph": {
+                "enabled": graph_backend_enabled and hasattr(graph_runner, "graphs"),
+                "captured_batch_sizes": sorted(getattr(graph_runner, "graphs", {})),
+                "replays": graph_runner.decode_cudagraph_replay_count,
+                "eager_fallbacks": graph_runner.decode_cudagraph_eager_fallbacks,
+                "fallback_reason": (graph_runner.cudagraph_disabled_reason
+                                    or ("enforce_eager" if graph_runner.enforce_eager
+                                        else None)),
             },
             "num_aging_promotions": sum(s.num_aging_promotions for s in schedulers),
             "slo_prefill_steps": slo_steps,

@@ -36,8 +36,9 @@ compares first-decode logits to an auto-KV baseline on held-out prompts. It also
 maximum activation range divided by the E4M3 limit; a ratio over 1 means that maximum is clipped,
 not the percentage of all values that saturate. The default built-in FP8 calibration/eval prompts
 are repeated to 1024 tokens; user corpora keep their original lengths unless the context-length
-options are set. Gemma-2 logit-softcap attention is incompatible with FP8 KV. Both scripts support
-built-in example text when corpus paths are omitted.
+options are set. Gemma-2 logit-softcap is implemented in the FP8 paged decode and varlen kernels;
+the calibration script accepts Gemma-2, though target-GPU precision and performance still need
+verification. Both scripts support built-in example text when corpus paths are omitted.
 
 `example.py` / `bench.py` hardcode the model path `~/huggingface/Qwen3-0.6B/`; download it with:
 
@@ -79,9 +80,9 @@ This repo is developed on Windows + WSL2 (Ubuntu), conda env `nanovllm`, Python 
   内核表达，见 INTERVIEW.md §4.2/§8 阶段 2）。fp8 内核 WINDOW>0 时
   m 从 0 起步（否则全掩块 `exp(-inf-(-inf))=NaN`；softmax 平移不变，数学等价）。
 - **attn logit soft-cap（Gemma-2）**：`Attention(logit_softcapping=cap)` 走 flash 原生
-  `softcap=cap` 参数（内核内 cap·tanh(logits/cap)，probe 验证与 torch 参考精确一致）；
-  softcap 层禁用 fp8 KV（自研内核无 softcap，forward 断言）。final logit soft-cap 在模型
-  `compute_logits` 里（logits = cap·tanh(logits/cap)）。
+  `softcap=cap` 参数；FP8 paged decode/varlen 内核也在 softmax 前计算
+  `cap·tanh(logits/cap)`。Gemma-2 softcap 层可使用 FP8 KV，组合精度与性能仍待目标卡验证。
+  final logit soft-cap 在模型 `compute_logits` 里（logits = cap·tanh(logits/cap)）。
 - **RMSNorm weight_offset（Gemma-2）**：`RMSNorm(..., weight_offset=True)` 输出 = norm(x)×(1+w)
   （HF Gemma2RMSNorm 同款；权重 init 0、checkpoint 存偏移量）——用标准 ×weight 会差 (1+w)/w 倍。
 - **KV cache quantization**: `kv_cache_dtype="fp8_e4m3"` stores K/V as FP8(E4M3) (1 byte/elem, near 2× capacity) with per-layer static scales. `kv_calibration_path` loads token-ID prompts made by `benchmarks/kv_fp8_calibrate.py`; an empty path keeps deterministic random-token calibration. The calibration script scans scale margins and compares first-decode logits on held-out prompts. `benchmarks/context_concurrency.py` measures live MHA/MLA cache bytes, bytes/token, block/token capacity, and full-context request capacity alongside TTFT/TPOT/E2E and throughput. Decode/verify read the cache with the custom fp8 Triton attention kernels (`paged_decode_attention_fp8` / `paged_varlen_attention_fp8`) that load fp8 directly and dequantize in-register via hardware cvt.
@@ -101,7 +102,7 @@ This repo is developed on Windows + WSL2 (Ubuntu), conda env `nanovllm`, Python 
 - **Partial blocks are cached and shared too, with copy-on-write safety**: `hash_blocks` publishes the last partial block's hash (ceiling `end`); `can_allocate` checks it; before a writer (decode append or a prefill tail crossing into a shared block) touches a shared block, `BlockManager.cow_block(seq, write_start)` swaps in a fresh block and records `(old, new)` in `Scheduler.cow_pairs`, which `LLMEngine.step()` executes on GPU via `ModelRunner.cow_block` (`kv_cache[:, :, new] = kv_cache[:, :, old]`) **before** `run()`. Stale hash entries are deleted with a guard (`hash_to_block_id.get(old_hash) == block_id`) — unguarded deletion hits KeyError when two identical-content blocks (e.g. a COW copy) share a hash. `allocate`/`can_append`/`can_allocate` reserve free blocks for COW; `num_cached_tokens` counts the actual cached tokens (`(n-1)*block_size + len(last_block.token_ids)`), and the scheduler derives `num_tokens` from it (never `num_cached_blocks * block_size`, which breaks on partial blocks).
 - `Sequence.num_cached_tokens` tracks how many tokens are already resident in the cache. During prefill, if the key span exceeds the query span (prefix reused), `prepare_prefill` builds `block_tables` and `Attention` uses the cache tensors directly as K/V.
 - Prefill is chunked when a sequence exceeds the remaining `max_num_batched_tokens`; **only the first scheduled sequence may be split** (see the guard in `Scheduler.schedule`).
-- **KV swap 抢占（`kv_swap=True` 默认，TP=1（支持 auto 与 fp8 KV））**：KV 块不足时 `preempt` 按 `recompute_aware_preemption` 的估算成本选择 swap 或 recompute（关闭该策略时以 swap-first 为默认）——KV 拷到 CPU（非 pinned，WSL2 下 pinned 的 D2H 拷贝会崩 VM）、释放 GPU 块、进独立 `swapped` 队列（避免被 prefill 误调度）；`schedule()` 开头 `_try_swap_in` 在 free 块足够时换回（`allocate_private` 分配私有块 + `index_copy_` 拷回，bit-exact，直接 decode 免重新 prefill）。CPU 缓冲空间受 `kv_swap_space_gb`（默认 2GB）约束，超限回落 recompute。**坑**：①`kv_cache[:, :, block_ids]`（list 高级索引）返回临时副本，swap_in 用它 `.copy_` 会静默写垃圾 KV——必须 `index_copy_` 原位写；②swap_out 块在拷贝前必须保持占用（否则本步被重分配覆盖）；③decode 序列 `cached == len-1`（最后 token 的 KV 本步才写）——can_swap 用 `not is_prefill` 判断，`allocate_private` 只分配 cached 块的个数（待写块由 `may_append` 分配，避免双重分配）。**诚实性能**：0.6B + WSL2 上 swap 比 recompute 慢（96×512 压力下 27.8s vs 11.8s——WSL2 虚拟化 D2H 慢 + 0.6B 重算便宜 + 预算边界换入换出震荡）；swap 的价值在 7B+（重算贵）+ 真实 Linux（D2H 快）。
+- **KV swap 抢占（`kv_swap=True` 默认，TP=1（支持 auto 与 FP8 KV））**：KV 块不足时 `preempt` 按 `recompute_aware_preemption` 的估算成本选择 swap 或 recompute（关闭该策略时以 swap-first 为默认）——KV 拷到普通 CPU 内存、释放 GPU 块、进独立 `swapped` 队列（避免被 prefill 误调度）；`schedule()` 开头 `_try_swap_in` 在 free 块足够时换回（`allocate_private` 分配私有块 + 原位 `index_copy_` 拷回，bit-exact，直接 decode 免重新 prefill）。预算受 `kv_swap_space_gb` 约束；split rolling 同时保存 local ring 与 global full-history 两池。CPU 缓冲超限时回落 recompute。**坑**：①`kv_cache[:, :, block_ids]`（list 高级索引）返回临时副本，swap_in 必须用 `index_copy_` 原位写；②swap_out 块在拷贝前必须保持占用（否则本步被重分配覆盖）；③decode 序列 `cached == len-1`（最后 token 的 KV 本步才写）——`allocate_private` 只分配 cached 块的个数，待写块由 `may_append` 分配，避免双重分配。**诚实性能**：旧 0.6B + WSL2 测量中 swap 慢于 recompute（96×512 压力下 27.8s vs 11.8s）；这不是新 rolling/split 组合的性能结论。
 
 ### Scheduler
 
@@ -115,7 +116,7 @@ Online scheduling policies are independently configurable: Top-W admission lazil
 
 ### CUDA-graph decode path
 
-`capture_cudagraph` captures decode forward passes for batch sizes `[1,2,4,8] + range(16, ≤512, 16)` sharing one memory pool. The decode `run_model` path selects the smallest captured size ≥ the live batch, copies inputs into static `graph_vars` tensors, replays, and slices `outputs[:bs]`. Ordinary non-MLA/non-rolling MHA mixed batches use lazy CUDA Graph capture keyed by exact tensor shapes and capture-time scalar bounds; dynamic cu_seqlens, slots, tables, IDs, and positions are copied into static buffers before replay. The mixed graph family shares a separate pool because replays are serialized, retains at most `mixed_cudagraph_max_graphs` shapes (default 4), and captures only batches up to `mixed_cudagraph_max_tokens` (default 4096) to bound memory. `--no-mixed-cudagraph` is the benchmark ablation. MLA, rolling/split, oversized, and spec-mixed batches remain eager. Pure-spec verification has a separate fixed-capacity graph family (non-MLA, non-rolling, supported row/stride); FP8 KV is supported there. Note `enforce_eager` controls CUDA-graph capture, not torch.compile below.
+`capture_cudagraph` captures decode forward passes for batch sizes `[1,2,4,8] + range(16, ≤512, 16)` sharing one memory pool. The decode `run_model` path selects the smallest captured size ≥ the live batch, copies inputs into static `graph_vars` tensors, including `chunk_starts` and the split full-pool tables/slots, replays, and slices `outputs[:bs]`. MHA mixed batches (including Mistral rolling and Gemma-2 split) use lazy CUDA Graph capture keyed by exact tensor shapes and capture-time scalar bounds; dynamic cu_seqlens, slots, ring/full tables, IDs, and positions are copied into static buffers before replay. The mixed graph family shares a separate pool because replays are serialized, retains at most `mixed_cudagraph_max_graphs` shapes (default 4), and captures only batches up to `mixed_cudagraph_max_tokens` (default 4096) to bound memory. `--no-mixed-cudagraph` is the benchmark ablation. MLA, oversized, and spec-mixed batches remain eager. sparse24 remains enabled but its forward falls back to eager because custom Triton graph replay has produced mismatches in an engine probe. Pure-spec verification has a separate fixed-capacity graph family (non-MLA, non-rolling, supported row/stride); FP8 KV is supported there. Note `enforce_eager` disables graph capture/replay, not `torch.compile` below.
 
 ### Tensor parallelism
 

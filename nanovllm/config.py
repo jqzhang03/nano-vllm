@@ -25,7 +25,7 @@ class Config:
     kv_cache_dtype: str = "auto" # KV缓存数据类型："auto"（模型dtype，默认）或 "fp8_e4m3"（FP8 E4M3量化，容量翻倍，decode用自研Triton内核）
     kv_calibration_path: str = "" # FP8 KV校准token IDs JSON；为空时使用内置随机token校准
     kv_fp8_scale_margin: float = 1.1 # 校准最大值对应E4M3量化上限的安全因子；<1会主动裁剪
-    kv_swap: bool = True # KV swap 抢占：KV块不足时把序列的KV拷到CPU内存并释放GPU块，恢复时直接换回（bit-exact，免重新prefill）。支持TP=1的auto/fp8 KV；TP>1仍回退recompute
+    kv_swap: bool = True # KV swap 抢占：KV块不足时把序列的KV拷到CPU内存并释放GPU块，恢复时直接换回（bit-exact，免重新prefill）。支持TP=1的MHA/MLA与auto/fp8 KV；TP>1仍回退recompute
     kv_swap_space_gb: float = 2.0 # KV swap 的 CPU 缓冲空间上限（GB，vLLM swap_space 同款）。换出缓冲累计超限时回落 recompute 抢占，防止 CPU RAM 耗尽（本机 WSL 内存有限，0.6B 单 KV 块 28MB）
     latency_aware_scheduling: bool = True # 混合批次为等待prefill预留预算，并在候选窗口内优先预计prefill较短的请求
     cache_affinity_admission: bool = True # Top-W准入：优先复用更多前缀KV的请求
@@ -50,10 +50,10 @@ class Config:
     recompute_aware_preemption: bool = True # 按估算swap往返成本与cache-aware recompute成本选择抢占方式
     preempt_prefill_tokens_per_second: float = 10000.0 # 尚无在线样本时的recompute估算回退值
     preempt_kv_transfer_gbps: float = 12.0 # 尚无在线样本时的KV swap带宽估算回退值
-    rolling_cache: bool = False # SWA 滚动缓冲（阶段 2b）：解码期每序列 KV 只保留窗口内容（块数 ≤ 窗口/块大小 + 2），旧块到期自动释放——长生成序列的 KV 内存有界。支持：mistral（全层统一窗口，bf16/fp8 KV，可加 ngram 投机）；gemma2（**交替 local/global**，阶段 2b 扩展 split 模式：local 层走环池、global 层走独立 full 池普通分页永不驱逐，仅 bf16 KV、无投机、eager decode）。滚动模型不参与前缀缓存发布/消费（窗口内容过期，重复 prompt 有代价，见 block_manager.py 头注）；环语义需自研 paged 内核（flash-attn 无法表达环表位置偏移，vLLM 传统实现也只掩码不滚动）
+    rolling_cache: bool = False # SWA 滚动缓冲：Mistral 使用统一环池；Gemma-2 交替 local/global 层使用环池+full 双池。两者支持 auto/fp8_e4m3 KV、权重量化、KV swap 和 decode/mixed CUDA Graph；sparse24 权重量化保留但 CUDA Graph 自动回退 eager。rolling+Medusa/EAGLE 与 Gemma-2 split+speculative 暂不支持。滚动模型不参与前缀缓存发布/消费（窗口内容过期，重复 prompt 有代价，见 block_manager.py 头注）；仅对具有 sliding-window 语义的 Mistral/Gemma-2 生效。
     num_ring_kvcache_blocks: int = 0  # split 模式：环池块数（runner 分配后写回，scheduler 建 BM 用）
     num_full_kvcache_blocks: int = 0  # split 模式：full 池块数（同上）
-    quantization: str = "none" # 权重量化："none" | "w8a8"（per-channel int8权重+per-token int8激活，Triton int8 GEMM）| "int4"（per-group int4权重，Triton反量化GEMM）| "awq"（int4 + AWQ激活感知缩放）| "sparse24"（2:4结构化剪枝+cuSPARSELt半结构化matmul）| "fp8"（e4m3全量化：per-column权重+per-token激活；decode走Triton内核、prefill走硬件FP8 MMA _scaled_mm）
+    quantization: str = "none" # 权重量化："none" | "w8a8"（per-channel int8权重+per-token int8激活，Triton int8 GEMM）| "int4"（per-group int4权重，Triton反量化GEMM）| "awq"（int4 + AWQ激活感知缩放）| "sparse24"（2:4结构化剪枝+自研Triton稀疏GEMM）| "fp8"（e4m3全量化：per-column权重+per-token激活；decode走Triton内核、prefill走硬件FP8 MMA _scaled_mm）
     awq_scales_path: str = "" # AWQ激活感知缩放文件（.pt，benchmarks/awq_calibrate.py真实文本校准产出）；为空时用随机token内联校准
     quantize_lm_head: bool = False # 是否量化LM head（默认不量化——与w8a8一致：logits由lm_head点积直接决定，量化它精度损失最大，见INTERVIEW.md §10.3.6）
     int4_dense_path: bool = True # int4双路径模式（默认开）：大M prefill/decode 与小N层走 w_deq 稠密反量化（cuBLAS，收掉大M亏损与TTFT回归），小M大N层走int4内核；代价是显存 1.73GB（比fp16的1.50还大）。False=纯int4（0.85GB，大batch慢），见INTERVIEW.md §10.3.6。streaming 模式下自动强制 False（w_deq 全尺寸副本与按层加载目的冲突；MLA kv_b 例外保留反量化副本）

@@ -420,8 +420,6 @@ def main() -> None:
     eval_prompts = extend_prompts(eval_prompts, eval_context_length)
 
     hf = AutoConfig.from_pretrained(args.model)
-    if hf.model_type == "gemma2":
-        raise SystemExit("Gemma-2 logit-softcap attention is not compatible with FP8 KV")
     max_position = int(getattr(hf, "max_position_embeddings", 4096))
     longest_eval = max(len(prompt) for prompt in eval_prompts)
     longest_calibration = max(len(prompt) for prompt in calibration_prompts)

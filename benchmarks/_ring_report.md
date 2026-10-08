@@ -1,6 +1,6 @@
 # 阶段 2b：SWA 滚动缓冲（滚动缓存）报告
 
-> **阶段快照说明（2026-10-05）**：这是 rolling-cache 初版记录。后续 [`_stage2b_ext_report.md`](_stage2b_ext_report.md) 已扩展 Mistral rolling 到 FP8 KV 和 n-gram verify，并加入 Gemma-2 split 双池。当前仍不支持 rolling+Medusa/EAGLE；Mistral rolling decode 可用 CUDA Graph，rolling verify 使用 eager；Gemma-2 split decode 仍 eager，且要求 `kv_cache_dtype="auto"`、关闭 speculative 与 KV swap。
+> **阶段快照说明（2026-10-05）**：这是 rolling-cache 初版记录，下面的限制描述当时的 checkout。后续 [`_stage2b_ext_report.md`](_stage2b_ext_report.md) 扩展了 Mistral rolling 的 FP8 KV 和 n-gram verify，并加入 Gemma-2 split 双池。2026-10-08 的代码又接通 Gemma-2 soft-cap + FP8 KV、rolling/split KV swap 与 decode/mixed CUDA Graph；这些新增组合尚无目标 GPU 验证。rolling+Medusa/EAGLE 仍不支持；Mistral rolling verify 走 eager；Gemma-2 split 仍要求关闭 speculative。
 
 ## 1. 动机与机制
 
