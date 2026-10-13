@@ -54,6 +54,7 @@ class ParallelLMHead(WeightQuantMixin, VocabParallelEmbedding):
         assert not bias
         super().__init__(num_embeddings, embedding_dim)
         self.int4 = False  # w_int4/w_int4_scale/awq_scale缓冲由quantize_int4创建
+        self.nvfp4 = False  # w_nvfp4/E4M3 block scales由quantize_nvfp4创建
         self.sparse24 = False  # w_sparse由quantize_sparse24创建
         self.fp8 = False  # w_fp8/w_fp8_scale缓冲由quantize_fp8创建
 
@@ -80,6 +81,8 @@ class ParallelLMHead(WeightQuantMixin, VocabParallelEmbedding):
             logits = self._sparse24_forward(x)
         elif self.int4:
             logits = self._int4_forward(x)
+        elif self.nvfp4:
+            logits = self._nvfp4_forward(x)
         else:
             logits = F.linear(x, self.weight)
         if self.tp_size > 1:

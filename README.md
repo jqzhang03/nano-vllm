@@ -10,8 +10,8 @@ A from-scratch, vLLM-style inference engine for offline generation and local onl
 
 * 🚀 **Scheduler** — vLLM-V1-style mixed batches (prefill rows + decode rows sharing one token budget), chunked prefill, bounded multi-step pure decode, TTFT/TPOT-target-aware quotas, spec batches, and KV-swap preemption (bit-exact CPU swap for decode sequences, including FP8 KV byte-preserving offload).
 * 📖 **Paged KV cache** — block size 256; chained-hash **prefix cache** (partial blocks included) with copy-on-write safety, generation-invalidated lazy Top-W scheduling features, and free-block LRU reclamation; **SWA rolling cache** (`rolling_cache=True`, per-sequence ring eviction to window+B — bounded decode KV, Mistral full-window / Gemma-2 local layers) incl. a split dual-pool mode for Gemma-2's alternating local/global windows.
-* ⚡ **Kernels** — custom Triton attention kernels for **FP8 KV cache** (paged decode + varlen/verify), plus Triton GEMMs for w8a8 / int4 / fp8 / 2:4-sparse weights.
-* 🎛️ **Weight quantization** — `--quantization none|w8a8|int4|awq|fp8|sparse24`: per-group int8 + SmoothQuant; int4 with an adaptive **dual-path router** (int4 kernel for bandwidth-bound small-M GEMMs, dequantized-cuBLAS elsewhere); AWQ per-layer α search; fp8 via hardware `torch._scaled_mm` on prefill; honest accuracy/perf ledger (real-text PPL, run-to-run variance documented).
+* ⚡ **Kernels** — custom Triton attention kernels for **FP8 KV cache** (paged decode + varlen/verify), Triton GEMMs for w8a8 / int4 / NVFP4 software / fp8 / 2:4-sparse weights, and a cuBLASLt NVFP4 native MMA backend.
+* 🎛️ **Weight quantization** — `--quantization none|w8a8|int4|nvfp4|awq|fp8|sparse24`: per-group int8 + SmoothQuant; int4 with an adaptive **dual-path router**; NVFP4 E2M1/E4M3 block scaling with a Triton software path or native cuBLASLt FP4 MMA on Blackwell; AWQ per-layer α search; fp8 via hardware `torch._scaled_mm` on prefill.
 * 🤖 **Speculative decoding** — n-gram / Medusa / EAGLE-1; verify uses prefix-reusing varlen prefill. Eligible non-rolling pure-spec batches use fixed-capacity CUDA Graphs (including FP8 KV); ordinary MHA mixed Prefill/Decode batches use bounded, lazy shape-keyed CUDA Graphs, including Mistral rolling and Gemma-2 split-cache inputs. MLA and spec-mixed batches fall back to eager. sparse24 keeps its quantized Triton GEMM but uses eager forward because graph replay has produced mismatches in the engine probe. Acceptance preserves the target sampler's distribution.
 * 🧩 **Model zoo** — registry dispatch by `hf_config.model_type`; streaming layer-wise load + quantize-on-load (7B+ on 16GB).
 * 🌐 **Tensor parallelism** — NCCL + shared-memory command channel, `weight_loader`-based sharding.
@@ -64,10 +64,207 @@ outputs = llm.generate(prompts, sampling_params)
 outputs[0]["text"]
 ```
 
-Feature flags (all live on `LLM(...)`): `quantization="int4|awq|fp8|w8a8|sparse24"`,
+Feature flags (all live on `LLM(...)`): `quantization="int4|nvfp4|awq|fp8|w8a8|sparse24"`,
+`nvfp4_backend="software|cublaslt"`,
 `kv_cache_dtype="fp8_e4m3"`, `speculative="ngram|medusa|eagle"`, `rolling_cache=True`,
 `kv_swap=True` (default), and `execution_mode="auto|mixed|pd"`. `example.py` is an end-to-end demo; `benchmarks/bench.py` produces
 the full TTFT/TPOT/E2E/p50/p99/SLO report and a JSON artifact under `results/`.
+For pure INT4 MoE experts, `moe_int4_backend="loop|segment"` selects the per-expert or
+segmented GEMM path; `moe_int4_fuse_gate_up` controls gate/up launch fusion on the segmented
+path.
+
+The 2026-10-12 DeepSeek-V2-Lite fixed-shape diagnostic matched split/fused token outputs
+in every random and greedy correctness case and found bitwise-equal sentinel logits and MoE
+values across all 26 MoE layers. Across 54 paired performance runs, fused output throughput
+had a +3.52% median delta (38 wins, 16 losses; -10.05% to +21.60%). The range crosses zero,
+so a stable gain is not established. This all-at-once batch with report-only SLO targets does
+not establish online serving goodput; keep fusion experimental. See
+[`INTERVIEW.md` §10.3.17](INTERVIEW.md) and
+[`benchmarks/_moe_report.md`](benchmarks/_moe_report.md).
+
+A later online diagnostic replayed five paired arrival traces and found one recurring
+request-23/token-48 mismatch. The layer-1 query input was identical, but its logical KV
+state differed in the failing pair. Replaying either frozen state under both observed
+24-row orders produced bitwise-identical outputs, so the current batch row permutation
+does not explain the mismatch. The earlier KV difference remains under investigation;
+fusion stays experimental. See [`INTERVIEW.md` §10.3.18](INTERVIEW.md),
+[`benchmarks/_moe_report.md`](benchmarks/_moe_report.md), and
+[`benchmarks/moe_int4_arrival_diag.py`](benchmarks/moe_int4_arrival_diag.py).
+
+### NVFP4 weight experiments
+
+`quantization="nvfp4"` packs E2M1 values two per byte, stores one E4M3 scale per
+16 K values, and keeps one FP32 scale per weight matrix. `nvfp4_backend="software"`
+is the default Triton path: it dequantizes weights in-register and computes BF16 dot
+products. Set `nvfp4_backend="cublaslt"` (or benchmark option
+`--nvfp4-backend cublaslt`) to dynamically quantize BF16 activations and call
+cuBLASLt's block-scaled native FP4 MMA. The native path requires Blackwell (SM100+)
+and cuBLASLt 12.8 or newer; it was exercised on an RTX 5060 Ti (SM120), PyTorch
+2.8/CUDA 12.8. Weight scales are stored once in cuBLASLt's swizzled layout. Empty
+MoE expert batches return without a GEMM. The full-model measurement below used
+TP=1 and eager execution; CUDA Graph capture and TP>1 remain unverified.
+
+DeepSeek-V2-Lite INT4 runs must set group size 64 because its 10,944-wide projections
+are not divisible by 128. For paired continuous-arrival comparisons, keep the trace,
+seed, scheduler, and SLO flags identical. Set both aggregate and per-request TTFT
+targets so joint SLO goodput uses the intended deadline:
+
+```bash
+python benchmarks/scheduling_ablation.py --model ~/huggingface/DeepSeek-V2-Lite \
+  --variants all_on --num-seqs 8 --min-input-len 64 --max-input-len 64 \
+  --min-output-len 16 --max-output-len 16 --arrival-mode constant --arrival-rate 1 \
+  --slo-ttft-ms 5000 --min-request-ttft-slo-ms 5000 --max-request-ttft-slo-ms 5000 \
+  --slo-tpot-ms 1500 --max-model-len 512 --gpu-memory-utilization 0.9 \
+  --streaming-load --enforce-eager --no-swap-kv --warmup-seqs 2 \
+  --quantization int4 --int4-group-size 64 --seed 7 \
+  --output results/v2lite_int4_nvfp4_trace_int4.json
+python benchmarks/scheduling_ablation.py --model ~/huggingface/DeepSeek-V2-Lite \
+  --variants all_on --num-seqs 8 --min-input-len 64 --max-input-len 64 \
+  --min-output-len 16 --max-output-len 16 --arrival-mode constant --arrival-rate 1 \
+  --slo-ttft-ms 5000 --min-request-ttft-slo-ms 5000 --max-request-ttft-slo-ms 5000 \
+  --slo-tpot-ms 1500 --max-model-len 512 --gpu-memory-utilization 0.9 \
+  --streaming-load --enforce-eager --no-swap-kv --warmup-seqs 2 \
+  --quantization nvfp4 --nvfp4-backend software --int4-group-size 64 --seed 7 \
+  --output results/v2lite_int4_nvfp4_trace_nvfp4.json
+python benchmarks/compare_quantization.py \
+  results/v2lite_int4_nvfp4_trace_int4.json \
+  results/v2lite_int4_nvfp4_trace_nvfp4.json --variant all_on \
+  --output results/v2lite_int4_nvfp4_trace_comparison.json
+python benchmarks/scheduling_ablation.py --model ~/huggingface/DeepSeek-V2-Lite \
+  --variants all_on --num-seqs 8 --min-input-len 64 --max-input-len 64 \
+  --min-output-len 16 --max-output-len 16 --arrival-mode constant --arrival-rate 1 \
+  --slo-ttft-ms 5000 --min-request-ttft-slo-ms 5000 --max-request-ttft-slo-ms 5000 \
+  --slo-tpot-ms 1500 --max-model-len 512 --gpu-memory-utilization 0.9 \
+  --streaming-load --enforce-eager --no-swap-kv --warmup-seqs 2 \
+  --quantization nvfp4 --nvfp4-backend software --int4-group-size 64 --seed 7 \
+  --output results/v2lite_nvfp4_software_trace.json
+python benchmarks/scheduling_ablation.py --model ~/huggingface/DeepSeek-V2-Lite \
+  --variants all_on --num-seqs 8 --min-input-len 64 --max-input-len 64 \
+  --min-output-len 16 --max-output-len 16 --arrival-mode constant --arrival-rate 1 \
+  --slo-ttft-ms 5000 --min-request-ttft-slo-ms 5000 --max-request-ttft-slo-ms 5000 \
+  --slo-tpot-ms 1500 --max-model-len 512 --gpu-memory-utilization 0.9 \
+  --streaming-load --enforce-eager --no-swap-kv --warmup-seqs 2 \
+  --quantization nvfp4 --nvfp4-backend cublaslt --int4-group-size 64 --seed 7 \
+  --output results/v2lite_nvfp4_cublaslt_ranked_trace.json
+python benchmarks/compare_quantization.py \
+  results/v2lite_nvfp4_software_trace.json results/v2lite_nvfp4_cublaslt_ranked_trace.json \
+  --variant all_on --output results/v2lite_nvfp4_software_vs_cublaslt_ranked_comparison.json
+```
+
+The paired report rejects different workload fingerprints or scheduler settings
+and reports joint TTFT/TPOT SLO goodput, throughput, TTFT, TPOT, and E2E latency.
+An earlier 2026-10-09 full streamed DeepSeek-V2-Lite run on an RTX 5060 Ti 16 GB
+(PyTorch 2.8/CUDA 12.8, Triton 3.4; eight synthetic requests) used INT4's pure
+packed group64 path (streaming disables its dense dual path; both modes retain the
+small MLA `kv_b` float view) and the software NVFP4 backend. INT4 measured 4.51
+output tok/s with 8/8 requests meeting both SLOs. Software NVFP4 measured 3.86 tok/s
+and 3/8 joint-SLO requests; joint-SLO output goodput fell from 4.51 to 1.45 tok/s.
+TTFT p50/p99 changed from 2.19/2.74 s to 2.80/4.59 s, and TPOT p50/p99 from
+1.29/1.32 s to 1.57/1.61 s. These earlier results are preserved in
+`results/v2lite_int4_nvfp4_trace_*`.
+
+A later paired run used the same current code, seed, 8-request constant-arrival
+trace, and SLO settings across INT4, software NVFP4, and native cuBLASLt NVFP4.
+With the heuristic-ranked cuBLASLt algorithm, throughput / joint-SLO output goodput
+were 4.42 / 4.42 tok/s for INT4, 4.46 / 3.90 tok/s for software NVFP4, and
+4.41 / 4.41 tok/s for cuBLASLt NVFP4. Native completed 8/8 requests within both
+SLOs, versus 7/8 for software NVFP4 and 8/8 for INT4. Native throughput and joint
+goodput were within 1% of INT4 and native goodput was 13% higher than software
+NVFP4. Native TTFT p50/p99 were 2.98/3.98 s, still slower than INT4's 2.01/2.42 s;
+TPOT p50/p99 were 1.33/1.40 s. The initial cuBLASLt run selected the smallest
+workspace algorithm and measured 4.21 tok/s / 1.58 tok/s goodput; choosing the
+heuristic-ranked candidate on the same trace raised goodput to 4.41 tok/s. These
+8-request results are directional, not a stable performance estimate. The full-model
+run exercised native calls on real model shapes, while `tests/test_nvfp4.py` checks
+GEMM values against a dequantized reference; native-backend full-model logit drift
+has not been measured.
+
+A four-case, same-input logits smoke check on the 4-layer real-weight slice using
+the software NVFP4 backend found lower NVFP4 mean absolute logit drift than INT4 (0.231 vs 0.349), but higher KL
+(0.054 vs 0.029) and lower top-1 agreement (75% vs 100%). This small sample does not
+establish model-quality superiority; see `results/v2lite_4l_quant_accuracy.json`.
+Native activation-quantization accuracy also remains unmeasured. The INT4 MoE segmented
+path and gate/up fusion have now been checked across real MoE layers and paired serving
+traces below. Results depend on the workload and do not establish a stable service-level
+fusion gain. These measurements apply only to this GPU and model.
+
+### Segmented INT4 MoE expert GEMM
+
+`moe_int4_backend="segment"` sorts routed rows by expert, then uses per-expert offsets
+and counts to run packed INT4 GEMMs without padding expert batches. Pointer tables refer
+to the existing expert weight buffers, so the path does not duplicate the quantized
+weights. `moe_int4_fuse_gate_up=True` computes both projections with one Triton launch;
+set it to `False` to compare separate gate and up launches. The default backend remains
+`loop`. Segmentation currently requires TP=1, BF16/FP16 activations, pure INT4 expert
+weights with a common supported group size, and no AWQ scaling or dequantized `w_deq`
+copy. Unsupported combinations retain the existing automatic grouped or per-expert path.
+CUDA Graph capture is unverified.
+
+The `benchmarks/moe_int4_ablation.py` profile separates routing, dispatch/sort/gather,
+gate/up GEMMs, SiLU multiply, down GEMM, and weighted scatter. On DeepSeek-V2-Lite
+(H=2048, I=1408, E=64, top-k=6; RTX 5060 Ti / WSL2), the first real-weight MoE layer
+matched the loop output bitwise for five input seeds and 1, 8, 32, and 128 input tokens.
+A wider fixed-input check covered all 26 MoE layers, three seeds, and batch sizes 1, 8,
+and 32: split and fused outputs matched the loop bitwise in all 234 layer cases.
+
+The earlier two full-model runs on one 8-request trace measured fused gate/up 3.3–19.3%
+faster than split; those are preliminary observations. The expanded paired sweep used
+three seeds, 4/8 requests per second, 16/64 output tokens, and two repetitions per
+condition (24 paired runs, 8 requests each). Every run met the 10 s TTFT / 600 ms TPOT
+targets, so joint-SLO output goodput tracked total output throughput. Fused throughput
+had a -2.4% median delta versus split, winning 7/24 pairs and losing 17/24. Per-load
+median deltas were -5.1% (4 req/s, 16 tokens), +2.2% (4 req/s, 64 tokens), -4.0%
+(8 req/s, 16 tokens), and -2.7% (8 req/s, 64 tokens). This workload does not show a
+reliable service-level fusion gain; keep the split option available and treat fusion as
+an experimental choice. Continuous-arrival generated-token parity was 22/24. For the two
+mismatched pairs, a repeated run of the same backend also changed its output fingerprint,
+while fixed-input MoE layer parity remained exact; the sequence differences therefore
+cannot be attributed to fusion alone.
+
+An additional stress sweep used 16 requests arriving at 16 req/s, 64 output tokens,
+three seeds, two repeats, and a 150 ms TPOT target (six paired measurements). Fused
+throughput had a +5.4% median delta versus split, with five wins and one loss; the range
+was -20.3% to +31.9%. Both backends met joint SLO for all 16 requests in every run, and
+generated tokens matched in five of six pairs. Same-backend repeats also changed output
+fingerprints in three of six repeat comparisons. Since every run passed SLO, the tests
+have not located the joint-goodput knee; this positive median is not enough to claim a
+stable fusion benefit. See `INTERVIEW.md` §10.3.16.
+
+A follow-up sweep on 2026-10-11 used 24 requests per condition, three seeds, and three
+repeats per seed (nine paired traces per cell), with 16/24/32 req/s arrival rates and
+150/125/100 ms TPOT targets. At 150 ms, 64- and 128-token outputs all met joint SLO through
+32 req/s. At 125 ms, 128-token outputs still passed every request, while 64-token split
+reached 88.9% at 32 req/s. At 100 ms, joint-SLO attainment fell to 40.7–63.0% for 64-token
+outputs and 29.2–66.2% for 128-token outputs. For the 128-token/100 ms cases, fused passed
+143/216 vs split 63/216 at 24 req/s and 141/216 vs 72/216 at 32 req/s; this is a promising
+load-specific signal, but per-run results remain noisy. Across the 54 pairs at 100 ms, fused
+throughput had a +3.5% median delta with a -20.3% to +28.4% range, and outputs matched in
+42/54 pairs. Keep fusion experimental pending more repeats around this boundary; full results
+are in `results/moe_int4_fuse_load150_20261011.json`,
+`results/moe_int4_fuse_load125_20261011.json`, and
+`results/moe_int4_fuse_load100_long_20261011.json`.
+
+A finer 2026-10-11 sweep measured 105/110/115/120 ms TPOT at 24/32 req/s with 64/128 output tokens, three seeds, and five paired repetitions per cell (240 pairs). For 128-token output, fused throughput had a +2.24% median delta (70 wins, 50 losses; -17.93% to +18.16%); 64-token output had +0.81% (64 wins, 56 losses; -28.65% to +29.87%). Joint-SLO goodput deltas varied widely, so the longer-output benefit is still conditional and not repeat-stable. SM-clock medians stayed at 2775 MHz (2760–2775); decode batch p50/max was 24 rows, although the full per-pair shape histograms matched in only 53/240 pairs. Greedy output parity was 212/240; all 28 mismatches were one seed-42 request at output token index 48. Keep fusion experimental while investigating this batch-sensitive divergence. See `INTERVIEW.md` §10.3.16, `benchmarks/_moe_report.md`, and `results/moe_int4_fuse_load105_120_rep5_20261011.json`.
+
+```bash
+python benchmarks/moe_int4_ablation.py ~/huggingface/DeepSeek-V2-Lite \
+  --int4-group-size 64 --token-batches 1,8,32 \
+  --profile-token-batches 1,8,32 --correctness-seeds 7,17,42,91,123 \
+  --correctness-token-batches 1,8,32,128 --correctness-all-layers \
+  --all-layer-correctness-seeds 7,17,42 \
+  --all-layer-correctness-token-batches 1,8,32 \
+  --output results/moe_int4_ablation.json
+python benchmarks/moe_int4_fuse_sweep.py \
+  --model ~/huggingface/DeepSeek-V2-Lite \
+  --seeds 7,17,42 --arrival-rates 4,8 --output-lengths 16,64 \
+  --repeats 2 --sampling-mode greedy \
+  --output results/moe_int4_fuse_sweep.json
+python benchmarks/moe_int4_fuse_sweep.py \
+  --model ~/huggingface/DeepSeek-V2-Lite \
+  --seeds 7,17,42 --arrival-rates 16 --output-lengths 64 --num-seqs 16 \
+  --slo-ttft-ms 10000 --slo-tpot-ms 150 --repeats 2 --sampling-mode greedy \
+  --output results/moe_int4_fuse_stress.json
+```
 
 `execution_mode="auto"` is the default: one visible GPU selects the regular mixed
 prefill/decode scheduler; with two or more visible GPUs it selects PD separation when
@@ -123,6 +320,13 @@ The server provides `/v1/chat/completions`, `/v1/completions`, `/v1/models`, and
 Set `stream=true` for Server-Sent Events (SSE) with incremental text chunks. A single engine
 worker owns GPU access and batches requests arriving while it is decoding; HTTP clients can
 submit concurrently. Disconnecting a stream cancels its queued/running sequence.
+
+The HTTP server runs mixed prefill/decode batches eagerly by default so a live request does not
+pay the first-use cost of capturing a new mixed CUDA Graph shape. Pure decode graphs remain
+available when supported. Pass `--mixed-cudagraph` to opt in to lazy mixed-graph capture; the
+first request with each unseen shape still pays its capture cost. Direct `LLM`/`Config` use keeps
+its existing mixed-graph default. This serving choice is based on the Qwen3-0.6B WSL2 results in
+`INTERVIEW.md` §10.3.13; other models and GPUs need their own same-trace measurement.
 
 Pass a `conversation_id` to keep chat history between calls. The first call can include a
 system message and a user message; later calls send only the new user message. History lives
@@ -308,9 +512,18 @@ python benchmarks/admission_ablation.py --num-seqs 128 --arrival-rate 16 \
 ```
 
 Each variant gets a fresh engine and the same trace. It reports accepted/deferred/rejected
-requests, per-arrival accept/reject rates, throughput, the served-request TTFT-target rate, the
-per-request cache-hit estimate vs the tokens actually reused (mean and worst absolute error), and
-the admission counters to `results/admission_ablation_*.json`. Pick a load that actually breaks
+requests, per-arrival accept/reject rates, throughput, TTFT/TPOT percentiles, and joint SLO
+goodput (completed requests and output tokens meeting both targets), plus the per-request
+cache-hit estimate vs the tokens actually reused. It stores the exact workload fingerprint and
+admission counters in `results/admission_ablation_*.json`. Compare before/after reports with:
+
+```bash
+python benchmarks/compare_ablation.py results/before.json results/after.json \
+  --variant dynamic_on_cache_aware
+```
+
+The comparison checks that prompts, sampling parameters, arrival times, seed, and SLO targets
+match before reporting deltas. Pick a load that actually breaks
 the target: at 8 req/s with a 2 s target every request already meets it and admission can only
 look harmful, whereas at 24 req/s / 128 requests without admission only 26.6% of requests get a
 first token within 2 s (p99 4.7 s) and admission trades that for a 15.6% accept rate at a 95%

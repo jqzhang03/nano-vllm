@@ -130,7 +130,8 @@ def test_spec_schedule_fallback_decode():
 
 def test_spec_schedule_mixed():
     """waiting非空 + running有草稿 → kind "mixed"，行序 [prefill..., verify...]。"""
-    sched = _make_spec_scheduler()
+    # This test checks mixed/spec row packing, not the SLO quota's chunking policy.
+    sched = _make_spec_scheduler(slo_aware_scheduling=False)
     bm = sched.block_manager
     r = Sequence(list(range(1, 9)) * 3)
     _simulate_prefill(bm, r, r.num_tokens)

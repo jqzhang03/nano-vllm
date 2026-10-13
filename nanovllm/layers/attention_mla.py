@@ -296,8 +296,8 @@ class MLAAttention(nn.Module):
             kv_lora_rank, num_heads * (qk_nope_head_dim + v_head_dim),
             bias=False)
         # MLA 吸收式 decode 需要 kv_b 的 float 视图（W_UK/W_UV 逐头读出）：
-        # 量化器对带此标记的层保留反量化副本（w_deq，int4 dual / fp8 keep_dense），
-        # 纯 int4/fp8（streaming）模型因此不落入稠密兜底/eager（占参 ~1%）。
+        # 量化器对带此标记的层保留反量化副本（w_deq），纯量化（streaming）
+        # 模型因此不落入稠密兜底/eager（占参约 1%）。
         self.kv_b_proj.is_mla_kv_b = True
         self.o_proj = RowParallelLinear(num_heads * v_head_dim, hidden_size,
                                         bias=attention_bias)
@@ -323,15 +323,15 @@ class MLAAttention(nn.Module):
         self._wuv_t = None            # [h, v_head, kv_lora] 逐头 W_UV
 
     # ------------------------------------------------------------------
-    # float 视图（与 MoE._float_weight 同规则）：未量化 weight / int4 dual-path
-    # 的 w_deq；纯 int4/fp8/... 无视图 → decode 走稠密兜底（_decode_rows）
+    # float 视图（与 MoE._float_weight 同规则）：未量化 weight 或 w_deq；
+    # 纯量化权重无视图 → decode 走稠密兜底（_decode_rows）
     # ------------------------------------------------------------------
     @staticmethod
     def _float_weight(lin: nn.Module) -> torch.Tensor | None:
         w = getattr(lin, "w_deq", None)
         if w is not None:
             return w
-        if not (lin.int4 or lin.fp8 or lin.w8a8 or lin.sparse24):
+        if not (lin.int4 or lin.nvfp4 or lin.fp8 or lin.w8a8 or lin.sparse24):
             return lin.weight
         return None
 

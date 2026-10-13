@@ -62,6 +62,7 @@ class MoE(nn.Module):
     def __init__(self, hidden_size: int, moe_intermediate_size: int,
                  num_experts: int, top_k: int, norm_topk_prob: bool = False,
                  segment_backend: bool = False,
+                 int4_backend: str = "loop", fuse_int4_gate_up: bool = True,
                  routed_scaling_factor: float = 1.0):
         super().__init__()
         assert num_experts > 0 and 1 <= top_k <= num_experts
@@ -77,6 +78,10 @@ class MoE(nn.Module):
         # 全尺寸最优或接近）；True = Triton 真段式内核（无 padding；实测仅在
         # 小 E + 极长段赢 43%，见 nanovllm/layers/moe_segment.py 头部边界表）
         self.segment_backend = segment_backend
+        if int4_backend not in ("loop", "segment"):
+            raise ValueError(f"unknown MoE INT4 backend: {int4_backend!r}")
+        self.int4_backend = int4_backend
+        self.fuse_int4_gate_up = fuse_int4_gate_up
         self.gate = ReplicatedLinear(hidden_size, num_experts, bias=False)  # [E, H]
         self.gate.quantize_exclude = True  # router 精度决定路由 → 永不量化
         self.experts = nn.ModuleList(
@@ -86,6 +91,10 @@ class MoE(nn.Module):
         self._gup_t = None    # [E, H, 2I] 3D 堆叠转置（gate/up 融合）
         self._dn_t = None     # [E, I, H] 3D 堆叠转置
         self._grouped_ok = None  # None=未判定；True/False=可用/回退 loop
+        self._int4_segment_ok = None
+        self._int4_segment_reason = None
+        self._int4_segment_tables = None
+        self._int4_segment_signature = None
 
     def _route(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """fp32 路由：返回 (topk 概率 [T,k]（x dtype，含 routed_scaling_factor）, 专家号 [T,k])。"""
@@ -99,16 +108,16 @@ class MoE(nn.Module):
         return top_vals.to(x.dtype), top_idx
 
     # ------------------------------------------------------------------
-    # 权重可组性：所有专家的三类线性都有 float 权重（未量化，或 int4
-    # dual-path 的 w_deq bf16 副本）→ 可堆叠 3D 走 grouped 批量 GEMM。
-    # 纯 int4 / fp8 / w8a8 / sparse24（权重是打包/定点格式，无 float 视图）
+    # 权重可组性：所有专家的三类线性都有 float 权重（未量化，或有 w_deq）
+    # → 可堆叠 3D 走 grouped 批量 GEMM。纯 int4 / nvfp4 / fp8 / w8a8 / sparse24
+    # （权重是打包/定点格式，无 float 视图）
     # → 回退逐专家循环（每专家走各自的量化内核）。
     # ------------------------------------------------------------------
     def _float_weight(self, lin: nn.Module) -> torch.Tensor | None:
         w = getattr(lin, "w_deq", None)
         if w is not None:
             return w
-        if not (lin.int4 or lin.fp8 or lin.w8a8 or lin.sparse24):
+        if not (lin.int4 or lin.nvfp4 or lin.fp8 or lin.w8a8 or lin.sparse24):
             return lin.weight
         return None
 
@@ -135,7 +144,141 @@ class MoE(nn.Module):
         """自动后端：float 权重可组 → grouped 批量 GEMM；否则逐专家循环。"""
         if self._ensure_grouped_weights():
             return self._forward_grouped(x)
+        if self.int4_backend == "segment" and self._can_segment_int4(x):
+            return self._forward_segment_int4(x)
         return self._forward_loop(x)
+
+    def _expert_linears(self):
+        return [
+            (expert.gate_proj, expert.up_proj, expert.down_proj)
+            for expert in self.experts
+        ]
+
+    def _can_segment_int4(self, x: torch.Tensor) -> bool:
+        """Check the supported packed-INT4 layout once after model quantization."""
+        if self._int4_segment_ok is True:
+            return True
+        linears = [lin for triple in self._expert_linears() for lin in triple]
+        reason = None
+        if not linears or any(not getattr(lin, "int4", False) for lin in linears):
+            reason = "all routed expert projections must use INT4"
+        elif any(getattr(lin, "w_deq", None) is not None for lin in linears):
+            reason = "dual-path INT4 uses the existing float grouped backend"
+        elif any(hasattr(lin, "awq_scale") for lin in linears):
+            reason = "AWQ activation scaling is not supported by segmented INT4"
+        elif any(getattr(lin, "bias", None) is not None for lin in linears):
+            reason = "expert projection bias is not supported by segmented INT4"
+        elif any(getattr(lin, "tp_size", 1) != 1 for lin in linears):
+            reason = "segmented INT4 currently requires tensor_parallel_size=1"
+        elif x.dtype not in (torch.bfloat16, torch.float16):
+            reason = f"activation dtype {x.dtype} is not supported"
+        else:
+            group_sizes = set()
+            for lin in linears:
+                packed = getattr(lin, "w_int4", None)
+                scales = getattr(lin, "w_int4_scale", None)
+                if packed is None or scales is None or packed.ndim != 2 or scales.ndim != 2:
+                    reason = "packed weights/scales have an unsupported shape"
+                    break
+                k = packed.shape[1] * 2
+                if scales.shape[0] != packed.shape[0] or k % scales.shape[1]:
+                    reason = "INT4 scale layout does not match the packed weights"
+                    break
+                group_sizes.add(k // scales.shape[1])
+                if scales.dtype != x.dtype or packed.device != x.device or scales.device != x.device:
+                    reason = "INT4 weights, scales, and activations must share device/dtype"
+                    break
+            if reason is None and len(group_sizes) != 1:
+                reason = "all expert projections must use the same INT4 group size"
+            if reason is None:
+                group_size = next(iter(group_sizes))
+                if group_size % 2 or 128 % group_size:
+                    reason = f"INT4 group size {group_size} must be even and divide 128"
+        self._int4_segment_reason = reason
+        self._int4_segment_ok = reason is None
+        return self._int4_segment_ok
+
+    def _ensure_int4_segment_tables(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
+        linears = self._expert_linears()
+        attrs = {
+            "gate_w": [item[0].w_int4 for item in linears],
+            "gate_s": [item[0].w_int4_scale for item in linears],
+            "up_w": [item[1].w_int4 for item in linears],
+            "up_s": [item[1].w_int4_scale for item in linears],
+            "down_w": [item[2].w_int4 for item in linears],
+            "down_s": [item[2].w_int4_scale for item in linears],
+        }
+        signature = (x.device, tuple(t.data_ptr() for tensors in attrs.values()
+                                     for t in tensors))
+        if signature != self._int4_segment_signature:
+            self._int4_segment_tables = {
+                name: torch.tensor([t.data_ptr() for t in tensors],
+                                   dtype=torch.int64, device=x.device)
+                for name, tensors in attrs.items()
+            }
+            self._int4_segment_signature = signature
+        return self._int4_segment_tables
+
+    def _forward_segment_int4(self, x: torch.Tensor) -> torch.Tensor:
+        """Sort routed rows once and run grouped, no-padding packed-INT4 GEMMs."""
+        from nanovllm.layers.moe_int4_segment import (
+            moe_segment_int4_gup,
+            moe_segment_int4_mm,
+        )
+
+        T = x.size(0)
+        top_vals, top_idx = self._route(x)
+        idx_flat = top_idx.reshape(-1)
+        tgt = (torch.arange(T, device=x.device)
+               .unsqueeze(1).expand(T, self.top_k).reshape(-1))
+        if idx_flat.numel() == 0:
+            return torch.zeros_like(x)
+
+        order = torch.argsort(idx_flat, stable=True)
+        sorted_idx = idx_flat[order]
+        xs = x.index_select(0, tgt[order])
+        counts = torch.bincount(sorted_idx, minlength=self.num_experts)
+        offsets = torch.cumsum(counts, 0) - counts
+        max_count = int(counts.max())
+        tables = self._ensure_int4_segment_tables(x)
+        group_size = self.experts[0].gate_proj.w_int4.shape[1] * 2 \
+            // self.experts[0].gate_proj.w_int4_scale.shape[1]
+
+        if self.fuse_int4_gate_up:
+            gup = moe_segment_int4_gup(
+                xs, tables["gate_w"], tables["gate_s"],
+                tables["up_w"], tables["up_s"], offsets, counts,
+                self.moe_intermediate_size, group_size,
+                max_tokens_per_expert=max_count)
+            gate, up = gup.chunk(2, dim=-1)
+        else:
+            gate = moe_segment_int4_mm(
+                xs, tables["gate_w"], tables["gate_s"], offsets, counts,
+                self.moe_intermediate_size, group_size,
+                max_tokens_per_expert=max_count)
+            up = moe_segment_int4_mm(
+                xs, tables["up_w"], tables["up_s"], offsets, counts,
+                self.moe_intermediate_size, group_size,
+                max_tokens_per_expert=max_count)
+        hidden = F.silu(gate) * up
+        ys = moe_segment_int4_mm(
+            hidden, tables["down_w"], tables["down_s"], offsets, counts,
+            self.hidden_size, group_size, max_tokens_per_expert=max_count)
+
+        inverse = torch.empty_like(order)
+        inverse[order] = torch.arange(order.numel(), device=x.device)
+        # Match _forward_loop's expert-id accumulation order. A single index_add
+        # over all slots permits BF16 atomics to sum them in a different order,
+        # which becomes visible at top_k=6 on a real DeepSeek router.
+        y_by_slot = ys[inverse].view(T, self.top_k, self.hidden_size)
+        slot_order = top_idx.argsort(dim=-1, stable=True)
+        y_expert_order = y_by_slot.gather(
+            1, slot_order[:, :, None].expand(T, self.top_k, self.hidden_size))
+        weights_expert_order = top_vals.gather(1, slot_order)
+        out = torch.zeros_like(x)
+        for slot in range(self.top_k):
+            out += y_expert_order[:, slot, :] * weights_expert_order[:, slot, None]
+        return out
 
     def _forward_loop(self, x: torch.Tensor) -> torch.Tensor:
         """逐专家循环后端（量化专家回退路径；与 reference 同序对照源）。"""

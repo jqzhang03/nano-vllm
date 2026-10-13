@@ -12,6 +12,7 @@
    which starved prefill and kept measured TPOT high (self-locking).
 """
 import os
+from types import SimpleNamespace
 
 import pytest
 
@@ -37,6 +38,13 @@ def _bare_engine(**overrides) -> LLMEngine:
     engine.config = _config(**overrides)
     engine._req_metrics = []
     engine._recorded_seq_ids = set()
+    engine.model_runner = SimpleNamespace(
+        mixed_cudagraph_capture_count=0,
+        mixed_cudagraph_replay_count=0,
+        mixed_cudagraph_eager_fallbacks=0,
+        decode_cudagraph_replay_count=0,
+        decode_cudagraph_eager_fallbacks=0,
+    )
     return engine
 
 

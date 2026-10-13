@@ -5,6 +5,11 @@ import torch.distributed as dist
 import triton
 import triton.language as tl
 
+from nanovllm.layers.nvfp4_cublaslt import (
+    cublaslt_nvfp4_gemm,
+    pad_nvfp4_scales,
+)
+
 
 def divide(numerator, denominator):
     assert numerator % denominator == 0
@@ -185,6 +190,115 @@ def int4_gemm(a: torch.Tensor, b_int4: torch.Tensor, b_scale: torch.Tensor) -> t
         out.stride(0), out.stride(1),
         BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=128, GROUP_M=8, GROUP=group,
         num_warps=warps, num_stages=2,
+    )
+    return out
+
+
+@triton.jit
+def _nvfp4_e2m1_to_float(code):
+    """Decode one signed NVFP4 E2M1 nibble to fp32."""
+    exponent = ((code >> 1) & 0x3).to(tl.float32)
+    mantissa = (code & 0x1).to(tl.float32)
+    exp_scale = tl.exp2(tl.maximum(exponent - 1.0, 0.0))
+    significand = tl.where(exponent == 0.0, mantissa * 0.5, 1.0 + mantissa * 0.5)
+    magnitude = exp_scale * significand
+    return tl.where((code & 0x8) != 0, -magnitude, magnitude)
+
+
+@triton.jit
+def gemm_nvfp4_kernel(
+    a_ptr, b_ptr, c_ptr, b_scale_ptr, b_global_scale_ptr,
+    M, N, K, num_groups,
+    stride_am, stride_ak, stride_bn, stride_bk, stride_cm, stride_cn,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    GROUP_M: tl.constexpr, GROUP: tl.constexpr,
+):
+    """NVFP4 weight-only GEMM: E2M1 values + E4M3 block scales + tensor scale.
+
+    The weight tiles are unpacked and dequantized in registers, then accumulated by
+    BF16 dot products. This is a software dequantization path; Triton 3.4's public
+    dot_scaled path accepts MXFP4's E8M0 scales, not NVFP4's E4M3 block scales.
+    """
+    pid = tl.program_id(0)
+    num_pid_m = tl.cdiv(M, BLOCK_M)
+    num_pid_n = tl.cdiv(N, BLOCK_N)
+    num_pid_in_group = GROUP_M * num_pid_n
+    group_id = pid // num_pid_in_group
+    first_pid_m = group_id * GROUP_M
+    group_size_m = min(num_pid_m - first_pid_m, GROUP_M)
+    pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+    pid_n = (pid % num_pid_in_group) // group_size_m
+
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    a_mask = offs_m[:, None] < M
+    b_mask = offs_n[None, :] < N
+    global_scale = tl.load(b_global_scale_ptr).to(tl.float32)
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+
+    # Each dot covers 32 K values. Its 16 even and 16 odd values share two
+    # adjacent NVFP4 scale blocks, so BF16 tensor-core K remains at least 16.
+    for k in range(0, tl.cdiv(K, BLOCK_K) * BLOCK_K, BLOCK_K):
+        for gg in tl.static_range(0, BLOCK_K // (2 * GROUP)):
+            jj = gg * GROUP + tl.arange(0, GROUP)
+            k_even = k + 2 * jj
+            even_mask = k_even < K
+            odd_mask = (k_even + 1) < K
+            a_even = tl.load(
+                a_ptr + offs_m[:, None] * stride_am + k_even[None, :] * stride_ak,
+                mask=a_mask & even_mask[None, :], other=0.0)
+            a_odd = tl.load(
+                a_ptr + offs_m[:, None] * stride_am + (k_even[None, :] + 1) * stride_ak,
+                mask=a_mask & odd_mask[None, :], other=0.0)
+            packed = tl.load(
+                b_ptr + offs_n[None, :] * stride_bn + (k // 2 + jj)[:, None] * stride_bk,
+                mask=even_mask[:, None] & b_mask, other=0)
+            scale_group = k_even // GROUP
+            scale_mask = ((offs_n[None, :] < N)
+                          & (scale_group[:, None] < num_groups)
+                          & even_mask[:, None])
+            block_scale = tl.load(
+                b_scale_ptr + offs_n[None, :] * num_groups + scale_group[:, None],
+                mask=scale_mask, other=1.0).to(tl.float32) * global_scale
+
+            low = _nvfp4_e2m1_to_float(packed & 0x0F) * block_scale
+            high = _nvfp4_e2m1_to_float((packed >> 4) & 0x0F) * block_scale
+            acc += tl.dot(a_even, low.to(tl.bfloat16), out_dtype=tl.float32)
+            acc += tl.dot(a_odd, high.to(tl.bfloat16), out_dtype=tl.float32)
+
+    c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
+    tl.store(c_ptrs, acc, mask=a_mask & b_mask)
+
+
+def nvfp4_gemm(a: torch.Tensor, b_nvfp4: torch.Tensor, b_scale: torch.Tensor,
+               b_global_scale: torch.Tensor, *, backend: str = "software") -> torch.Tensor:
+    """NVFP4 linear using software dequantization or cuBLASLt native MMA."""
+    M, K = a.shape
+    N = b_nvfp4.shape[0]
+    assert K % 16 == 0, f"NVFP4 requires 16-value K blocks, got K={K}"
+    assert b_nvfp4.shape == (N, K // 2), f"expected packed [N, K//2], got {b_nvfp4.shape}"
+    if backend == "cublaslt":
+        if b_scale.ndim != 1:
+            raise ValueError("cuBLASLt NVFP4 GEMM expects pre-swizzled 1D block scales")
+        return cublaslt_nvfp4_gemm(a, b_nvfp4, b_scale, b_global_scale)
+    if backend != "software":
+        raise ValueError(f"unknown NVFP4 backend: {backend!r}")
+    if b_scale.ndim != 2 or b_scale.shape != (N, K // 16):
+        raise ValueError(f"software NVFP4 GEMM expects block scales [{N}, {K // 16}]")
+    num_groups = b_scale.shape[1]
+    group = K // num_groups
+    assert a.dtype == torch.bfloat16, f"NVFP4 Triton GEMM expects BF16 activations, got {a.dtype}"
+    out = torch.empty(M, N, device=a.device, dtype=torch.bfloat16)
+    bm, bn, bk = 16, 128, 128
+    grid = (triton.cdiv(M, bm) * triton.cdiv(N, bn),)
+    gemm_nvfp4_kernel[grid](
+        a, b_nvfp4, out, b_scale, b_global_scale,
+        M, N, K, num_groups,
+        a.stride(0), a.stride(1),
+        b_nvfp4.stride(0), b_nvfp4.stride(1),
+        out.stride(0), out.stride(1),
+        BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk, GROUP_M=8, GROUP=group,
+        num_warps=4, num_stages=2,
     )
     return out
 
@@ -379,6 +493,70 @@ def fp8_gemm(a: torch.Tensor, w_fp8: torch.Tensor, w_scale: torch.Tensor) -> tor
     return out
 
 
+NVFP4_GROUP_SIZE = 16
+NVFP4_MAX_VALUE = 6.0
+NVFP4_SCALE_MAX = 448.0
+
+
+def quantize_nvfp4_tensor(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Quantize a row-major weight matrix to NVFP4 E2M1 + E4M3 block scales.
+
+    Returns packed nibbles ``[N, K//2]``, E4M3 scales ``[N, K//16]``, and the
+    FP32 tensor scale. This follows the NVFP4 double-scaling layout: one E4M3
+    scale per 16 values and one FP32 scale per tensor.
+    """
+    if weight.ndim != 2:
+        raise ValueError(f"NVFP4 expects a 2D weight matrix, got shape={tuple(weight.shape)}")
+    n, k = weight.shape
+    if k % NVFP4_GROUP_SIZE:
+        raise ValueError(f"NVFP4 K={k} must be divisible by {NVFP4_GROUP_SIZE}")
+
+    w = weight.detach().to(torch.float32)
+    blocks = w.view(n, k // NVFP4_GROUP_SIZE, NVFP4_GROUP_SIZE)
+    tensor_scale = w.abs().amax().clamp(min=1e-8) / (NVFP4_MAX_VALUE * NVFP4_SCALE_MAX)
+    block_amax = blocks.abs().amax(dim=-1)
+    # Clamp to E4M3FN's finite subnormal/normal range before rounding to the
+    # stored block-scale format. The effective scale is used for E2M1 rounding.
+    block_scale = (block_amax / (NVFP4_MAX_VALUE * tensor_scale)).clamp(
+        min=1.0 / 512.0, max=NVFP4_SCALE_MAX)
+    block_scale_e4m3 = block_scale.to(torch.float8_e4m3fn).contiguous()
+    effective_scale = block_scale_e4m3.float() * tensor_scale
+    normalized = (blocks / effective_scale.unsqueeze(-1)).reshape(n, k)
+
+    # Positive E2M1 values are [0, 0.5, 1, 1.5, 2, 3, 4, 6]. The seven
+    # midpoint thresholds give nearest-value rounding without an 8x temporary.
+    thresholds = torch.tensor(
+        (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0),
+        device=w.device, dtype=torch.float32)
+    magnitude_code = torch.bucketize(normalized.abs().contiguous(), thresholds).to(torch.uint8)
+    sign = torch.signbit(normalized).to(torch.uint8) << 3
+    q = magnitude_code | sign
+    packed = (q[:, 0::2] | (q[:, 1::2] << 4)).contiguous()
+    return packed, block_scale_e4m3, tensor_scale.contiguous()
+
+
+def dequantize_nvfp4_tensor(packed: torch.Tensor, block_scale: torch.Tensor,
+                            tensor_scale: torch.Tensor, k: int) -> torch.Tensor:
+    """Return an FP32 view of an NVFP4 packed weight matrix."""
+    n = packed.shape[0]
+    if k % NVFP4_GROUP_SIZE or packed.shape != (n, k // 2):
+        raise ValueError(f"invalid packed NVFP4 shape={tuple(packed.shape)} for K={k}")
+    if block_scale.shape != (n, k // NVFP4_GROUP_SIZE):
+        raise ValueError(f"invalid NVFP4 scale shape={tuple(block_scale.shape)}")
+
+    codes = torch.empty(n, k, device=packed.device, dtype=torch.uint8)
+    codes[:, 0::2] = packed & 0x0F
+    codes[:, 1::2] = (packed >> 4) & 0x0F
+    exponent = ((codes >> 1) & 0x3).to(torch.float32)
+    mantissa = (codes & 0x1).to(torch.float32)
+    exp_scale = torch.pow(2.0, (exponent - 1.0).clamp_min(0.0))
+    significand = torch.where(exponent == 0.0, mantissa * 0.5, 1.0 + mantissa * 0.5)
+    values = exp_scale * significand
+    values = torch.where((codes & 0x8) != 0, -values, values)
+    scale_by_k = block_scale.float()[:, torch.arange(k, device=packed.device) // NVFP4_GROUP_SIZE]
+    return values * scale_by_k * tensor_scale.float()
+
+
 class WeightQuantMixin:
     """int4 / sparse24 量化共享实现（LinearBase 与 ParallelLMHead 复用）。"""
 
@@ -451,6 +629,48 @@ class WeightQuantMixin:
         if awq is not None:
             x = x / awq[None, :]  # AWQ恒等变换的激活侧（权重侧已折叠 W'=W·s）
         y = int4_gemm(x, self.w_int4, self.w_int4_scale)
+        if bias is not None:
+            y = y + bias
+        return y
+
+    def quantize_nvfp4(self, keep_dense: bool = False, backend: str = "software"):
+        """Pack weights as NVFP4 E2M1 with E4M3 scales per 16-value block.
+
+        ``keep_dense`` is reserved for MLA ``kv_b``: that small projection needs
+        a float view for absorbed decode. Normal linears stay packed and use the
+        selected NVFP4 GEMM backend.
+        """
+        if backend not in ("software", "cublaslt"):
+            raise ValueError(f"unknown NVFP4 backend: {backend!r}")
+        w = self.weight.detach()
+        n, k = w.shape
+        packed, block_scale, tensor_scale = quantize_nvfp4_tensor(w)
+        self.register_buffer("w_nvfp4", packed)
+        stored_scale = (pad_nvfp4_scales(block_scale) if backend == "cublaslt"
+                        else block_scale)
+        self.register_buffer("w_nvfp4_scale", stored_scale)
+        self.register_buffer("w_nvfp4_global_scale", tensor_scale)
+        self.nvfp4_backend = backend
+        if keep_dense:
+            dense = dequantize_nvfp4_tensor(packed, block_scale, tensor_scale, k)
+            self.register_buffer("w_deq", dense.to(w.dtype).contiguous())
+        self.nvfp4 = True
+        del self.weight
+
+    def _nvfp4_forward(self, x: torch.Tensor) -> torch.Tensor:
+        bias = getattr(self, "bias", None)
+        w_deq = getattr(self, "w_deq", None)
+        if w_deq is not None and (x.shape[0] > self.int4_max_m
+                                  or self.w_nvfp4.shape[0] < self.int4_min_n):
+            y = F.linear(x, w_deq, bias)
+            return y
+        y = nvfp4_gemm(
+            x,
+            self.w_nvfp4,
+            self.w_nvfp4_scale,
+            self.w_nvfp4_global_scale,
+            backend=getattr(self, "nvfp4_backend", "software"),
+        )
         if bias is not None:
             y = y + bias
         return y
@@ -560,6 +780,7 @@ class LinearBase(WeightQuantMixin, nn.Module):
         # ---- 量化状态（load_model之后由ModelRunner调用对应quantize方法） ----
         self.w8a8 = False  # w_int8/w_scale/smooth缓冲由quantize_w8a8创建（不能先占普通属性名）
         self.int4 = False  # w_int4/w_int4_scale/awq_scale缓冲由quantize_int4创建
+        self.nvfp4 = False  # w_nvfp4/E4M3 block scales由quantize_nvfp4创建
         self.sparse24 = False  # w_s24_v/w_s24_idx缓冲由quantize_sparse24创建
         self.fp8 = False  # w_fp8/w_fp8_scale缓冲由quantize_fp8创建
         self.quantize_exclude = False  # True：跳过量化（MoE router——gate 精度决定路由）
@@ -631,6 +852,8 @@ class ReplicatedLinear(LinearBase):
             return self._sparse24_forward(x)
         if self.int4:
             return self._int4_forward(x)
+        if self.nvfp4:
+            return self._nvfp4_forward(x)
         if self.w8a8:
             return self._w8a8_forward(x)
         return F.linear(x, self.weight, self.bias)
@@ -661,6 +884,8 @@ class ColumnParallelLinear(LinearBase):
             return self._sparse24_forward(x)
         if self.int4:
             return self._int4_forward(x)
+        if self.nvfp4:
+            return self._nvfp4_forward(x)
         if self.w8a8:
             return self._w8a8_forward(x)
         return F.linear(x, self.weight, self.bias)
@@ -749,6 +974,8 @@ class RowParallelLinear(LinearBase):
             y = self._sparse24_forward(x)
         elif self.int4:
             y = self._int4_forward(x)
+        elif self.nvfp4:
+            y = self._nvfp4_forward(x)
         elif self.w8a8:
             y = self._w8a8_forward(x)
         else:

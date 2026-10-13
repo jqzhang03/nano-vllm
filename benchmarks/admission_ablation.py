@@ -28,10 +28,10 @@ from nanovllm.sampling_params import SamplingParams
 
 try:
     from .bench import add_workload_args, build_workload, env_info, summarize
-    from .scheduling_ablation import build_arrival_trace
+    from .scheduling_ablation import build_arrival_trace, workload_fingerprint
 except ImportError:
     from bench import add_workload_args, build_workload, env_info, summarize
-    from scheduling_ablation import build_arrival_trace
+    from scheduling_ablation import build_arrival_trace, workload_fingerprint
 
 
 def parse_args():
@@ -46,9 +46,19 @@ def parse_args():
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
     parser.add_argument("--tp", type=int, default=1)
     parser.add_argument("--quantization", default="none")
+    parser.add_argument("--int4-group-size", type=int, default=128,
+                        help="INT4 K-group size; DeepSeek-V2-Lite requires 64")
     parser.add_argument("--kv-cache-dtype", choices=("auto", "fp8_e4m3"), default="auto")
     parser.add_argument("--no-swap-kv", action="store_true")
     parser.add_argument("--enforce-eager", action="store_true")
+    mixed_graph_args = parser.add_mutually_exclusive_group()
+    mixed_graph_args.add_argument(
+        "--mixed-cudagraph", dest="mixed_cudagraph", action="store_true",
+        help="enable lazy CUDA Graph capture for mixed prefill/decode batches")
+    mixed_graph_args.add_argument(
+        "--no-mixed-cudagraph", dest="mixed_cudagraph", action="store_false",
+        help="use eager mixed batches while retaining pure-decode graphs")
+    parser.set_defaults(mixed_cudagraph=False)
     parser.add_argument("--warmup-seqs", type=int, default=8)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--max-queued-requests", type=int, default=256)
@@ -56,6 +66,10 @@ def parse_args():
     parser.add_argument("--max-admission-wait-ms", type=float, default=2000.0)
     parser.add_argument("--admission-work-budget-ms", type=float, default=10000.0)
     parser.add_argument("--admission-target-ttft-ms", type=float, default=2000.0)
+    parser.add_argument("--slo-ttft-ms", type=float, default=2000.0,
+                        help="measured per-request TTFT SLO; kept separate from admission tuning")
+    parser.add_argument("--slo-tpot-ms", type=float, default=80.0,
+                        help="measured average inter-token latency SLO")
     parser.add_argument("--admission-soft-pressure", type=float, default=0.85)
     parser.add_argument("--output", default=None)
     return parser.parse_args()
@@ -78,9 +92,13 @@ async def run_variant(args, prompts, sampling_params, arrival_times,
             max_model_len=args.max_model_len,
             gpu_memory_utilization=args.gpu_memory_utilization,
             quantization=args.quantization,
+            int4_group_size=args.int4_group_size,
             kv_cache_dtype=args.kv_cache_dtype,
             kv_swap=not args.no_swap_kv,
             enforce_eager=args.enforce_eager,
+            mixed_cudagraph=args.mixed_cudagraph,
+            default_ttft_slo_ms=args.slo_ttft_ms,
+            default_tpot_slo_ms=args.slo_tpot_ms,
             # Scheduler-side Top-W cache affinity stays on across admission
             # variants; only the admission estimate's cache awareness is toggled.
         ))
@@ -130,7 +148,9 @@ async def run_variant(args, prompts, sampling_params, arrival_times,
                 await asyncio.sleep(delay)
             try:
                 handle = await manager.submit(
-                    prompts[index], sampling_params[index], submitted_at=arrival)
+                    prompts[index], sampling_params[index], submitted_at=arrival,
+                    ttft_slo_ms=args.slo_ttft_ms,
+                    tpot_slo_ms=args.slo_tpot_ms)
             except HTTPException as exc:
                 detail = exc.detail if isinstance(exc.detail, dict) else {}
                 rejected_row = {
@@ -147,6 +167,19 @@ async def run_variant(args, prompts, sampling_params, arrival_times,
                     rejected_row[key] = detail.get(key)
                 return rejected_row
             result = await handle.result
+            completion_tokens = len(result.get("token_ids", []))
+            ttft_ms = (None if handle.first_token_at is None else
+                       (handle.first_token_at - arrival) * 1000.0)
+            e2e_ms = (None if handle.completed_at is None else
+                      (handle.completed_at - arrival) * 1000.0)
+            tpot_ms = (None if handle.first_token_at is None
+                       or handle.completed_at is None or completion_tokens <= 1 else
+                       (handle.completed_at - handle.first_token_at) * 1000.0
+                       / (completion_tokens - 1))
+            ttft_slo_met = (None if ttft_ms is None else
+                            ttft_ms <= args.slo_ttft_ms)
+            tpot_slo_met = (None if tpot_ms is None else
+                            tpot_ms <= args.slo_tpot_ms)
             return {
                 "index": index,
                 "status": "accepted" if "error" not in result else "failed",
@@ -158,11 +191,13 @@ async def run_variant(args, prompts, sampling_params, arrival_times,
                 "estimated_cache_hit_tokens": handle.estimated_cache_hit_tokens,
                 "actual_cache_hit_tokens": handle.prefix_cached_tokens,
                 "sampling_max_tokens": sampling_params[index].max_tokens,
-                "ttft_ms": (None if handle.first_token_at is None else
-                            (handle.first_token_at - arrival) * 1000.0),
-                "e2e_ms": (None if handle.completed_at is None else
-                           (handle.completed_at - arrival) * 1000.0),
-                "completion_tokens": len(result.get("token_ids", [])),
+                "ttft_ms": ttft_ms,
+                "e2e_ms": e2e_ms,
+                "tpot_ms": tpot_ms,
+                "ttft_slo_met": ttft_slo_met,
+                "tpot_slo_met": tpot_slo_met,
+                "joint_slo_met": (ttft_slo_met is True and tpot_slo_met is True),
+                "completion_tokens": completion_tokens,
                 "error": result.get("error"),
             }
 
@@ -170,12 +205,13 @@ async def run_variant(args, prompts, sampling_params, arrival_times,
         torch.cuda.synchronize()
         wall = time.perf_counter() - start
         admission = manager.admission_snapshot()
+        engine_metrics = engine.collect_metrics()
         await manager.close()
         accepted = [row for row in rows if row["status"] == "accepted"]
         total_output_tokens = sum(row["completion_tokens"] for row in accepted)
         ttfts = [row["ttft_ms"] for row in accepted if row["ttft_ms"] is not None]
         e2es = [row["e2e_ms"] for row in accepted if row["e2e_ms"] is not None]
-        slo_met = [value <= args.admission_target_ttft_ms for value in ttfts]
+        slo_met = [value <= args.slo_ttft_ms for value in ttfts]
         hit_rows = [row for row in accepted
                     if row["estimated_cache_hit_tokens"] is not None]
         hit_deltas = [row["estimated_cache_hit_tokens"] - row["actual_cache_hit_tokens"]
@@ -191,8 +227,10 @@ async def run_variant(args, prompts, sampling_params, arrival_times,
         # 未被拒的请求里，TTFT 是否真的落在目标内（准入的目标就是 admission_target_ttft_ms）
         served = [row for row in rows if row["status"] != "rejected"]
         served_ttfts = [row["ttft_ms"] for row in served if row["ttft_ms"] is not None]
-        served_slo_met = [value <= args.admission_target_ttft_ms
+        served_slo_met = [value <= args.slo_ttft_ms
                           for value in served_ttfts]
+        joint_slo_rows = [row for row in accepted if row["joint_slo_met"]]
+        joint_slo_output_tokens = sum(row["completion_tokens"] for row in joint_slo_rows)
         return {
             "dynamic_admission": dynamic_admission,
             "prefix_cache_aware_admission": prefix_cache_aware_admission,
@@ -219,8 +257,21 @@ async def run_variant(args, prompts, sampling_params, arrival_times,
             "output_tokens": total_output_tokens,
             "output_tokens_per_second": total_output_tokens / max(wall, 1e-9),
             "ttft_ms": summarize(ttfts),
+            "tpot_ms": summarize(row["tpot_ms"] for row in accepted),
             "e2e_ms": summarize(e2es),
             "target_ttft_met_percent": 100.0 * sum(slo_met) / max(1, len(slo_met)),
+            "slo_goodput": {
+                "ttft_target_ms": args.slo_ttft_ms,
+                "tpot_target_ms": args.slo_tpot_ms,
+                "joint_slo_requests": len(joint_slo_rows),
+                "joint_slo_request_rate_per_second": (
+                    len(joint_slo_rows) / max(wall, 1e-9)),
+                "joint_slo_arrival_percent": (
+                    100.0 * len(joint_slo_rows) / max(1, total_arrivals)),
+                "joint_slo_output_tokens": joint_slo_output_tokens,
+                "joint_slo_output_tokens_per_second": (
+                    joint_slo_output_tokens / max(wall, 1e-9)),
+            },
             "cache_hits": {
                 "requests_with_estimate": len(hit_rows),
                 "estimated_tokens": sum(row["estimated_cache_hit_tokens"]
@@ -234,6 +285,17 @@ async def run_variant(args, prompts, sampling_params, arrival_times,
                     (abs(delta) for delta in hit_deltas), default=None),
             },
             "admission": admission,
+            "execution_settings": {
+                "enforce_eager": args.enforce_eager,
+                "mixed_cudagraph": engine.config.mixed_cudagraph,
+                "kv_cache_dtype": engine.config.kv_cache_dtype,
+                "quantization": engine.config.quantization,
+                "int4_group_size": engine.config.int4_group_size,
+            },
+            "graph_metrics": {
+                "mixed_cudagraph": engine_metrics.get("mixed_cudagraph", {}),
+                "decode_cudagraph": engine_metrics.get("decode_cudagraph", {}),
+            },
             "per_request": rows,
         }
     finally:
@@ -280,7 +342,9 @@ async def async_main(args, prompts, sampling_params, arrival_times) -> dict:
               f"throughput {result['output_tokens_per_second']:.1f} tok/s | "
               f"TTFT p50/p99 {result['ttft_ms']['p50'] or 0:.1f}/"
               f"{result['ttft_ms']['p99'] or 0:.1f} ms | "
-              f"served TTFT target met {acc['served_ttft_target_met_percent']:.1f}% | "
+              f"joint-SLO goodput {result['slo_goodput']['joint_slo_output_tokens_per_second']:.1f} tok/s "
+              f"({result['slo_goodput']['joint_slo_requests']}/{result['requests']} req) | "
+              f"served TTFT SLO met {acc['served_ttft_target_met_percent']:.1f}% | "
               f"prefix hits: est {hits['estimated_tokens']:.0f} vs actual "
               f"{hits['actual_tokens']} tokens over {hits['requests_reusing_prefix']} "
               f"reusing requests | mean estimate error "
@@ -314,6 +378,12 @@ def main() -> None:
                 "arrival_times_seconds": arrivals,
                 "prompt_tokens": [len(prompt) for prompt in prompts],
                 "max_output_tokens": [params.max_tokens for params in sampling_params],
+                "ttft_slo_targets_ms": [args.slo_ttft_ms] * len(prompts),
+                "tpot_slo_targets_ms": [args.slo_tpot_ms] * len(prompts),
+                "fingerprint": workload_fingerprint(
+                    prompts, sampling_params, arrivals,
+                    [args.slo_ttft_ms] * len(prompts),
+                    [args.slo_tpot_ms] * len(prompts), args.seed),
                 "seed": args.seed,
             },
             "runs": runs,
@@ -321,7 +391,7 @@ def main() -> None:
     print(f"full results -> {output_path}")
     print("\nAdmission comparison (same trace, fresh engine per variant):")
     header = (f"{'variant':<24} {'accept%':>8} {'reject%':>8} {'defer':>6} {'tok/s':>8} "
-              f"{'TTFT p50':>9} {'TTFT p99':>9} {'served-SLO':>11} "
+              f"{'SLO tok/s':>9} {'SLO req/s':>9} {'TTFT p50':>9} {'TTFT p99':>9} {'served-SLO':>11} "
               f"{'est hit':>8} {'actual hit':>10} {'est err':>8}")
     print(header)
     for name, result in runs.items():
@@ -333,6 +403,8 @@ def main() -> None:
               f"{acc['reject_rate_percent']:>7.1f}% "
               f"{result['deferred_then_accepted']:>6} "
               f"{result['output_tokens_per_second']:>8.1f} "
+              f"{result['slo_goodput']['joint_slo_output_tokens_per_second']:>9.1f} "
+              f"{result['slo_goodput']['joint_slo_request_rate_per_second']:>9.2f} "
               f"{result['ttft_ms']['p50'] or 0:>9.1f} "
               f"{result['ttft_ms']['p99'] or 0:>9.1f} "
               f"{acc['served_ttft_target_met_percent']:>10.1f}% "

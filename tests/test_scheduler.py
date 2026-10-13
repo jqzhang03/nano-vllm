@@ -5,10 +5,12 @@ from nanovllm.config import Config
 import os
 
 
-def _make_scheduler(max_num_batched_tokens=2048, kv_swap=True):
+def _make_scheduler(max_num_batched_tokens=2048, kv_swap=True, **config_overrides):
     path = os.path.expanduser("~/huggingface/Qwen3-0.6B/")
-    config = Config(model=path, num_kvcache_blocks=64, kvcache_block_size=256,
-                    max_num_batched_tokens=max_num_batched_tokens, kv_swap=kv_swap)
+    kwargs = dict(model=path, num_kvcache_blocks=64, kvcache_block_size=256,
+                  max_num_batched_tokens=max_num_batched_tokens, kv_swap=kv_swap)
+    kwargs.update(config_overrides)
+    config = Config(**kwargs)
     return Scheduler(config)
 
 
@@ -31,7 +33,7 @@ def test_scheduler():
 
 def test_mixed_batch():
     """waiting与running都非空时返回混合批次：早完成prefill的序列立即decode（vLLM V1同款）。"""
-    scheduler = _make_scheduler()
+    scheduler = _make_scheduler(slo_aware_scheduling=False)
     bm = scheduler.block_manager
     # 1个已过prefill的running序列（内容与其他序列不同，避免前缀缓存命中干扰）
     r = Sequence([7] * 1024)
@@ -78,7 +80,7 @@ def test_pure_phases():
         kinds.append(kind)
     assert kinds == ["decode", "decode", "decode"], kinds
 
-    scheduler2 = _make_scheduler()
+    scheduler2 = _make_scheduler(slo_aware_scheduling=False)
     for i in range(2):
         scheduler2.add(Sequence([i + 1] * 1024))
     kinds = []
@@ -92,7 +94,9 @@ def test_pure_phases():
 def test_kv_swap_state():
     """KV swap 抢占状态机：KV完整的decode序列抢占时换出（保留num_cached_tokens、
     进swapped队列），free块恢复后换入（直接decode，免重新prefill）。"""
-    scheduler = _make_scheduler(kv_swap=True)
+    # Exercise the KV swap lifecycle independently from the cost-based policy
+    # that may choose recompute for this short sequence.
+    scheduler = _make_scheduler(kv_swap=True, recompute_aware_preemption=False)
     bm = scheduler.block_manager
     s = Sequence([7] * 1024)
     _simulate_prefill(bm, s, 1024)

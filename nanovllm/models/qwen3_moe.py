@@ -72,6 +72,8 @@ class Qwen3MoeDecoderLayer(nn.Module):
                 norm_topk_prob=getattr(config, "norm_topk_prob", False),
                 # Triton 真段式后端开关（config 字段；默认 bmm，边界见 moe_segment.py）
                 segment_backend=bool(getattr(config, "moe_segment_backend", False)),
+                int4_backend=getattr(config, "moe_int4_backend", "loop"),
+                fuse_int4_gate_up=bool(getattr(config, "moe_int4_fuse_gate_up", True)),
             )
         else:
             self.mlp = Qwen3MoeMLP(

@@ -16,7 +16,7 @@
 >
 > **本轮实测（2026-10-06，RTX 5060 Ti / WSL2，Qwen3-0.6B，mixed 单卡）**：**⑤ 复跑修订（当日第二次）**：上一轮把 `without_decode_burst_yield` 判为"结构上不可达"，方向对但结论不完整——那次运行里新功能只写了一半：`_run_decode_burst` 收集了 `finished` 却没返回（调用点解包 2 元组 → 任何进入 burst 的 step 直接 `TypeError`）、`Config` 缺 `decode_burst_yield_on_arrival`、服务端调用的 `_sync_decode_burst_pressure()` 未定义、准入用的 `_estimate_prefix_cache_match()`/`_projected_kv_blocks()` 未定义、`_estimate_admission` 里返回键引用了不存在的变量。补齐后重跑：**burst 中途到达确实能打断后续轮次**（服务端实测 8/8 轮让出，迟到请求尾延迟 68.3 → 53.6 ms，最差轮 676 → 329 ms，§10.3.11），原命令重跑结论不变（TPOT 配额仍是 collapse 根因，§10.3.10）；CPU 用例 `tests/test_decode_burst_yield.py` 钉住返回 arity 与到达压力谓词。**⑥ 指标正确性与 TPOT 饥饿修复（当日第三轮）**：①per-request 指标对 burst 内完成的序列重复落盘，128 请求只统计到 95 个不同 seq_id（另 38 条重复），驱动侧据此**提前结束跑批**——已改 `_record_once()` 幂等 + `reset_benchmark_metrics()` + harness 断言，所有变体现为 128/128 唯一；②TPOT 预填配额收缩加**死区**与**队列深度门限**（`tpot_prefill_throttle_margin=0.5` / `tpot_throttle_max_waiting=16`），把 self-locking 的 floor 钉死解开：128 请求 / 16 req/s / 20 ms 目标下 all_on 350 → **1140 tok/s**、TTFT p50 44.5 s → **1.6 s**、TPOT p50 173 → **82 ms**；③准入校准换到会打穿 SLO 的负载（24 req/s、128 请求）：关闭准入时只有 **26.6%** 的请求在 2 s 内拿到首 token，开准入（感知缓存）后接受 15.6% 请求、被服务者 **95%** 达标、吞吐 777 tok/s（不感知缓存仅 617）。①**前缀命中估算已与实测对齐**——准入现在按 `BlockManager.prefix_snapshot()`（engine 空闲时物化的不可变哈希表副本 + `prefix_map_version()` 失效）用候选请求的链式块哈希估算可复用 token，`cache_affinity_admission=False` 时恒为 0（"不感知缓存"消融）。进程内探针 `benchmarks/prefix_cache_probe.py` 10/10 请求估算==实际（0/256/512 三档，绝对误差 0，全部块对齐）；HTTP `benchmarks/prefix_cache_verify.py` 8/8 请求 `admission.estimated_cache_hit_tokens == context.prefix_cache_hit_tokens`（冷启动服务：首发 0/0、复用 512/512，Δ=0）。②**准入消融**（`admission_ablation.py` 三档：关闭 / 开但不感知缓存 / 开且感知缓存，同一到达 trace）：1 req/s、32 请求、共享前缀 512 时三档吞吐 264.9/264.5/264.6 tok/s、**0 拒绝 0 延迟**——低费率下准入根本不触发，缓存感知只把命中估算误差从 -496 token 修正到 0。4/8/16 req/s poisson、64 请求下：**缓存感知在 4-8 req/s 稳定有用**（比不感知多接受 4~13 个请求、吞吐 +4.9%~+51%，估算误差 -490 → -10~0 token），但**默认准入阈值整体是净损失**——相对关闭准入吞吐 -12.4%（4 req/s）、-12.2%~-54.0%（8 req/s，3 seed）、-45.0%（16 req/s），越忙越亏；16 req/s 饱和点上感知与不感知打平（接受数相同）。费率带宽、多种子重复与逐请求命中对照见 `results/admission_ablation_*.json`。③**decode burst 让出**：`decode_burst_yield`（默认开）新增为独立消融项 `without_decode_burst_yield`（关掉后 burst 即使有新 prefill 到达也跑满 `max_decode_steps`），并新增 `decode_bursts/rounds/yields/skipped_slots` 计数。④**修掉两处"跑不通"**：`Qwen3/Qwen2/Llama3Attention` 直接用 `dist.get_world_size()`，TP=1 时进程组未初始化 → 模型构造即崩（服务与离线路径都受影响，改用 `tp_size()` 回退）；`admission_ablation.py` 未在变体之间 `gc.collect()+empty_cache()` → 第二个变体 KV 分配断言失败。新实现尚未在 RTX 5060 Ti/WSL2 上验证收益，不作为性能结论。
 >
-> **当前限制**：混合 CUDA Graph、multi-step decode 与 TPOT 调度尚未在 RTX 5060 Ti/WSL2 上运行 benchmark；CUDA Graph 首次遇到每种形状会额外执行一次 eager warmup 和 capture，最多保留 `mixed_cudagraph_max_graphs` 种形状，超过 `mixed_cudagraph_max_tokens`（默认 4096）则 eager 回退。Multi-step 只覆盖纯非投机 decode，默认最多 4 轮；在线服务在 burst 结束后发送这段时间产生的 token，因此可能合并为一个 SSE 文本块。TPOT 调度是基于请求级 token 间隔 EWMA 的启发式目标，不保证硬 deadline。服务准入的输出长度比例是跨请求的全局 EWMA，未按请求类型区分；**前缀命中预测已实现且与实测一致，但准入阈值本身未校准**——2026-10-06 实测 8 req/s 下默认参数（work budget 10s / soft pressure 0.85）会拒绝约一半请求并损失 31~36% 吞吐（详见 §10.3.9），说明"估算准"不等于"准入策略对"；Mixtral 未实现。PD 缺少异步 P/D 重叠、远端 worker/RDMA，且本机单卡环境不能验证多卡收益。历史性能表不作为新增策略的效果证明。
+> **当前限制**：2026-10-09 本机复测覆盖 RTX 5060 Ti/WSL2 上的 Qwen3-0.6B、TP=1 离线 mixed workload（§10.3.12），已测 mixed CUDA Graph 与 multi-step decode；Graph 冷批捕获显著拖慢首批 TTFT，捕获后的重复批吞吐与 eager 基本持平。该结果不能外推到在线 HTTP、其他模型或量化/KV/rolling/swap 组合。CUDA Graph 首次遇到每种形状会额外执行一次 eager warmup 和 capture，最多保留 `mixed_cudagraph_max_graphs` 种形状，超过 `mixed_cudagraph_max_tokens`（默认 4096）则 eager 回退。Multi-step 只覆盖纯非投机 decode，默认最多 4 轮；在线服务在 burst 结束后发送这段时间产生的 token，因此可能合并为一个 SSE 文本块。TPOT-aware scheduling 已有 §10.3.10 的到达 trace 消融；它基于请求级 token 间隔 EWMA，不保证硬 deadline。服务准入的输出长度比例是跨请求的全局 EWMA，未按请求类型区分；**前缀命中预测已实现且与实测一致，但准入阈值本身未校准**——2026-10-06 实测 8 req/s 下默认参数（work budget 10s / soft pressure 0.85）会拒绝约一半请求并损失 31~36% 吞吐（详见 §10.3.9），说明"估算准"不等于"准入策略对"；Mixtral 未实现。PD 缺少异步 P/D 重叠、远端 worker/RDMA，且本机单卡环境不能验证多卡收益。历史性能表不作为新增策略的效果证明。
 >
 > **串讲三原则**：①先讲成本模型与上界，再讲实现；②主动交代"哪里亏、为什么"（比吹嘘可信）；
 > ③所有结论要么有探针证据、要么明确标注"未验证"。方法学信条：**跑通 ≠ 写对**。
@@ -131,7 +131,15 @@
 | `config.py` `int4_dense_path`/`quantize_lm_head`/`awq_scales_path`/`int4_group_size` | 双路径开关 / lm_head 量化（默认关）/ 校准文件 / 组大小 |
 | 配套 | `_int4_check.py`、`_quant_ppl.py`（**端到端 ppl 是决定性指标，注意 run 间波动**，§10.3.6）、`_awq_diagnose.py`；§10.3.6 |
 
-#### 1.4.4 2:4 结构化稀疏
+#### 1.4.4 NVFP4（实验路径）
+| 读什么 | 要点 |
+|---|---|
+| `linear.py` `quantize_nvfp4_tensor`/`gemm_nvfp4_kernel` | E2M1 每字节打包两个值，K 维每 16 个值存 E4M3 scale，每矩阵一个 FP32 tensor scale；默认 `software` 后端在 Triton 内反量化后做 BF16 dot |
+| `nvfp4_cublaslt.py` / `linear.py` `nvfp4_backend="cublaslt"` | 动态打包 BF16 激活为 E2M1 + E4M3 scales，按 cuBLASLt tile swizzle 权重 scale，再调用 block-scaled 原生 FP4 MMA；SM100+、cuBLASLt 12.8+；权重只存一份 swizzled scale |
+| `model_runner.py` `quantize_nvfp4_weights`/`_streaming_quant_hook` | 普通加载和流式加载都支持；MLA `kv_b` 留小型 `w_deq` 供吸收式 decode；MoE router 跳过量化，纯量化专家走逐专家内核 |
+| 配套 | `tests/test_nvfp4.py` 覆盖两后端 scale、CUDA GEMM 与空专家批次；`_v2lite_4l_parity.py` 的已有 logits smoke 数据来自 software NVFP4；软件完整模型结果见 §10.3.14，native 性能结果见 §10.3.15 |
+
+#### 1.4.5 2:4 结构化稀疏
 | 读什么 | 要点 |
 |---|---|
 | `linear.py` `gemm_sparse24_kernel`/`sparse24_gemm` | 4 路拆分：a 按 K 步长 4 加载、`idx==p` 掩码重建权重块、4 个 dot；打包 `v [N,K//2] bf16` + `idx [N,K//4] uint8` |
@@ -393,6 +401,13 @@ M=256 scaled_mm 1.86×；fp8 decode 内核逐层 ~1.15ms；verify 启动税 ~10m
 （persistent 亏、split-K 仅小 M 赢——给条件不给背书）。
 
 ### 4.4 量化（路径取舍 + 精度方法论 + 诚实数字）
+
+**NVFP4 路径**：存储为 E2M1 packed nibbles + K 维 16 值一组的 E4M3 scale + 每矩阵 FP32 tensor
+scale。默认 `software` 后端由 `gemm_nvfp4_kernel` 在寄存器中反量化权重后做 BF16 dot；WSL 的
+Triton 3.4 `dot_scaled` 使用 MXFP4 的 E8M0 scale，不能将它称为 NVFP4 原生 MMA。可选
+`cublaslt` 后端动态量化 BF16 激活，再由 cuBLASLt 做 E4M3 block-scaled FP4 MMA。该后端要求
+Blackwell (SM100+) 与 cuBLASLt 12.8+；目前验证 RTX 5060 Ti/SM120、TP=1、eager，CUDA Graph
+与 TP>1 尚未验证。真实 DeepSeek-V2-Lite 的同 trace SLO goodput 对比见 §10.3.14–15。
 
 **机制**：w8a8（per-group 128 int8 + per-token int8 + SmoothQuant）、int4（per-group 对称 +
 2-dot 反量化内核 + 双路径 + `int4_group_size` 可配）、AWQ（α 搜索缩放折叠）、fp8 权重（e4m3
@@ -814,13 +829,13 @@ RTN 差在哪"。**动作**：①GPTQ（Hessian 逆 + 逐列误差补偿）在 0
 | `nanovllm/engine/scheduler.py` | **调度器** | `Scheduler` ：`schedule`  / `_compute_draft`  / `_schedule_mixed`  / `_spec_rows`  / `_schedule_spec`  / `_schedule_mixed_spec`  / `_schedule_prefill`  / `_schedule_decode`  / `preempt`  / `swap_out`  / `swap_in`  / `_try_swap_in`  / `_maybe_finish`  / `postprocess`  / `postprocess_spec`  |
 | `nanovllm/engine/sequence.py` | 序列状态（CPU 侧真源） | `SequenceStatus` 、`Sequence` （`kv_table` 滚动/全池表；`__getstate__` ） |
 | `nanovllm/engine/block_manager.py` | **KV 块池 + 前缀缓存 + COW + 滚动环** | `Block` 、`BlockManager` ：`_t`  / `ring_cap`  / `_evict_front`  / `compute_hash`  / `can_allocate`  / `allocate`  / `allocate_private`  / `deallocate`  / `can_append`  / `can_append_spec`  / `may_append_spec`  / `cow_block`  / `may_append`  / `hash_blocks`  |
-| `nanovllm/engine/model_runner.py` | **打包 + GPU 执行** | `ModelRunner` ：`call` （TP）/ `cow_block`  / `swap_out`  / `swap_in`  / `warmup_model`  / `quantize_int4_weights`  / `quantize_fp8_weights`  / `prune_sparse24`  / `quantize_awq_weights`  / `_decide_streaming` （meta 计数 + `cache_clear`）/ `_streaming_quant_hook`  / `_finalize_streaming`  / `calibrate_fp8_kv`  / `_finalize_mla_mode`  / `_finalize_rolling`  / `allocate_kv_cache`  / `_ring_rows`  / `prepare_prefill`  / `prepare_mixed`  / `prepare_spec`  / `_prepare_mixed_spec`  / `prepare_decode`  / `run_model`  / `_spec_graph_hidden`  / `capture_spec_graph`  / `run`  / `capture_cudagraph`  |
+| `nanovllm/engine/model_runner.py` | **打包 + GPU 执行** | `ModelRunner` ：`call` （TP）/ `cow_block`  / `swap_out`  / `swap_in`  / `warmup_model`  / `quantize_int4_weights`  / `quantize_nvfp4_weights`  / `quantize_fp8_weights`  / `prune_sparse24`  / `quantize_awq_weights`  / `_decide_streaming` （meta 计数 + `cache_clear`）/ `_streaming_quant_hook`  / `_finalize_streaming`  / `calibrate_fp8_kv`  / `_finalize_mla_mode`  / `_finalize_rolling`  / `allocate_kv_cache`  / `_ring_rows`  / `prepare_prefill`  / `prepare_mixed`  / `prepare_spec`  / `_prepare_mixed_spec`  / `prepare_decode`  / `run_model`  / `_spec_graph_hidden`  / `capture_spec_graph`  / `run`  / `capture_cudagraph`  |
 | `nanovllm/engine/ngram.py` | n-gram 投机（纯函数） | `find_ngram_draft` 、`verify_drafts`  |
 | `nanovllm/models/registry.py` | 按 model_type 选模型 | `get_model_class` ；`_PLANNED_BLOCKERS`  |
 | `nanovllm/models/*.py` | 7 个模型族（同构模板） | qwen3  · qwen2  · llama3  · mistral  · gemma2  · qwen3_moe  · deepseek_v2 （Attention/MLP/DecoderLayer/Model/ForCausalLM）；`compute_logits` 各 ForCausalLM 末尾（qwen3.py） |
 | `nanovllm/layers/attention.py` | **注意力：写 KV + flash/自研内核路由** | `store_kvcache_kernel`  / `store_kvcache`  / fp8 decode 内核  / `kv_rows_gather`  / `paged_decode_attention_fp8`  / `paged_decode_attention_bf16`  / fp8 varlen 内核  / `paged_varlen_attention_fp8`  / `Attention` （`forward` 、`_ring_varlen` 、`_decode_rows` ） |
 | `nanovllm/layers/attention_mla.py` | **MLA（DeepSeek）** | `mla_store`  / `mla_gather_dequant`  / `mla_decode_kernel`  / `mla_decode_attention`  / `MLAAttention` （`forward` 、`_decode_rows` 、`_decode_kernel` ） |
-| `nanovllm/layers/linear.py` | **全部 GEMM + 量化** | int8 内核  / w8a8  / int4 内核  / int4_gemm  / sparse24 内核  / sparse24_gemm  / fp8 激活量化  / fp8 内核  / fp8_gemm  / `WeightQuantMixin` （quantize_int4 、_int4_forward 、quantize_fp8 、quantize_sparse24 ）/ `LinearBase` （quantize_w8a8 、forward ）/ Column  / Merged  / QKV  / Row  |
+| `nanovllm/layers/linear.py` | **全部 GEMM + 量化** | int8 内核  / w8a8  / int4 内核  / int4_gemm  / NVFP4 内核  / nvfp4_gemm  / sparse24 内核  / sparse24_gemm  / fp8 激活量化  / fp8 内核  / fp8_gemm  / `WeightQuantMixin` （quantize_int4 、quantize_nvfp4 、_nvfp4_forward 、quantize_fp8 、quantize_sparse24 ）/ `LinearBase` （quantize_w8a8 、forward ）/ Column  / Merged  / QKV  / Row  |
 | `nanovllm/layers/moe.py` | **MoE（1.5）** | `ExpertFFN`  / `MoE` （`_route` 、forward 、`_forward_loop` 、`_forward_grouped` 、`reference` ） |
 | `nanovllm/layers/medusa.py` / `eagle.py` | 投机草稿头 | `MedusaHeads`  / `EagleLayer`  |
 | `nanovllm/layers/layernorm.py` / `rotary_embedding.py` / `activation.py` / `sampler.py` | 基础算子 | `RMSNorm`（含 weight_offset 变体）/ `RotaryEmbedding` （build_cache 、forward ）/ `get_rope` （**@lru_cache(1) 共享实例——meta 污染教训 §6 故事 18**）/ `SiluAndMul` / `Sampler`（Gumbel） |
@@ -1019,7 +1034,25 @@ python benchmarks/kv_fp8_calibrate.py --calibration-file calibration.jsonl \
 python benchmarks/context_concurrency.py --kv-cache-dtype fp8_e4m3 \
     --kv-calibration-path results/kv_eval.tokens.json --context-lengths 512,1024,2048 \
     --concurrency 1,2,4,8
+# 14. DeepSeek-V2-Lite INT4(group64) vs NVFP4：同一到达 trace + 联合 SLO goodput
+python benchmarks/scheduling_ablation.py --model ~/huggingface/DeepSeek-V2-Lite \
+    --variants all_on --num-seqs 8 --min-input-len 64 --max-input-len 64 \
+    --min-output-len 16 --max-output-len 16 --arrival-mode constant --arrival-rate 1 \
+    --slo-ttft-ms 5000 --min-request-ttft-slo-ms 5000 \
+    --max-request-ttft-slo-ms 5000 --slo-tpot-ms 1500 --max-model-len 512 \
+    --gpu-memory-utilization 0.9 --streaming-load --enforce-eager --no-swap-kv \
+    --warmup-seqs 2 --quantization int4 --int4-group-size 64 --seed 7 \
+    --output results/v2lite_int4_nvfp4_trace_int4.json
+# 历史 software NVFP4 运行：同一命令设 --quantization nvfp4 --nvfp4-backend software
+# 原生 cuBLASLt 运行与 paired 结果见 §10.3.15 / README 的 NVFP4 weight experiments
+python benchmarks/compare_quantization.py \
+    results/v2lite_int4_nvfp4_trace_int4.json \
+    results/v2lite_int4_nvfp4_trace_nvfp4.json --variant all_on \
+    --output results/v2lite_int4_nvfp4_trace_comparison.json
 ```
+
+软件 NVFP4 与 INT4 的早期全模型性能对比和 4 层精度 smoke check 见 §10.3.14；原生
+cuBLASLt 配对性能见 §10.3.15。结果 JSON 保存在各节列出的 `results/` 文件中。
 
 结果 JSON → `results/bench_<workload>_<ts>.json`；并发矩阵同时输出同 stem CSV；FP8 校准输出报告 JSON、摘要 CSV 和 `.tokens.json` 校准数据；profiling → `profiles/{prefill,decode}.txt`。
 
@@ -1388,6 +1421,398 @@ python benchmarks/scheduling_ablation.py --variants baseline all_on \
 
 **读数**：①让出机制在 burst 的**后续轮次**确实生效（8/8），迟到请求不必等整个 burst；②steady-state 差异 -21%（53.6 vs 68.3 ms），最差轮 -51%（329 vs 676 ms），前两轮的差距更大（含 JIT/图捕获）；③效应量级 ≈ `max_decode_steps × 单轮耗时`（8×~14 ms ≈ 110 ms 上界），所以 `max_decode_steps` 越大、单轮越慢，这个让出越值钱；④offline trace 驱动的消融表里这一列仍会是 0，因为那条路径无法在 step 内提交请求——**要衡量它必须走服务端并发提交**（本表）或以后加 "step 内可提交" 的驱动方式。
 
+
+#### 10.3.12 默认 mixed CUDA Graph 与 TTFT 配额复测（2026-10-09，Qwen3-0.6B，RTX 5060 Ti / WSL2）
+
+环境：Python 3.12.13、torch 2.8.0+cu128、CUDA 12.8、triton 3.4.0、flash-attn 2.8.3.post1。单 GPU、TP=1、bf16；64 请求，input 128–1024、output 64–512，seed 0，warmup 8。每项的首批使用相同 workload；四批对照重复相同 prompt，因此后续批已受 prefix cache 影响。
+
+```bash
+python benchmarks/bench.py --model ~/huggingface/Qwen3-0.6B --num-seqs 64 \
+  --min-input-len 128 --max-input-len 1024 --min-output-len 64 --max-output-len 512 \
+  --warmup-seqs 8 --seed 0 --repeat-batches 4
+python benchmarks/bench.py --model ~/huggingface/Qwen3-0.6B --num-seqs 64 \
+  --min-input-len 128 --max-input-len 1024 --min-output-len 64 --max-output-len 512 \
+  --warmup-seqs 8 --seed 0 --repeat-batches 4 --no-mixed-cudagraph
+python benchmarks/bench.py --model ~/huggingface/Qwen3-0.6B --num-seqs 64 \
+  --min-input-len 128 --max-input-len 1024 --min-output-len 64 --max-output-len 512 \
+  --warmup-seqs 8 --seed 0 --repeat-batches 1 \
+  --no-mixed-cudagraph --no-slo-aware-scheduling
+```
+
+| 配置 | 批次 | wall | output tok/s | TTFT p50/p99 | TPOT p50/p99 | 其他 |
+|---|---:|---:|---:|---:|---:|---|
+| mixed Graph 开 | 冷批 0 | 10.684 s | 1,740.2 | 1,753.9 / 3,659.5 ms | 21.0 / 53.0 ms | 9 captures / 9 replays；TTFT ≤500 ms 达标 6.3% |
+| mixed Graph 关 | 冷批 0 | 8.005 s | 2,322.6 | 559.0 / 1,054.5 ms | 16.5 / 25.5 ms | 9 eager fallback；TTFT ≤500 ms 达标 37.5% |
+| mixed Graph 开 | 热批 2/3 | 6.97 / 7.02 s | — | — | — | 每批 0 captures / 2 replays |
+| mixed Graph 关 | 热批 2/3 | 6.96 / 6.92 s | — | — | — | 每批 2 eager fallback |
+
+另外在 Graph 关闭时消融默认 TTFT SLO 配额（500 ms）：启用配额的冷批为 2,322.6 tok/s、TTFT p50/p99 559.0/1,054.5 ms、达标 37.5%，prefill 10 步；关闭配额为 2,287.7 tok/s、453.4/999.7 ms、达标 51.6%，prefill 3 步。吞吐差异约 1.5%，TTFT 指标偏向关闭配额；单次离线批次不足以据此改默认值，需用重复到达 trace 复验。
+
+**读数**：①冷批 Graph 吞吐比关闭 mixed Graph（mixed batch 改走 eager fallback）低约 25%，TTFT p50 约 3.1 倍；原因与每种形状的惰性 eager warmup/capture 落在计时区间一致。②捕获完成后，后两批墙钟时间与 mixed eager fallback 基本相同，没有观察到稳定吞吐收益；它们是 prefix-cache 热 workload，不代表新 prompt 首次到达。③这台卡上的下一步应先把常见 mixed shape 的 capture 时间从首个请求路径中移出，并分别报告 cold-start 与 steady-state；优化后再在更大的在线到达 trace 上重测。④同次 WSL `pytest -q` 为 79 passed、5 failed：4 项 scheduler 断言沿用旧的整段 prefill / 无条件 swap 假设，和默认 SLO 配额、recompute-aware swap 选择不一致；另 1 项 metrics 测试的 bare-engine fixture 缺少 `model_runner`。修复测试配置/fixture 后再把全套单测作为门禁。原始 JSON：
+
+- `results/bench_qwen3_graph_r4_n64_i128-1024_o64-512_20261009.json`
+- `results/bench_qwen3_no_graph_r4_n64_i128-1024_o64-512_20261009.json`
+- `results/bench_qwen3_no_graph_no_slo_n64_i128-1024_o64-512_20261009.json`
+
+#### 10.3.13 持续到达负载下 mixed graph 默认值与联合 SLO goodput（2026-10-09，Qwen3-0.6B，RTX 5060 Ti / WSL2）
+
+本机 Python 3.12.13、torch 2.8.0+cu128、CUDA 12.8、triton 3.4.0、flash-attn 2.8.3.post1；单 GPU、TP=1、bf16。固定 64 个请求、Poisson 到达、512-token 共享前缀、seed 11，输入随机长度 128–1024、输出上限 64–512、warmup 4。测量 SLO 固定为 TTFT ≤ 2000 ms 且平均 TPOT ≤ 80 ms。另在 16 req/s 用 seed 12 配对复验。每个准入变体使用新引擎，同一组里 trace 完全相同。
+
+SLO goodput 定义为：完成且同时满足 TTFT 与 TPOT 目标的请求数 / wall 秒，以及这些请求产生的输出 token / wall 秒。分母按**全部到达请求**统计；被拒绝请求不计入 goodput。`admission_ablation.py` 现在把逐请求 TTFT/TPOT、联合达标数、请求速率、输出 token 速率和实际 workload fingerprint 写入 JSON；`compare_ablation.py` 在 fingerprint 不一致时拒绝前后比较。
+
+| 到达率 / seed | mixed graph | 接收 / 拒绝 | 联合 SLO 达标 | SLO 输出 goodput | TTFT p50 / p99 |
+|---|---|---:|---:|---:|---:|
+| 8 req/s / 11 | 开（原服务默认） | 13 / 51 | 6 / 64 | 171.3 tok/s | 2002.8 / 4284.6 ms |
+| 8 req/s / 11 | 关（新服务默认） | 64 / 0 | 64 / 64 | 1520.9 tok/s | 82.7 / 179.0 ms |
+| 16 req/s / 11 | 开（原服务默认） | 15 / 49 | 7 / 64 | 231.5 tok/s | 1714.8 / 5517.2 ms |
+| 16 req/s / 11 | 关（新服务默认） | 64 / 0 | 64 / 64 | 1757.6 tok/s | 132.3 / 357.4 ms |
+| 16 req/s / 12 | 开 | 16 / 48 | 5 / 64 | 129.5 tok/s | 3192.4 / 6564.4 ms |
+| 16 req/s / 12 | 关 | 64 / 0 | 64 / 64 | 1762.4 tok/s | 90.4 / 396.0 ms |
+
+| 到达率 / seed | mixed graph | TPOT p50 / p99 |
+|---|---|---:|
+| 8 req/s / 11 | 开 / 关 | 18.1 / 72.3 → 16.9 / 20.2 ms |
+| 16 req/s / 11 | 开 / 关 | 19.6 / 82.7 → 20.8 / 28.4 ms |
+| 16 req/s / 12 | 开 / 关 | 19.1 / 89.3 → 19.6 / 26.5 ms |
+
+同 trace 比较命令：
+
+```bash
+python benchmarks/admission_ablation.py --num-seqs 64 --arrival-mode poisson --arrival-rate 16 \
+  --shared-prefix-len 512 --seed 11 --warmup-seqs 4 --mixed-cudagraph \
+  --slo-ttft-ms 2000 --slo-tpot-ms 80 --output results/before.json
+python benchmarks/admission_ablation.py --num-seqs 64 --arrival-mode poisson --arrival-rate 16 \
+  --shared-prefix-len 512 --seed 11 --warmup-seqs 4 \
+  --slo-ttft-ms 2000 --slo-tpot-ms 80 --output results/after.json
+python benchmarks/compare_ablation.py results/before.json results/after.json \
+  --variant dynamic_on_cache_aware
+```
+
+**结果与改动**：测量区间内 mixed graph 开启时，cache-aware 变体触发了 25 次 capture、27 次 replay（seed 11），以及 28 次 capture、29 次 replay（seed 12）；首次遇到这些形状的惰性 capture 与在线请求重叠。动态准入因此只接收 13–16 个请求，且大量仍超 TTFT SLO。关闭 mixed graph 后 mixed capture 为 0，纯 decode graph 仍启用（16 req/s seed 11 有 570 次 decode replay），64/64 请求都达到两个 SLO。为避免 HTTP 请求触发未见形状的惰性 capture，`create_app()` 与 `nanovllm-serve` 默认改用 eager mixed batch，`--mixed-cudagraph` 保留为显式 opt-in；直接 `LLM`/`Config` 的默认值不变。全套 WSL pytest 为 **87 passed**。
+
+这组结果限于一张 RTX 5060 Ti、Qwen3-0.6B、64 请求和上述两个 SLO；它不能证明其他模型、提示长度分布或 GPU 上 mixed graph 都会变慢。若要启用 mixed graph，应先在目标负载上预热/测量，并用相同 trace、seed 的联合 SLO goodput 比较。
+
+结果文件：
+
+- `results/admission_baseline_r8_shared512_s11.json`
+- `results/admission_baseline_r16_shared512_s11.json`
+- `results/admission_seed12_mixed_r16_shared512.json`
+- `results/admission_after_default_r8_shared512_s11.json`
+- `results/admission_after_default_r16_shared512_s11.json`
+- `results/admission_seed12_default_r16_shared512.json`
+
+#### 10.3.14 早期 NVFP4 software GEMM 对比 INT4（2026-10-09，DeepSeek-V2-Lite，RTX 5060 Ti / WSL2）
+
+环境：RTX 5060 Ti 16 GB、PyTorch 2.8 + CUDA 12.8、Triton 3.4。测试完整 DeepSeek-V2-Lite
+检查点（流式量化），固定 seed 7，8 个合成请求、输入 64 token、输出 16 token、常量到达率
+1 req/s，all-on 调度、eager、关闭 KV swap；TTFT/TPOT 目标分别为 5000/1500 ms。两种量化
+均从同一提示、到达时间和采样参数生成 workload fingerprint，比较器确认其余配置一致。
+流式加载会关闭 INT4 的 dense dual path，因此该项是纯 packed group64 INT4；两种格式只保留
+MLA `kv_b` 的小型 `w_deq` view。
+
+| 指标 | INT4 group64 | NVFP4 | NVFP4 相对变化 |
+|---|---:|---:|---:|
+| 总输出吞吐 | 4.51 tok/s | 3.86 tok/s | -14.4% |
+| 联合 TTFT+TPOT SLO 输出 goodput | 4.51 tok/s | 1.45 tok/s | -67.8% |
+| 达成联合 SLO 的请求 | 8/8 | 3/8 | -62.5 个百分点 |
+| TTFT p50 / p99 | 2.188 / 2.743 s | 2.800 / 4.592 s | +0.612 / +1.849 s |
+| TPOT p50 / p99 | 1.288 / 1.322 s | 1.574 / 1.607 s | +0.286 / +0.285 s |
+| E2E p99 | 22.05 s | 26.41 s | +4.35 s |
+
+**结论**：该历史 run 使用 software NVFP4 后端，在这张卡和这条 trace 上没有超过 INT4；它在
+1.5 s TPOT 目标下只满足 3/8 请求。software 路径在寄存器中解包 E2M1 与 E4M3 scale，再做
+BF16 dot。单条 8 请求 trace 是方向性结果，不外推到其他上下文、并发或 GPU；原生 cuBLASLt
+后端已在 §10.3.15 实现并测量。
+
+同次 software NVFP4 的 4 层真权重固定输入 logits smoke check 用两条文本 prompt，分别计算单 token 前缀和完整
+prompt 的输出 logits，共 4 个输入点。INT4 vs BF16 的 mean/max abs diff 为 0.349/2.868、
+KL 0.0292、top-1 一致 100%；NVFP4 为 0.231/2.562、KL 0.0539、top-1 一致 75%。误差指标
+不一致且样本太少，不能据此裁定量化任务质量；需要 held-out PPL 或任务集评估。
+
+当时计划优先实现支持 E4M3 block scale 的原生 NVFP4 MMA；现已实现，首轮结果与下一步见
+§10.3.15。原始软件 run 结果：
+`results/v2lite_int4_nvfp4_trace_comparison.json` 与 `results/v2lite_4l_quant_accuracy.json`；
+复现命令见 §10.2 步骤 14。
+
+#### 10.3.15 原生 NVFP4 cuBLASLt 配对压测（2026-10-09，DeepSeek-V2-Lite，RTX 5060 Ti / WSL2）
+
+环境：RTX 5060 Ti 16 GB / SM120、PyTorch 2.8.0+cu128、CUDA 12.8、cuBLASLt
+12.8.4.1、Triton 3.4。对完整 DeepSeek-V2-Lite 做 TP=1 流式量化；三个 run 使用相同 seed 7、
+8 个合成请求、64-token 输入、16-token 输出、constant 1 req/s、all_on 调度、eager、关闭
+KV swap、5 s TTFT 与 1.5 s TPOT SLO。`compare_quantization.py` 验证 workload fingerprint、
+设备和其余配置一致。INT4 使用 group64；两个 NVFP4 run 分别使用 `software` 和 `cublaslt`。
+INT4 与 software NVFP4 保留原有历史观察（§10.3.14），本表是当前代码的一组三路配对复测：
+
+| 指标 | INT4 group64 | NVFP4 software | NVFP4 cuBLASLt |
+|---|---:|---:|---:|
+| 总输出吞吐 | 4.42 tok/s | 4.46 tok/s | 4.41 tok/s |
+| 联合 TTFT+TPOT SLO 输出 goodput | 4.42 tok/s | 3.90 tok/s | 4.41 tok/s |
+| 同时满足两项 SLO 的请求 | 8/8 | 7/8 | 8/8 |
+| TTFT p50 / p99 | 2.011 / 2.425 s | 2.439 / 3.210 s | 2.985 / 3.985 s |
+| TPOT p50 / p99 | 1.133 / 1.326 s | 1.439 / 1.513 s | 1.330 / 1.402 s |
+| E2E p99 | 21.976 s | 24.610 s | 24.411 s |
+
+最终代码选择 cuBLASLt 启发式列表中排序靠前的有效候选。该单轮里它相对 software NVFP4
+总吞吐低 1.1%、联合 SLO goodput 高 13%；相对 INT4 的总吞吐和 SLO goodput 都低约 0.2%，
+两者都达成 8/8 请求 SLO。cuBLASLt 的 TTFT p50/p99 仍比 INT4 高约 0.97/1.56 s。
+最初按 workspace 最小值选算法，同一 trace 得到 4.21 tok/s / 1.58 tok/s SLO goodput、
+3/8 请求达标；换成启发式排序候选后为 4.41 / 4.41 tok/s、8/8 达标。这说明算法选择
+显著影响本次结果。TPOT 目标接近观测分布，8 请求的 goodput 对少数超时很敏感；这些数据
+仍是方向性样本，不能当作稳定总体估计。
+
+原生路径现在能在完整模型真实层形状上执行。GPU 单测还验证激活 E2M1 packing、cuBLASLt
+scale swizzle、GEMM 与 dequantized reference 的误差，以及 MoE 空专家的 M=0 快速返回；
+`tests/test_nvfp4.py tests/test_quantization_comparison.py` 为 15 passed，完整 WSL pytest 为
+102 passed。精度漂移 smoke 数据
+§10.3.14 来自 software NVFP4；原生后端新增的动态激活量化尚未做 full-model logits/PPL 评估。
+本次性能测试关闭 CUDA Graph，只测 TP=1；Graph 与 TP>1 组合未验证。
+
+MoE INT4 分段 GEMM 和 gate/up 融合已在 §10.3.16 实现，并完成多 seed、到达率、输出长度
+以及全部真实 MoE 层的复测。融合的收益随负载变化，尚无统一性能结论；NVFP4 激活量化精度
+与更多设备上的 CUDA Graph/TP 组合仍待验证。原生
+NVFP4 运行产物：
+`results/v2lite_int4_cublaslt_trace.json`、`results/v2lite_nvfp4_software_trace.json`、
+`results/v2lite_nvfp4_cublaslt_trace.json`、`results/v2lite_nvfp4_cublaslt_ranked_trace.json`、
+`results/v2lite_nvfp4_software_vs_cublaslt_ranked_comparison.json`、
+`results/v2lite_int4_vs_nvfp4_cublaslt_ranked_comparison.json`、
+`results/v2lite_nvfp4_cublaslt_min_workspace_vs_ranked_comparison.json`。
+
+#### 10.3.16 纯 INT4 MoE 分段 GEMM 与 gate/up 融合（2026-10-09，DeepSeek-V2-Lite）
+
+**实现**：新增 `moe_int4_backend="segment"`，将路由后的 token-expert assignment 按专家排序，
+用 offsets/counts 驱动无 padding Triton INT4 GEMM。专家 packed 权重仍保存在原有线性层 buffer，
+小型 device pointer table 只负责定位权重和 scale，不会复制整层量化权重。可将 gate/up 两个
+projection 放入同一 Triton launch（`moe_int4_fuse_gate_up=True`）；关闭该开关即可跑 split
+消融。默认 backend 仍是 `loop`，不改变既有模型默认行为。
+
+支持边界：TP=1、BF16/FP16 激活、所有专家 projection 使用相同且受支持的 INT4 group size，
+并且不使用 AWQ activation scale 或 INT4 `w_deq` 双路径副本。NVFP4、FP8、W8A8、AWQ 等继续
+使用原 automatic grouped/loop 后端；TP>1 不使用此分段内核。动态路由图捕获仍未验证。DeepSeek-V2-Lite 需要
+`--int4-group-size 64`。
+
+**单层计时与精度**：RTX 5060 Ti 16 GB / SM120、WSL2、PyTorch 2.8.0+cu128、Triton 3.4.0；
+使用真实 DeepSeek-V2-Lite 权重，第一 MoE 层 H=2048/I=1408/E=64/top-k=6。每种变体 warmup
+3 次；每个 CUDA-event 样本包含 10 次 forward，取 7 个样本的中位数。三种后端对同一输入
+相对 loop 均为逐位一致（relative error = 0，max absolute error = 0）。
+
+| 输入 token | loop | segment split | segment fused | loop/split | loop/fused |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 63.158 ms | 1.205 ms | 1.120 ms | 52.4× | 56.4× |
+| 8 | 29.873 ms | 2.490 ms | 2.133 ms | 12.0× | 14.0× |
+| 32 | 78.592 ms | 2.951 ms | 2.933 ms | 26.6× | 26.8× |
+
+以 1-token profile 为例，独立计时的路由/dispatch-sort-gather/gate-up GEMM/SiLU/down GEMM/
+weighted scatter（ms）如下。不同阶段分别重复计时，因此这些数值不能相加为整层 latency；
+loop 的 Python 专家循环与 allocator 也让分阶段数字比 segment 更容易受主机时钟扰动。
+
+| 阶段 | loop | segment split | segment fused |
+|---|---:|---:|---:|
+| route + top-k | 0.078 | 0.076 | 0.078 |
+| dispatch / sort / gather | 21.245 | 0.350 | 0.332 |
+| gate + up GEMM | 5.127 | 0.094 | 0.097 |
+| SiLU × up | 0.894 | 0.014 | 0.024 |
+| down GEMM | 1.860 | 0.057 | 0.055 |
+| weighted scatter | 4.904 | 0.032 | 0.042 |
+
+主要收益来自将 64 个专家的 mask/gather/小 GEMM/scatter 调用收成分段 GEMM。融合 gate/up
+把两次 kernel launch 收成一次，但本次 gate/up GEMM 阶段耗时接近持平，说明融合本身的收益
+小于 loop → segment 的收益。
+
+**连续到达消融**：三个 backend 使用同一 workload fingerprint
+`5302d61edb11c1fc`，seed 7，8 个请求、64-token 输入、16-token 输出、constant 4 req/s，
+10 s TTFT 与 600 ms TPOT 联合目标，all_on 调度，eager，streaming pure INT4 group64，关闭
+KV swap。两轮的命令和配置相同，`compare_ablation.py` 检查 workload 与硬件/引擎配置。
+
+| run | backend | 输出 tok/s | 联合 SLO goodput tok/s | SLO 请求 | TTFT p50 | TPOT p50 |
+|---:|---|---:|---:|---:|---:|---:|
+| 1 | loop | 4.83 | 0.00 | 0/8 | 1793 ms | 1526 ms |
+| 1 | segment split | 27.86 | 27.86 | 8/8 | 210 ms | 124 ms |
+| 1 | segment fused | 33.23 | 33.23 | 8/8 | 177 ms | 132 ms |
+| 2 | loop | 5.28 | 0.00 | 0/8 | 3717 ms | 1301 ms |
+| 2 | segment split | 36.75 | 36.75 | 8/8 | 1112 ms | 87 ms |
+| 2 | segment fused | 37.96 | 37.96 | 8/8 | 180 ms | 81 ms |
+
+**初轮判断（历史结果）**：segment 在两轮中均显著提高端到端吞吐（约 5.8–7.2×）并将
+joint-SLO 请求从 0/8 提升至 8/8。Fused 相对 split 的吞吐分别高 19.3% 和 3.3%；该小样本
+结果只能作为早期观察，后续扩展复测见下。
+
+##### 扩展正确性与服务负载复测
+
+**真实层正确性**：仍使用 RTX 5060 Ti 16 GB / SM120、WSL2、PyTorch 2.8.0+cu128、Triton
+3.4.0、DeepSeek-V2-Lite 流式纯 INT4 group64。第一 MoE 层额外覆盖 5 个输入 seed
+（7/17/42/91/123）和 1/8/32/128 token，共 20 组；另对全部 26 个真实 MoE 层覆盖
+seed 7/17/42 和 1/8/32 token，共 234 个 layer/seed/batch 组合。所有 split、fused 输出都与
+同层 `_forward_loop` **逐位一致**（max absolute error=0，relative error=0）。这证明内核在
+固定输入下的层级计算正确；不把连续调度下生成序列的偶发差异等同于该层 kernel 失配。
+
+**4/8 req/s 全模型矩阵**：保持 8 请求、64-token 输入，输出长度 16/64，seed 7/17/42，
+constant arrival，每个条件重复两次，共 24 个 split/fused 配对。配置为 TP=1、eager、纯
+INT4 group64、关闭 KV swap，TTFT 10 s / TPOT 600 ms；每次计时前预热两种内核并清空空闲前缀
+KV，配对顺序交替。结果如下；delta 为 fused 相对 split 的输出吞吐变化。
+
+| 到达率 | 输出 token | 配对数 | fused 胜/负 | delta 中位数 | delta 范围 |
+|---:|---:|---:|---:|---:|---:|
+| 4 req/s | 16 | 6 | 1 / 5 | -5.1% | -10.0% 到 +14.4% |
+| 4 req/s | 64 | 6 | 3 / 3 | +2.2% | -3.4% 到 +19.9% |
+| 8 req/s | 16 | 6 | 1 / 5 | -4.0% | -18.5% 到 +0.6% |
+| 8 req/s | 64 | 6 | 2 / 4 | -2.7% | -8.4% 到 +27.1% |
+| **合计** | — | **24** | **7 / 17** | **-2.4%** | **-18.5% 到 +27.1%** |
+
+该矩阵所有后端运行都达到 8/8 联合 SLO，因此请求达标率没有区分度，joint-SLO token
+goodput 的变化与总输出吞吐相同。TTFT p50 和 TPOT p50 的总体 delta 中位数分别为 +3.6% 和
++3.2%（延迟变差）。融合没有在这些负载下产生稳定收益，16-token 输出尤其倾向 split。
+
+**16 req/s 压力点**：增加到 16 个请求、64-token 输出，TPOT 目标收紧到 150 ms，seed
+7/17/42，每个 seed 重复两次，共 6 个配对。所有 split/fused 运行均为 16/16 联合达标；fused
+吞吐中位数高 5.4%，5 胜 1 负，但范围为 -20.3% 到 +31.9%，重复波动仍大，也没有改变请求
+达标数量。这个结果提示融合可能在长输出高并发下有收益，但还不足以形成稳定的服务策略。
+
+**SLO 拐点复测（2026-10-11）**：仍为 RTX 5060 Ti 16 GB / SM120、WSL2、PyTorch
+2.8.0+cu128、Triton 3.4.0、DeepSeek-V2-Lite 流式纯 INT4 group64、TP=1、eager、关闭 KV
+swap，TTFT 目标 10 s，greedy argmax。constant-arrival 每个条件 24 个请求、输入 64 token，
+seed 7/17/42，每个 seed 重复 3 次；split/fused 配对顺序交替、每次跑前预热两个 kernel，
+清空空闲 prefix KV。150/125 ms TPOT 各测输出 16/64/128 和 16/24/32 req/s（每后端每格
+216 个请求、9 条 trace）；100 ms TPOT 测输出 64/128（共 54 对）。下表每格依次为
+**split/fused 联合 SLO 达标请求数（总数 216）**和**每条 trace 的平均 joint-SLO output
+goodput（split/fused tok/s）**：
+
+| TPOT | 输出 token | 16 req/s | 24 req/s | 32 req/s |
+|---:|---:|---:|---:|---:|
+| 150 ms | 16 | 216/216；127.9/131.1 | 216/197；151.5/131.8 | 211/216；144.1/162.7 |
+| 150 ms | 64 | 216/216；198.6/198.5 | 216/216；201.9/222.4 | 216/216；210.1/217.4 |
+| 150 ms | 128 | 216/216；216.8/225.4 | 216/216；226.9/223.3 | 216/216；227.1/230.3 |
+| 125 ms | 16 | 125/168；71.4/100.3 | 166/181；115.8/122.7 | 145/190；108.9/144.8 |
+| 125 ms | 64 | 216/195；197.1/175.6 | 213/216；211.9/208.3 | 192/216；187.7/216.1 |
+| 125 ms | 128 | 216/216；210.2/210.0 | 216/216；225.2/223.8 | 216/216；228.3/226.2 |
+| 100 ms | 64 | 133/136；132.1/133.5 | 93/92；96.6/94.6 | 88/89；90.3/91.2 |
+| 100 ms | 128 | 111/115；116.0/121.7 | 63/143；68.4/153.8 | 72/141；78.2/155.8 |
+
+100 ms 的 128-token 输出在 24/32 req/s 是值得继续确认的条件：fused 分别通过 143/216
+和 141/216 个请求，split 为 63/216 和 72/216；9 个配对的中位 joint-SLO goodput 差分别为
+129.81 和 202.24 tok/s。该差异在请求通过数上明显，但重复结果仍抖动：24 req/s 时 split
+有 6/9 轮零达标、2/9 轮全达标，fused 有 2/9 轮零达标、4/9 轮全达标；32 req/s 时分别为
+split 6/9 零、3/9 全，fused 3/9 零、5/9 全。100 ms、64-token 输出则 fused 和 split 的
+达标总数接近，随到达率增加从约 62% 降到约 41–43%。因此融合在 128-token 严格 SLO 下有
+条件性收益信号，不应外推到短输出或更松的目标。
+
+按这组离散采样点，150 ms 时 64/128-token 输出在 32 req/s 仍 100% 达标；125 ms 时
+128-token 输出仍全达标、64-token split 在 32 req/s 降到 192/216；100 ms 时两种长度在
+16 req/s 已出现 goodput 下降。128-token 的 TPOT 拐点因此落在 100–125 ms 之间，64-token
+则更受负载和后端影响。这里找到的是联合 SLO 达标率下降区间；尚未细分 100–125 ms 的
+精确目标拐点。
+
+三档共 216 个 split/fused 配对：150 ms 的输出吞吐中位 delta 为 +2.51%（49 胜/32 负，范围
+-22.84% 到 +31.71%）；125 ms 为 +1.28%（43 胜/38 负，-22.42% 到 +42.12%）；100 ms 为
++3.53%（33 胜/21 负，-20.31% 到 +28.38%）。连续到达生成 token 在 150/125/100 ms 分别有
+65/81、70/81、42/54 对完全一致，共 177/216 对；固定输入的 234 组 layer parity 仍逐位一致。
+这些结果支持“融合收益随输出长度、到达率和 TPOT 变化”，不支持“融合普遍提高推理吞吐”。
+
+**端到端 token 诊断**：确定性 argmax 的连续到达运行在中负载矩阵中有 22/24 对完全相同，
+高负载点有 5/6 对相同；少数差异发生在生成早期，且对应条件中同一后端的两次重复输出也
+不完全一致，说明它受持续调度的 batch 形状/执行历史影响。固定输入的 234 组层级结果仍全部
+逐位相同。后续若要把端到端 token parity 作为硬门槛，应先固定 decode batch 形状并定位其
+非确定性来源。
+
+**结论（截至 2026-10-11）**：保留 split/fused 消融开关，暂不把 fused 宣称为普遍优化。
+已经在 100 ms TPOT 条件下观察到 64/128-token 输出 goodput 下跌；128-token 输出的 fused
+后端在 24/32 req/s 有较高达标数，值得做固定 trace 的追加重复以确认。下一步应先收窄
+100–125 ms 的 TPOT 区间、控制并记录 GPU 时钟与 decode batch 形状，再评估把 SiLU×up 融入
+gate/up 输出以减少中间张量写读。其他到达率、输出长度、硬件和 CUDA Graph/TP 组合仍需
+单独验证。
+
+运行产物：`results/moe_int4_ablation_final.json`、`results/moe_int4_arrival_loop.json`、
+`results/moe_int4_arrival_segment_split.json`、`results/moe_int4_arrival_segment_fused.json`、
+以及第二轮 `results/moe_int4_arrival_r2_*.json`；扩展正确性为
+`results/moe_int4_ablation_seed_matrix_20261009.json` 和
+`results/moe_int4_all_layer_correctness_20261009.json`，全模型配对矩阵为
+`results/moe_int4_fuse_sweep_greedy_rep2_20261009.json`，16 req/s 压力点为
+`results/moe_int4_fuse_stress_r16_out64_tpot150_20261009.json`。本次拐点复测为
+`results/moe_int4_fuse_load150_20261011.json`、`results/moe_int4_fuse_load125_20261011.json`、
+`results/moe_int4_fuse_load100_long_20261011.json`。初轮 near-greedy trace
+`results/moe_int4_fuse_sweep_20261009.json` 仅用于诊断随机采样差异，不作为正确性门槛。
+
+**100–125 ms TPOT 细化复测（2026-10-11）**：在 105/110/115/120 ms、24/32 req/s、64/128-token 下各测 3 seeds × 5 次 split/fused 配对，共 240 对。每对沿用相同 prompt/arrival fingerprint、2-seq warmup、交替后端顺序并在 trace 后清空 prefix KV；同时按 1 s 间隔记录 GPU 时钟与逐次 model-call shape。128-token fused 吞吐中位 delta 为 +2.24%（70 胜/50 负，范围 -17.93%～+18.16%），64-token 为 +0.81%（64 胜/56 负，范围 -28.65%～+29.87%）；joint-SLO output goodput delta 中位数分别 +5.04/+1.48 tok/s，但重复范围都跨正负，未确认稳定融合收益。按 24/32 req/s 合计的联合 SLO 请求数如下（每端每格 720）：
+
+| TPOT | 64-token split/fused | 128-token split/fused |
+|---:|---:|---:|
+| 105 ms | 514/522 | 549/614 |
+| 110 ms | 555/598 | 679/693 |
+| 115 ms | 654/653 | 720/719 |
+| 120 ms | 648/709 | 720/720 |
+
+两后端每条 trace 的 SM clock 中位数均为 2775 MHz（范围 2760–2775），decode batch p50/max 均为 24 行，但完整 batch shape histogram 仅 53/240 对一致。端到端 greedy token parity 为 212/240；28 个不一致均在 seed=42、request index 23、0-based 输出 token index 48 首次分歧。同后端重复也有少数组发生 fingerprint 变化，原始 JSON 未保存分歧处 logits/token ID。后续固定形状与在线诊断见 §§10.3.17–10.3.18；保留 split/fused 消融开关，不宣称融合普遍提升。详细逐负载配对表见 [benchmarks/_moe_report.md](benchmarks/_moe_report.md)，原始 JSON 为 `results/moe_int4_fuse_load105_120_rep5_20261011.json`。
+
+#### 10.3.17 固定 batch 形状下的 INT4 MoE 分歧诊断（2026-10-12）
+
+DeepSeek-V2-Lite / RTX 5060 Ti / WSL2，TP=1、INT4 group64、segment backend、eager。24 个
+合成 prompt 请求同时提交，每条输入 64 tokens；seed 7/17/42、随机采样温度 0.6/0.8/1.0、
+固定输出 64/128 tokens。split/fused 各做两次完整 24 路、128-token warmup，然后对 18 个条件
+各做三次交替顺序配对，共 54 对。另跑 6 个 greedy 条件用于输出正确性检查。
+
+随机采样 split/fused token 输出在 432/432 个请求上完全一致，greedy 为 144/144。性能回放使用
+split 输出 token trace 固定两端的每个模型输入；54/54 对的输入 fingerprint 和 model-call shape
+histogram 完全相同。按输出长度汇总：
+
+| 输出长度 | 配对数 | fused 输出吞吐中位 delta | 胜/负 | 范围 |
+|---:|---:|---:|---:|---:|
+| 64 | 27 | +3.49% | 20/7 | -10.05%～+21.60% |
+| 128 | 27 | +3.56% | 18/9 | -9.61%～+14.20% |
+| 合计 | 54 | +3.52% | 38/16 | -10.05%～+21.60% |
+
+按 workload seed 汇总，中位 delta 分别为 seed 7 +3.07%（14/4）、seed 17 +3.53%（12/6）、
+seed 42 +2.64%（12/6）；每个 seed 的配对范围仍跨零。
+
+整体 TPOT p50 中位 delta 为 -3.69%（fused 较低），SM clock 中位数两端均为 2760 MHz。
+虽然吞吐中位数偏正，但配对范围跨零，仍不足以证明稳定的融合收益；本次全批同时到达，且
+60 s TTFT / 10 s TPOT 目标仅用于报告，不能据此推断连续到达下的 SLO goodput。
+
+旧实验的 seed=42 / request 23 / token 48 哨兵在固定 batch greedy teacher-forced 回放下，
+102400 个完整 logits 完全相同；26 个 MoE 层的输入、路由、gate/up/down 投影及输出均 bitwise
+相同。旧的 token 48 分歧在本次 all-at-once 固定 batch 测试中没有复现，也没有重建旧的到达调度历史。
+后续在线 trace 在 §10.3.18 再次复现该分歧；固定逻辑 KV 的行置换回放排除了目标调用的行顺序，当前证据
+指向更早形成的 KV 状态，首次不同的位置仍待定位。固定 batch 结论仍只约束 all-at-once workload，不能
+外推为在线 serving goodput。
+
+详细温度拆分与 GPU 时钟/形状记录见 [MoE 实验报告](benchmarks/_moe_report.md) 和
+[固定 batch 结果 JSON](results/moe_int4_fixed_shape_diag_20261012.json)；复现实验脚本为
+[moe_int4_fixed_shape_diag.py](benchmarks/moe_int4_fixed_shape_diag.py)。
+
+#### 10.3.18 连续到达下的 MLA decode 行置换隔离（2026-10-12）
+
+**目的与配置**：判断 10/11 融合复测中 request 23 / 输出 token 48 的分歧是否由 split/fused
+两端 decode batch 行顺序不同造成。复用同一 arrival workload fingerprint
+`9f9947466d6d1844a4ac1b6ebedf565eec33d6d170e37c3c0ccc496ec9a84782`：DeepSeek-V2-Lite，
+RTX 5060 Ti / SM120，TP=1、INT4 group64、segment、eager，seed 42、32 req/s、24 个请求、
+64-token 输入/输出、10 s TTFT / 115 ms TPOT，greedy argmax。每端使用两请求 warmup，清空 idle
+prefix KV；完成五对诊断 trace。诊断 hook 会复制 layer 1 的 hidden 与逻辑 MLA KV，并在模型调用后
+用相同 hidden/KV 重建小型缓存，按 split 和 fused 实际观察到的行序回放。所有诊断运行时间均不作为
+性能数据。
+
+| 检查 | 结果 |
+|---|---:|
+| split/fused 目标调用顺序不同 | 5/5 对 |
+| token 输出完全一致 | 4/5 对；唯一差异为 request 23 / token 48 |
+| 固定每端 KV、复现原始行序并与 live 输出逐位一致 | 10/10 后端状态 |
+| 固定每端 KV、切换为对端观察到的行序后逐位一致 | 10/10 后端状态；每次 24/24 行 |
+| 两端位置相同的请求行：hidden 完全相同 | 96/96 行 |
+| 两端位置相同的请求行：逻辑 KV / attention 输出完全相同 | 95/96 行 |
+
+失败配对仍是相同的 request 23 输入 token 17、position 111。该目标行进入 layer 1 attention 的
+hidden state 在两端 2048/2048 元素 bitwise 相同；但 split/fused 的 112-token 逻辑 KV 有
+19,575/64,512 个元素不同，max abs `0.125`。attention 输出有 958/2,048 个元素不同，max abs
+`9.77e-4`、relative L2 `2.72e-3`；最终 top-1 分别为 split `7002`（margin `0.6875`）与 fused
+`15`（margin `9.5625`）。CPU/CUDA RNG state hash 前后相同。失败配对中两种顺序重放都能逐位复现
+各自 live attention 输出，而保持每端 KV 不变、仅交换 24 行顺序后，attention 输出仍完全一致。
+
+因此，这次 token 分歧不能归因于目标 decode 调用里的 batch 行置换。分歧已经在进入当前 MLA
+attention 时的逻辑 KV 状态中；这组实验尚未确定这些缓存元素最早在哪个 prompt/decode 位置产生差异，
+也没有定位它们来自前序层的数值变化还是 cache 生命周期。下一步应跟踪 request 23 在 prompt prefill
+至 position 111 的 layer-1 KV 写入与对应 hidden，找到最早不同的位置，再核对该位置的 MLA cache
+block table / slot mapping。此结果不构成修改 MoE fused GEMM 的证据，融合仍保持实验选项。
+
+复现实验入口为 [moe_int4_arrival_diag.py](benchmarks/moe_int4_arrival_diag.py)。详细逐对指标见
+[MoE 实验报告](benchmarks/_moe_report.md)，原始结果为
+[moe_int4_mla_row_permutation_rep5_20261012.json](results/moe_int4_mla_row_permutation_rep5_20261012.json)。
 
 ### 10.4 Profiling
 

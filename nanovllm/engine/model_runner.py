@@ -104,6 +104,8 @@ class ModelRunner:
                 self.calibrate_and_quantize_w8a8()
             elif config.quantization == "int4":
                 self.quantize_int4_weights()
+            elif config.quantization == "nvfp4":
+                self.quantize_nvfp4_weights()
             elif config.quantization == "awq":
                 self.quantize_awq_weights()
             elif config.quantization == "sparse24":
@@ -384,6 +386,18 @@ class ModelRunner:
             dp = self.config.int4_dense_path or getattr(m, "is_mla_kv_b", False)
             m.quantize_int4(dense_path=dp, group_size=self.config.int4_group_size)
 
+    def quantize_nvfp4_weights(self):
+        """NVFP4 E2M1 weights with 16-value E4M3 block scales.
+
+        MLA ``kv_b`` retains its small dequantized view for absorbed decode; all
+        other linears stay packed and use the configured NVFP4 GEMM backend.
+        """
+        for m in self._quant_mods():
+            m.quantize_nvfp4(
+                keep_dense=getattr(m, "is_mla_kv_b", False),
+                backend=self.config.nvfp4_backend,
+            )
+
     def quantize_fp8_weights(self):
         """FP8(e4m3) 全量化（per-column 权重 + per-token 激活，vLLM 同款方案）。
 
@@ -535,11 +549,13 @@ class ModelRunner:
                 if isinstance(m, ParallelLMHead):
                     # 与 eager 的 _quant_mods 同规则：默认不量化；tie 绑定时跳过
                     if self.config.quantize_lm_head and not self.config.hf_config.tie_word_embeddings:
-                        if q in ("int4", "awq", "sparse24", "fp8"):
+                        if q in ("int4", "nvfp4", "awq", "sparse24", "fp8"):
                             if q == "sparse24":
                                 m.quantize_sparse24()
                             elif q == "fp8":
                                 m.quantize_fp8()
+                            elif q == "nvfp4":
+                                m.quantize_nvfp4(backend=self.config.nvfp4_backend)
                             else:
                                 s = awq_scales.get(full) if awq_scales is not None else None
                                 m.quantize_int4(s, dense_path=dp, group_size=self.config.int4_group_size)
@@ -553,6 +569,11 @@ class ModelRunner:
                     m.quantize_int4(awq_scales.get(full) if awq_scales is not None else None,
                                     group_size=self.config.int4_group_size,
                                     dense_path=dp or kvb)
+                elif q == "nvfp4":
+                    m.quantize_nvfp4(
+                        keep_dense=kvb,
+                        backend=self.config.nvfp4_backend,
+                    )
                 elif q == "awq":
                     assert awq_scales is not None and full in awq_scales, \
                         f"awq scale missing for {full}"

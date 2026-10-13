@@ -15,12 +15,14 @@ from __future__ import annotations
 
 import argparse
 import gc
+import hashlib
 import json
 from math import isfinite
 import os
 import random
 import time
 from datetime import datetime, timezone
+from typing import Callable
 
 import torch
 
@@ -92,6 +94,28 @@ def build_ttft_slo_targets(num_requests: int, min_ms: float, max_ms: float,
     return [rng.uniform(min_ms, max_ms) for _ in range(num_requests)]
 
 
+def workload_fingerprint(prompts, sampling_params, arrival_times,
+                         ttft_slo_targets_ms, tpot_slo_targets_ms,
+                         seed: int) -> str:
+    """Hash the concrete inputs and deadlines so separate runs can be paired."""
+    trace = {
+        "seed": seed,
+        "prompt_token_ids": prompts,
+        "sampling": [
+            {"temperature": params.temperature,
+             "max_tokens": params.max_tokens,
+             "ignore_eos": params.ignore_eos}
+            for params in sampling_params
+        ],
+        "arrival_times_seconds": arrival_times,
+        "ttft_slo_targets_ms": ttft_slo_targets_ms,
+        "tpot_slo_targets_ms": tpot_slo_targets_ms,
+    }
+    encoded = json.dumps(trace, sort_keys=True, separators=(",", ":"),
+                         allow_nan=False).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def scheduler_list(engine: LLM):
     return ((engine.prefill_scheduler, engine.decode_scheduler) if engine._pd
             else (engine.scheduler,))
@@ -116,12 +140,9 @@ def _step_stats_empty():
     }
 
 
-def run_arrival_trace(args, prompts, sampling_params, arrival_times,
-                      ttft_slo_targets_ms: list[float],
-                      policy: dict[str, bool]) -> dict:
-    torch.manual_seed(args.seed)
-    torch.cuda.manual_seed_all(args.seed)
-    engine = LLM(
+def create_arrival_engine(args, policy: dict[str, bool]) -> LLM:
+    """Construct an engine with the exact configuration used by this harness."""
+    return LLM(
         args.model,
         execution_mode="mixed",
         tensor_parallel_size=args.tp,
@@ -130,6 +151,10 @@ def run_arrival_trace(args, prompts, sampling_params, arrival_times,
         enforce_eager=args.enforce_eager,
         kv_cache_dtype=args.kv_cache_dtype,
         quantization=args.quantization,
+        nvfp4_backend=args.nvfp4_backend,
+        int4_group_size=args.int4_group_size,
+        moe_int4_backend=args.moe_int4_backend,
+        moe_int4_fuse_gate_up=not args.no_moe_int4_fuse_gate_up,
         streaming_load=args.streaming_load,
         kv_swap=not args.no_swap_kv,
         kv_swap_space_gb=args.kv_swap_space_gb,
@@ -147,6 +172,21 @@ def run_arrival_trace(args, prompts, sampling_params, arrival_times,
         tpot_throttle_max_waiting=args.tpot_throttle_max_waiting,
         **policy,
     )
+
+
+def run_arrival_trace(args, prompts, sampling_params, arrival_times,
+                      ttft_slo_targets_ms: list[float],
+                      policy: dict[str, bool], *, engine: LLM | None = None,
+                      capture_completion_tokens: bool = False,
+                      before_trace: Callable[[LLM], None] | None = None) -> dict:
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
+    owns_engine = engine is None
+    if engine is None:
+        engine = create_arrival_engine(args, policy)
+    if not engine.is_finished():
+        raise RuntimeError("run_arrival_trace requires an idle, fully drained engine")
+    completion_token_ids = {}
     try:
         # Compile kernels and warm CUDA without inserting workload prefixes into the cache.
         warmup_count = min(args.warmup_seqs, len(prompts))
@@ -162,6 +202,9 @@ def run_arrival_trace(args, prompts, sampling_params, arrival_times,
                 SamplingParams(temperature=0.6, ignore_eos=True, max_tokens=8),
                 use_tqdm=False,
             )
+
+        if before_trace is not None:
+            before_trace(engine)
 
         torch.manual_seed(args.seed)
         torch.cuda.manual_seed_all(args.seed)
@@ -239,6 +282,8 @@ def run_arrival_trace(args, prompts, sampling_params, arrival_times,
             for seq_id, token_ids in finished:
                 if seq_id not in completed_seq_ids:
                     completed_seq_ids.add(seq_id)
+                if capture_completion_tokens:
+                    completion_token_ids[seq_id] = list(token_ids)
             completed = len(completed_seq_ids)
 
         torch.cuda.synchronize()
@@ -256,7 +301,7 @@ def run_arrival_trace(args, prompts, sampling_params, arrival_times,
                 f"only {len(set(row_ids))} of {len(prompts)} requests were recorded; "
                 f"the run stopped before every request completed")
         summary = summarize_requests(metrics, wall, args)
-        return {
+        result = {
             "wall_seconds": wall,
             "summary": summary,
             "scheduler_metrics": {
@@ -283,11 +328,18 @@ def run_arrival_trace(args, prompts, sampling_params, arrival_times,
             "per_request": metrics["per_request"],
             "policy": policy,
         }
+        if capture_completion_tokens:
+            result["completion_token_ids"] = {
+                str(seq_id): tokens
+                for seq_id, tokens in sorted(completion_token_ids.items())
+            }
+        return result
     finally:
-        engine.exit()
-        del engine
-        gc.collect()
-        torch.cuda.empty_cache()
+        if owns_engine:
+            engine.exit()
+            del engine
+            gc.collect()
+            torch.cuda.empty_cache()
 
 
 def summarize_requests(metrics: dict, wall: float, args) -> dict:
@@ -304,11 +356,20 @@ def summarize_requests(metrics: dict, wall: float, args) -> dict:
     e2e = [row["t_completed"] - row["t_submitted"] for row in rows
            if row["t_completed"] is not None and row["t_submitted"] is not None]
     total_output = sum(row["completion_tokens"] for row in rows)
+    joint_slo_rows = [
+        row for row in rows
+        if row.get("t_completed") is not None
+        and row.get("ttft_slo_met") is True
+        and row.get("tpot_slo_met") is True
+    ]
+    joint_slo_output_tokens = sum(row["completion_tokens"] for row in joint_slo_rows)
     stats = metrics["step_stats"]
     ttft_slo_count = sum(value * 1000 <= args.slo_ttft_ms for value in ttft)
     tpot_slo_count = sum(value * 1000 <= args.slo_tpot_ms for value in tpot)
     request_slo_rows = [row for row in rows if row.get("ttft_slo_met") is not None]
     request_tpot_slo_rows = [row for row in rows if row.get("tpot_slo_met") is not None]
+    request_ttft_targets = [row["ttft_slo_ms"] for row in rows
+                            if row.get("ttft_slo_ms") is not None]
     prefill_tps = (stats["prefill_tokens"] / stats["prefill_time"]
                    if stats["prefill_time"] > 0 else None)
     decode_tps = (stats["decode_tokens"] / stats["decode_time"]
@@ -321,6 +382,19 @@ def summarize_requests(metrics: dict, wall: float, args) -> dict:
         "requests_completed": len(rows),
         "output_tokens": total_output,
         "throughput_output_tok_per_s": total_output / wall if wall else 0.0,
+        "slo_goodput": {
+            "ttft_target_ms_min": min(request_ttft_targets, default=None),
+            "ttft_target_ms_max": max(request_ttft_targets, default=None),
+            "tpot_target_ms": args.slo_tpot_ms,
+            "joint_slo_requests": len(joint_slo_rows),
+            "joint_slo_request_rate_per_second": (
+                len(joint_slo_rows) / wall if wall else 0.0),
+            "joint_slo_arrival_percent": (
+                100.0 * len(joint_slo_rows) / max(1, len(rows))),
+            "joint_slo_output_tokens": joint_slo_output_tokens,
+            "joint_slo_output_tokens_per_second": (
+                joint_slo_output_tokens / wall if wall else 0.0),
+        },
         "ttft": summarize(ttft),
         "queue_wait": summarize(queue_wait),
         "tpot": summarize(tpot),
@@ -419,7 +493,16 @@ def comparison_delta(summary: dict, baseline: dict) -> dict[str, float | None]:
             baseline["decode_throughput_tok_per_s"]),
         "max_queue_wait_seconds": relative_change(
             summary["max_queue_wait_seconds"], baseline["max_queue_wait_seconds"]),
+        "slo_goodput_requests_per_second": relative_change(
+            summary["slo_goodput"]["joint_slo_request_rate_per_second"],
+            baseline["slo_goodput"]["joint_slo_request_rate_per_second"]),
+        "slo_goodput_output_tokens_per_second": relative_change(
+            summary["slo_goodput"]["joint_slo_output_tokens_per_second"],
+            baseline["slo_goodput"]["joint_slo_output_tokens_per_second"]),
     }
+    result["slo_goodput_arrival_percent_points"] = (
+        summary["slo_goodput"]["joint_slo_arrival_percent"]
+        - baseline["slo_goodput"]["joint_slo_arrival_percent"])
     for metric in ("queue_wait", "ttft", "tpot", "e2e"):
         for percentile_name in ("p50", "p99"):
             result[f"{metric}_{percentile_name}"] = relative_change(
@@ -470,6 +553,16 @@ def parse_args():
                         default=list(variants), help="policy variants to run")
     parser.add_argument("--kv-cache-dtype", choices=("auto", "fp8_e4m3"), default="auto")
     parser.add_argument("--quantization", default="none")
+    parser.add_argument("--nvfp4-backend", choices=("software", "cublaslt"),
+                        default="software",
+                        help="NVFP4 GEMM backend; cublaslt requires Blackwell and native FP4 support")
+    parser.add_argument("--int4-group-size", type=int, default=128,
+                        help="INT4 K-group size; DeepSeek-V2-Lite requires 64")
+    parser.add_argument("--moe-int4-backend", choices=("loop", "segment"),
+                        default="loop",
+                        help="pure-INT4 MoE expert backend: per-expert loop or segmented GEMM")
+    parser.add_argument("--no-moe-int4-fuse-gate-up", action="store_true",
+                        help="ablate the segmented INT4 fused gate/up projection")
     parser.add_argument("--streaming-load", action="store_true")
     parser.add_argument("--no-swap-kv", action="store_true")
     parser.add_argument("--kv-swap-space-gb", type=float, default=2.0)
@@ -517,6 +610,8 @@ def parse_args():
 def main():
     args = parse_args()
     args.model = os.path.expanduser(args.model)
+    if args.moe_int4_backend == "segment" and args.quantization != "int4":
+        raise ValueError("--moe-int4-backend segment requires --quantization int4")
     from transformers import AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=True) \
         if args.prompts_file else None
@@ -582,8 +677,8 @@ def main():
                   f"{summary['prefill_steps']:>14}")
         # 与"最宽松目标"对比，反映收紧目标带来的代价
         widest = max(runs.items(), key=lambda item: float(item[0].split("_")[1][:-2]))
-        _report_and_save(args, runs, variants, prompts, arrivals, ttft_slo_targets_ms,
-                         delta_baseline=widest[0])
+        _report_and_save(args, runs, variants, prompts, sampling_params, arrivals,
+                         ttft_slo_targets_ms, delta_baseline=widest[0])
         return
 
     for variant_name in args.variants:
@@ -610,11 +705,12 @@ def main():
               f"burst pressure yields {summary['decode_burst_pressure_yields']}",
               flush=True)
 
-    _report_and_save(args, runs, variants, prompts, arrivals, ttft_slo_targets_ms)
+    _report_and_save(args, runs, variants, prompts, sampling_params, arrivals,
+                     ttft_slo_targets_ms)
 
 
-def _report_and_save(args, runs, variants, prompts, arrivals, ttft_slo_targets_ms,
-                     delta_baseline: str = "baseline") -> None:
+def _report_and_save(args, runs, variants, prompts, sampling_params, arrivals,
+                     ttft_slo_targets_ms, delta_baseline: str = "baseline") -> None:
     """Write the JSON payload and print the comparison tables for a finished run set."""
     baseline = runs.get(delta_baseline)
     if baseline:
@@ -642,6 +738,11 @@ def _report_and_save(args, runs, variants, prompts, arrivals, ttft_slo_targets_m
             "enforce_eager": args.enforce_eager,
             "kv_cache_dtype": args.kv_cache_dtype,
             "quantization": args.quantization,
+            "nvfp4_backend": args.nvfp4_backend,
+            "int4_group_size": args.int4_group_size,
+            "moe_int4_backend": args.moe_int4_backend,
+            "moe_int4_fuse_gate_up": not args.no_moe_int4_fuse_gate_up,
+            "streaming_load": args.streaming_load,
             "kv_swap": not args.no_swap_kv,
             "kv_swap_space_gb": args.kv_swap_space_gb,
             "admission_window": args.admission_window,
@@ -667,6 +768,9 @@ def _report_and_save(args, runs, variants, prompts, arrivals, ttft_slo_targets_m
             "arrival_times_seconds": arrivals,
             "ttft_slo_targets_ms": ttft_slo_targets_ms,
             "tpot_slo_targets_ms": [args.slo_tpot_ms] * len(prompts),
+            "fingerprint": workload_fingerprint(
+                prompts, sampling_params, arrivals, ttft_slo_targets_ms,
+                [args.slo_tpot_ms] * len(prompts), args.seed),
             "seed": args.seed,
             "shared_prefix_len": args.shared_prefix_len,
             "min_input_len": args.min_input_len,
@@ -698,6 +802,15 @@ def _report_and_save(args, runs, variants, prompts, arrivals, ttft_slo_targets_m
               f"{fmt_delta('queue_wait_p99'):>9} {fmt_delta('tpot_p50'):>9} "
               f"{fmt_delta('e2e_p99'):>9} "
               f"{fmt_delta('request_ttft_slo_percent_points', 'pp'):>7}")
+
+    print("\nJoint SLO goodput (each completed request must meet both targets):")
+    print("variant                 SLO requests  req/s  output tok/s  arrival met%")
+    for name, result in runs.items():
+        goodput = result["summary"]["slo_goodput"]
+        print(f"{name:<23} {goodput['joint_slo_requests']:>12} "
+              f"{goodput['joint_slo_request_rate_per_second']:>6.2f} "
+              f"{goodput['joint_slo_output_tokens_per_second']:>12.1f} "
+              f"{goodput['joint_slo_arrival_percent']:>11.1f}%")
 
     print("\nPrefix/KV lifecycle work by policy:")
     print("variant                 feature parse/reuse    stale   evict  gen-mut  deferred refs queued/committed peak blocks/refs")

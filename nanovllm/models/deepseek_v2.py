@@ -76,6 +76,8 @@ class DeepseekV2Moe(MoE):
             norm_topk_prob=False,               # DeepSeek 无 topk 概率归一化
             routed_scaling_factor=config.routed_scaling_factor,
             segment_backend=bool(getattr(config, "moe_segment_backend", False)),
+            int4_backend=getattr(config, "moe_int4_backend", "loop"),
+            fuse_int4_gate_up=bool(getattr(config, "moe_int4_fuse_gate_up", True)),
         )
         # 共享专家 = 更宽的 dense FFN（intermediate = moe_intermediate × n_shared）
         self.shared_experts = DeepseekV2MLP(

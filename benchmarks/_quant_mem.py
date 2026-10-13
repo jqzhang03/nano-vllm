@@ -1,6 +1,6 @@
 """各量化模式的模型权重显存占用（按参数/缓冲区实际字节数统计）。
 
-用法：python benchmarks/_quant_mem.py [model] [none|w8a8|int4|awq|sparse24] [awq_scales_path] [nodense]
+用法：python benchmarks/_quant_mem.py [model] [none|w8a8|int4|nvfp4|awq|sparse24] [awq_scales_path] [nodense]
 model 缺省 = Qwen3-0.6B；第三参 nodense：int4/awq 关闭稠密反量化路径（纯 int4 显存模式）。
 """
 import os
@@ -18,13 +18,20 @@ llm = LLM(MODEL, quantization=mode,
           awq_scales_path=awq_path, int4_dense_path=dense_path, max_model_len=4096)
 
 total = 0
-counts = {"int4": 0, "sparse24": 0, "int8": 0, "dense": 0}
+counts = {"int4": 0, "nvfp4": 0, "sparse24": 0, "int8": 0, "dense": 0}
 for n, m in llm.model_runner.model.named_modules():
     if hasattr(m, "w_int4"):
         total += m.w_int4.numel() * m.w_int4.element_size() + m.w_int4_scale.numel() * m.w_int4_scale.element_size()
         if hasattr(m, "w_deq"):  # 双路径模式的稠密反量化副本（bf16）
             total += m.w_deq.numel() * m.w_deq.element_size()
         counts["int4"] += 1
+    elif hasattr(m, "w_nvfp4"):
+        total += (m.w_nvfp4.numel() * m.w_nvfp4.element_size()
+                  + m.w_nvfp4_scale.numel() * m.w_nvfp4_scale.element_size()
+                  + m.w_nvfp4_global_scale.numel() * m.w_nvfp4_global_scale.element_size())
+        if hasattr(m, "w_deq"):
+            total += m.w_deq.numel() * m.w_deq.element_size()
+        counts["nvfp4"] += 1
     elif hasattr(m, "w_s24_v"):
         total += m.w_s24_v.numel() * m.w_s24_v.element_size() + m.w_s24_idx.numel() * m.w_s24_idx.element_size()
         counts["sparse24"] += 1

@@ -1,16 +1,12 @@
-"""真实 DeepSeek-V2-Lite 数值锚（阶段 2b 扩展）：4 层真权重 + 真实分布。
+"""DeepSeek-V2-Lite 4-layer real-weight parity and quantization drift probe.
 
-链（跑通≠写对）：
-1) HF(GPU fp16, 4 层真权重) 全模型前向 vs 本引擎 nano 手工稠密参考 ——
-   取每序列**末行**（transformers 5.15 DeepseekV2 无缓存全前向无因果掩码，
-   中间行语义不可比，见 _mla_check.py 尾注）；
-2) 本引擎(fp16 4 层) decode vs nano 手工参考（引擎解码语义 = 末行规范）；
-3) 本引擎 int4(4 层) vs 本引擎 fp16(4 层)：真实权重上的量化噪声带。
-
-用法: python benchmarks/_v2lite_4l_parity.py
+The script checks each engine mode against the matching manual forward, then
+compares INT4/NVFP4 logits with BF16 on identical fixed token prefixes. The
+small prompt set is a smoke check, not a perplexity or task-quality evaluation.
 """
 import os
 import sys
+import json
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -41,14 +37,18 @@ def build_nano_ref(quant: str):
     load_model(model, MODEL)
     if cfg.tie_word_embeddings:
         model.lm_head.weight.data = model.model.embed_tokens.weight.data
-    if quant == "int4":
+    model = model.to(torch.bfloat16).cuda()
+    if quant in ("int4", "nvfp4"):
         from nanovllm.layers.linear import LinearBase
         for m in model.modules():
             if isinstance(m, LinearBase) and not getattr(m, "quantize_exclude", False):
-                # V2-Lite dense 中间维 10944 不能被 128 整除 → group 64
-                m.quantize_int4(dense_path=getattr(m, "is_mla_kv_b", False),
-                                group_size=64)
-    return model.to(torch.bfloat16).cuda()
+                if quant == "int4":
+                    # V2-Lite dense 中间维 10944 不能被 128 整除 → group 64
+                    m.quantize_int4(dense_path=getattr(m, "is_mla_kv_b", False),
+                                    group_size=64)
+                else:
+                    m.quantize_nvfp4(keep_dense=getattr(m, "is_mla_kv_b", False))
+    return model
 
 
 def nano_last_logits(model, tokens, T):
@@ -77,6 +77,41 @@ def nano_last_logits(model, tokens, T):
         return F.linear(fin, model.lm_head.weight).float()[T - 1]
 
 
+def fixed_input_logits(model, tokens):
+    """Logits for identical one-token and full-prompt inputs, copied to CPU."""
+    logits = {}
+    for index, sequence in enumerate(tokens):
+        for case, length in (("one_token", 1), ("full_prompt", len(sequence))):
+            logits[f"seq{index}_{case}"] = nano_last_logits(
+                model, sequence, length).detach().cpu()
+    return logits
+
+
+def quantization_drift(reference, candidate):
+    """Aggregate same-input logit error, KL, and top-1 agreement."""
+    import torch.nn.functional as F
+
+    absolute_differences = []
+    divergences = []
+    top1_matches = 0
+    for name, expected in reference.items():
+        actual = candidate[name].float()
+        expected = expected.float()
+        absolute_differences.append((expected - actual).abs().flatten())
+        logp = F.log_softmax(expected, dim=-1)
+        logq = F.log_softmax(actual, dim=-1)
+        divergences.append((logp.exp() * (logp - logq)).sum().item())
+        top1_matches += int(expected.argmax() == actual.argmax())
+    all_differences = torch.cat(absolute_differences)
+    return {
+        "input_cases": len(reference),
+        "mean_abs_logit_diff": all_differences.mean().item(),
+        "max_abs_logit_diff": all_differences.max().item(),
+        "mean_kl_bf16_to_quantized": sum(divergences) / len(divergences),
+        "top1_agreement_percent": 100.0 * top1_matches / len(reference),
+    }
+
+
 def main():
     import gc
     TOKENS = prompts()
@@ -86,7 +121,7 @@ def main():
     # 引擎数学链（含 MoE 路由/reference 同序）已在 toy 上对 HF 位级验证过。
     from nanovllm import LLM, SamplingParams
     engine = {}
-    for quant in ("none", "int4"):
+    for quant in ("none", "int4", "nvfp4"):
         print(f"[engine quant={quant}]")
         llm = LLM(MODEL, max_model_len=512, quantization=quant, kv_swap=False,
                   enforce_eager=True, max_num_batched_tokens=1024,
@@ -103,13 +138,25 @@ def main():
         torch.cuda.empty_cache()
         torch.cuda.empty_cache()
         engine[quant] = (dec, comps)
-    ref_none = build_nano_ref("none")
-    ref_i4 = build_nano_ref("int4")
-    for quant, ref in (("none", ref_none), ("int4", ref_i4)):
+    baseline_logits = None
+    drift = {}
+    for quant in ("none", "int4", "nvfp4"):
+        ref = build_nano_ref(quant)
+        fixed_logits = fixed_input_logits(ref, TOKENS)
+        if quant == "none":
+            baseline_logits = fixed_logits
+        else:
+            drift[quant] = quantization_drift(baseline_logits, fixed_logits)
+            result = drift[quant]
+            print(f"[{quant} vs BF16; identical fixed token inputs] "
+                  f"mean_abs={result['mean_abs_logit_diff']:.6f} "
+                  f"max_abs={result['max_abs_logit_diff']:.4f} "
+                  f"KL={result['mean_kl_bf16_to_quantized']:.6f} "
+                  f"top1={result['top1_agreement_percent']:.1f}%")
+
         dec, comps = engine[quant]
         bad = 0
-        print(f"[{quant} engine decode vs {'int4' if quant == 'int4' else 'fp16'} "
-              f"稠密参考]")
+        print(f"[{quant} engine decode vs same-mode manual reference]")
         for i, t in enumerate(TOKENS):
             so_far = t + comps[i]
             for step in range(min(len(comps[i]), len(dec))):
@@ -123,6 +170,20 @@ def main():
                           f"mean {dd.mean().item():.5f} top1 {'Y' if ok else 'N'}")
         print(f"  mismatches {bad}")
         assert bad <= max(2, 48 // 10), f"{quant} 引擎 decode 对照失败"
+        del ref
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    os.makedirs("results", exist_ok=True)
+    report = {
+        "model": MODEL,
+        "reference": "BF16, same fixed token prefixes",
+        "input_cases": ["one-token prefix", "full prompt"],
+        "quality_is_smoke_check": True,
+        "quantization_drift": drift,
+    }
+    with open("results/v2lite_4l_quant_accuracy.json", "w", encoding="utf-8") as f:
+        json.dump(report, f, indent=2)
     print("V2-LITE 4L REAL-WEIGHTS PARITY OK")
 
 

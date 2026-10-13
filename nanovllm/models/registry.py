@@ -44,6 +44,8 @@ _PLANNED_BLOCKERS: dict[str, str] = {
 # - rotary_embedding.get_rope 不支持 rope_scaling（YaRN/linear/dynamic）——长上下文扩展
 #   模型（如 Llama-3.2、Mistral-Nemo）需要先实现（INTERVIEW.md §1.7 卡点清单）。
 # - 流式加载限制：int4 强制纯 int4（MLA kv_b 例外）、w8a8 无 SmoothQuant、awq 仅预生成 scales。
+# - NVFP4：K 维必须能按 16 分组；streaming 可用，MLA kv_b 保留小型 w_deq。当前 GEMM
+#   在 Triton 内解码权重后执行 BF16 dot，尚未接入原生 FP4 MMA。
 
 
 def get_model_class(model_type: str) -> Type[nn.Module]:

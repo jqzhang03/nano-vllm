@@ -151,11 +151,13 @@ def run_nanovllm(args, prompts, sampling_params):
               kv_calibration_path=getattr(args, "kv_calibration_path", ""),
               kv_fp8_scale_margin=getattr(args, "kv_fp8_scale_margin", 1.1),
               quantization=getattr(args, "quantization", "none"),
+              nvfp4_backend=getattr(args, "nvfp4_backend", "software"),
               awq_scales_path=getattr(args, "awq_scales_path", ""),
               quantize_lm_head=getattr(args, "quantize_lm_head", False),
               speculative=getattr(args, "speculative", "none"),
               streaming_load=getattr(args, "streaming_load", False),
               int4_dense_path=not getattr(args, "no_int4_dense_path", False),
+              int4_group_size=getattr(args, "int4_group_size", 128),
               kv_swap=not getattr(args, "no_swap_kv", False),
               kv_swap_space_gb=getattr(args, "kv_swap_space_gb", 2.0),
               mixed_cudagraph=not getattr(args, "no_mixed_cudagraph", False),
@@ -456,8 +458,12 @@ def parse_args():
                    help="FP8 KV校准最大值的scale安全因子；小于1会增加饱和裁剪")
     p.add_argument("--quantization", default="none",
                    help="权重量化: none | w8a8(int8, Triton GEMM) | int4(per-group int4, Triton GEMM) | "
+                        "nvfp4(E2M1 + E4M3 scales; software or native cuBLASLt MMA) | "
                         "awq(int4+激活感知缩放) | sparse24(2:4结构化剪枝, Triton稀疏GEMM) | "
                         "fp8(e4m3全量化: per-column权重+per-token激活, Triton内核+硬件FP8 MMA)")
+    p.add_argument("--nvfp4-backend", choices=("software", "cublaslt"), default="software",
+                   help="NVFP4 GEMM backend; cublaslt dynamically quantizes activations and "
+                        "requires Blackwell native FP4 MMA")
     p.add_argument("--awq-scales-path", default="",
                    help="AWQ缩放文件（benchmarks/awq_calibrate.py产出）；空=随机token内联校准")
     p.add_argument("--quantize-lm-head", action="store_true",
@@ -465,6 +471,8 @@ def parse_args():
     p.add_argument("--no-int4-dense-path", action="store_true",
                    help="int4 关闭双路径模式（纯 int4 显存模式，0.85GB；吞吐回退见 INTERVIEW.md §10.3.6；"
                         "流式加载(7B+)自动强制关闭）")
+    p.add_argument("--int4-group-size", type=int, default=128,
+                   help="INT4 K 维分组大小；DeepSeek-V2-Lite 的 10944 维需设为 64")
     p.add_argument("--no-swap-kv", action="store_true",
                    help="关闭KV swap抢占（KV块不足时回退重算 recompute 而非换出到CPU；"
                         "swap 支持 TP=1 的 auto 与 fp8_e4m3 KV；TP>1 时回退重算）")
@@ -554,6 +562,7 @@ def main():
     tag = (f"n{args.num_seqs}_i{args.min_input_len}-{args.max_input_len}_"
            f"o{args.min_output_len}-{args.max_output_len}"
            + (f"_prefix{args.shared_prefix_len}" if args.shared_prefix_len else "")
+           + (f"_nvfp4-{args.nvfp4_backend}" if args.quantization == "nvfp4" else "")
            + ("_eager" if args.enforce_eager else ""))
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     out_path = args.output or os.path.join("results", f"bench_{tag}_{ts}.json")
@@ -567,6 +576,15 @@ def main():
                      "prompts_file": args.prompts_file, "enforce_eager": args.enforce_eager, "tp": args.tp,
                      "repeat_batches": args.repeat_batches},
         "scheduler": scheduler_options(args),
+        "benchmark_config": {
+            "quantization": args.quantization,
+            "nvfp4_backend": args.nvfp4_backend,
+            "int4_group_size": args.int4_group_size,
+            "enforce_eager": args.enforce_eager,
+            "tensor_parallel_size": args.tp,
+            "max_model_len": args.max_model_len,
+            "gpu_memory_utilization": args.gpu_memory_utilization,
+        },
         "nanovllm": {"batches": [{k: v for k, v in b.items() if k != "per_request"} for b in batches],
                      "summary": make_summary(metrics), "per_request": metrics["per_request"],
                      "num_preemptions": metrics.get("num_preemptions", 0)},

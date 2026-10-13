@@ -1170,6 +1170,10 @@ def create_app(model: str, *, engine_kwargs: dict[str, Any] | None = None,
                cache_affinity_admission: bool = True) -> FastAPI:
     """Create an OpenAI-compatible app; model loading happens in the lifespan."""
     engine_kwargs = dict(engine_kwargs or {})
+    # Mixed graphs are captured lazily, so an unseen shape can stall a live
+    # request. Keep the HTTP serving default on eager mixed batches; callers can
+    # still opt in explicitly when their shape distribution is known and warm.
+    engine_kwargs.setdefault("mixed_cudagraph", False)
     if max_queued_requests < 1:
         raise ValueError("max_queued_requests must be at least 1")
     if max_deferred_requests < 0:
@@ -1574,8 +1578,14 @@ def main() -> None:
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
     parser.add_argument("--prefix-cache-max-free-blocks", type=int, default=0,
                         help="cap idle reusable prefix blocks; 0 leaves the cap unset")
-    parser.add_argument("--no-mixed-cudagraph", action="store_true",
-                        help="run mixed prefill/decode batches eagerly")
+    mixed_graph_args = parser.add_mutually_exclusive_group()
+    mixed_graph_args.add_argument(
+        "--mixed-cudagraph", dest="mixed_cudagraph", action="store_true",
+        help="enable lazy CUDA Graph capture for mixed prefill/decode batches")
+    mixed_graph_args.add_argument(
+        "--no-mixed-cudagraph", dest="mixed_cudagraph", action="store_false",
+        help="run mixed prefill/decode batches eagerly (the serving default)")
+    parser.set_defaults(mixed_cudagraph=False)
     parser.add_argument("--mixed-cudagraph-max-graphs", type=int, default=4)
     parser.add_argument("--mixed-cudagraph-max-tokens", type=int, default=4096,
                         help="use eager execution for larger mixed batches to bound capture memory")
@@ -1646,7 +1656,7 @@ def main() -> None:
             "max_model_len": args.max_model_len,
             "gpu_memory_utilization": args.gpu_memory_utilization,
             "prefix_cache_max_free_blocks": args.prefix_cache_max_free_blocks,
-            "mixed_cudagraph": not args.no_mixed_cudagraph,
+            "mixed_cudagraph": args.mixed_cudagraph,
             "mixed_cudagraph_max_graphs": args.mixed_cudagraph_max_graphs,
             "mixed_cudagraph_max_tokens": args.mixed_cudagraph_max_tokens,
             "kv_cache_dtype": args.kv_cache_dtype,
