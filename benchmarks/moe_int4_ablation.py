@@ -16,7 +16,15 @@ import gc
 import json
 import os
 import statistics
+import sys
 from pathlib import Path
+
+SCRIPT_DIR = str(Path(__file__).resolve().parent)
+REPO_ROOT = str(Path(__file__).resolve().parents[1])
+if SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, SCRIPT_DIR)
+if REPO_ROOT not in sys.path:
+    sys.path.insert(1, REPO_ROOT)
 
 import torch
 import torch.nn.functional as F
