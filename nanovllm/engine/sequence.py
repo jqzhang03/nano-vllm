@@ -47,6 +47,10 @@ class Sequence:
         self.is_prefill = True
         self.block_table = []
         self.draft_tokens: list[int] | None = None  # 投机解码：本步n-gram草稿（None=非verify行；[]=verify行无草稿）
+        self.spec_proposed_tokens = 0
+        self.spec_accepted_tokens = 0
+        self.spec_verify_steps = 0
+        self.spec_verify_tokens = 0
         self.swapped = False  # KV swap 抢占：KV 已换出到 CPU（在 swapped 队列，恢复时换入直接decode）
         # 滚动缓冲（SWA 环）：块表只保留窗口内容，表内第 i 项 = 第 kv_j0+i 个
         # 逻辑块（chunk 序号从 0 起）；key 位置 = (kv_j0+i)*block_size + 槽内偏移
@@ -156,5 +160,9 @@ class Sequence:
         self.tpot_slo_ms = None
         self.t_last_token = None
         self.tpot_ewma_ms = None
+        self.spec_proposed_tokens = 0
+        self.spec_accepted_tokens = 0
+        self.spec_verify_steps = 0
+        self.spec_verify_tokens = 0
         self.age_promoted = False
         self.preemption_count = 0

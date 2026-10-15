@@ -1,0 +1,101 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1220" height="590" viewBox="0 0 1220 590">
+<rect width="100%" height="100%" fill="#ffffff"/>
+<style>text{font-family:Arial,Helvetica,sans-serif;fill:#263238}</style>
+<text x="610" y="26" text-anchor="middle" font-size="17" font-weight="600">Paired scheduling results · five ShareGPT arrival seeds</text>
+<text x="312.5" y="67" text-anchor="middle" font-size="13" font-weight="600">ShareGPT · 500 requests · 8 req/s</text>
+<line x1="94" y1="483.00" x2="579" y2="483.00" stroke="#d7dce1" stroke-width="1"/>
+<text x="86" y="487.00" text-anchor="end" font-size="10">1,508</text>
+<line x1="94" y1="391.75" x2="579" y2="391.75" stroke="#d7dce1" stroke-width="1"/>
+<text x="86" y="395.75" text-anchor="end" font-size="10">1,609</text>
+<line x1="94" y1="300.50" x2="579" y2="300.50" stroke="#d7dce1" stroke-width="1"/>
+<text x="86" y="304.50" text-anchor="end" font-size="10">1,709</text>
+<line x1="94" y1="209.25" x2="579" y2="209.25" stroke="#d7dce1" stroke-width="1"/>
+<text x="86" y="213.25" text-anchor="end" font-size="10">1,810</text>
+<line x1="94" y1="118.00" x2="579" y2="118.00" stroke="#d7dce1" stroke-width="1"/>
+<text x="86" y="122.00" text-anchor="end" font-size="10">1,911</text>
+<line x1="94.00" y1="118" x2="94.00" y2="483" stroke="#edf0f2" stroke-width="1"/>
+<text x="94.00" y="501" text-anchor="middle" font-size="9">baseline</text>
+<line x1="579.00" y1="118" x2="579.00" y2="483" stroke="#edf0f2" stroke-width="1"/>
+<text x="579.00" y="501" text-anchor="middle" font-size="9">all_on</text>
+<line x1="94" y1="483" x2="579" y2="483" stroke="#64727a"/>
+<line x1="94" y1="118" x2="94" y2="483" stroke="#64727a"/>
+<text x="336.5" y="549" text-anchor="middle" font-size="11">Scheduling variant</text>
+<text x="36" y="300.5" text-anchor="middle" font-size="11" transform="rotate(-90 36 300.5)">Output throughput (tokens/s)</text>
+<polyline points="94.00,153.32 579.00,300.25" fill="none" stroke="#b7bec7" stroke-width="2"/>
+<circle cx="94.00" cy="153.32" r="3.5" fill="#b7bec7"></circle>
+<circle cx="579.00" cy="300.25" r="3.5" fill="#b7bec7"></circle>
+<polyline points="94.00,207.04 579.00,311.72" fill="none" stroke="#b7bec7" stroke-width="2"/>
+<circle cx="94.00" cy="207.04" r="3.5" fill="#b7bec7"></circle>
+<circle cx="579.00" cy="311.72" r="3.5" fill="#b7bec7"></circle>
+<polyline points="94.00,406.59 579.00,447.68" fill="none" stroke="#b7bec7" stroke-width="2"/>
+<circle cx="94.00" cy="406.59" r="3.5" fill="#b7bec7"></circle>
+<circle cx="579.00" cy="447.68" r="3.5" fill="#b7bec7"></circle>
+<polyline points="94.00,238.95 579.00,360.86" fill="none" stroke="#b7bec7" stroke-width="2"/>
+<circle cx="94.00" cy="238.95" r="3.5" fill="#b7bec7"></circle>
+<circle cx="579.00" cy="360.86" r="3.5" fill="#b7bec7"></circle>
+<polyline points="94.00,156.92 579.00,275.97" fill="none" stroke="#b7bec7" stroke-width="2"/>
+<circle cx="94.00" cy="156.92" r="3.5" fill="#b7bec7"></circle>
+<circle cx="579.00" cy="275.97" r="3.5" fill="#b7bec7"></circle>
+<circle cx="94.00" cy="153.32" r="3.5" fill="#355f8a"></circle>
+<circle cx="94.00" cy="207.04" r="3.5" fill="#355f8a"></circle>
+<circle cx="94.00" cy="406.59" r="3.5" fill="#355f8a"></circle>
+<circle cx="94.00" cy="238.95" r="3.5" fill="#355f8a"></circle>
+<circle cx="94.00" cy="156.92" r="3.5" fill="#355f8a"></circle>
+<rect x="575.50" y="296.75" width="7" height="7" fill="#d17c2f"></rect>
+<rect x="575.50" y="308.22" width="7" height="7" fill="#d17c2f"></rect>
+<rect x="575.50" y="444.18" width="7" height="7" fill="#d17c2f"></rect>
+<rect x="575.50" y="357.36" width="7" height="7" fill="#d17c2f"></rect>
+<rect x="575.50" y="272.47" width="7" height="7" fill="#d17c2f"></rect>
+<text x="912.5" y="67" text-anchor="middle" font-size="13" font-weight="600">All arrivals count toward SLO goodput</text>
+<line x1="694" y1="483.00" x2="1179" y2="483.00" stroke="#d7dce1" stroke-width="1"/>
+<text x="686" y="487.00" text-anchor="end" font-size="10">-77.7</text>
+<line x1="694" y1="391.75" x2="1179" y2="391.75" stroke="#d7dce1" stroke-width="1"/>
+<text x="686" y="395.75" text-anchor="end" font-size="10">261</text>
+<line x1="694" y1="300.50" x2="1179" y2="300.50" stroke="#d7dce1" stroke-width="1"/>
+<text x="686" y="304.50" text-anchor="end" font-size="10">600</text>
+<line x1="694" y1="209.25" x2="1179" y2="209.25" stroke="#d7dce1" stroke-width="1"/>
+<text x="686" y="213.25" text-anchor="end" font-size="10">939</text>
+<line x1="694" y1="118.00" x2="1179" y2="118.00" stroke="#d7dce1" stroke-width="1"/>
+<text x="686" y="122.00" text-anchor="end" font-size="10">1,278</text>
+<line x1="694.00" y1="118" x2="694.00" y2="483" stroke="#edf0f2" stroke-width="1"/>
+<text x="694.00" y="501" text-anchor="middle" font-size="9">baseline</text>
+<line x1="1179.00" y1="118" x2="1179.00" y2="483" stroke="#edf0f2" stroke-width="1"/>
+<text x="1179.00" y="501" text-anchor="middle" font-size="9">all_on</text>
+<line x1="694" y1="483" x2="1179" y2="483" stroke="#64727a"/>
+<line x1="694" y1="118" x2="694" y2="483" stroke="#64727a"/>
+<text x="936.5" y="549" text-anchor="middle" font-size="11">Scheduling variant</text>
+<text x="636" y="300.5" text-anchor="middle" font-size="11" transform="rotate(-90 636 300.5)">Joint-SLO output goodput (tokens/s)</text>
+<polyline points="694.00,257.21 1179.00,407.94" fill="none" stroke="#b7bec7" stroke-width="2"/>
+<circle cx="694.00" cy="257.21" r="3.5" fill="#b7bec7"></circle>
+<circle cx="1179.00" cy="407.94" r="3.5" fill="#b7bec7"></circle>
+<polyline points="694.00,231.85 1179.00,344.96" fill="none" stroke="#b7bec7" stroke-width="2"/>
+<circle cx="694.00" cy="231.85" r="3.5" fill="#b7bec7"></circle>
+<circle cx="1179.00" cy="344.96" r="3.5" fill="#b7bec7"></circle>
+<polyline points="694.00,417.72 1179.00,447.68" fill="none" stroke="#b7bec7" stroke-width="2"/>
+<circle cx="694.00" cy="417.72" r="3.5" fill="#b7bec7"></circle>
+<circle cx="1179.00" cy="447.68" r="3.5" fill="#b7bec7"></circle>
+<polyline points="694.00,223.41 1179.00,364.91" fill="none" stroke="#b7bec7" stroke-width="2"/>
+<circle cx="694.00" cy="223.41" r="3.5" fill="#b7bec7"></circle>
+<circle cx="1179.00" cy="364.91" r="3.5" fill="#b7bec7"></circle>
+<polyline points="694.00,153.32 1179.00,295.20" fill="none" stroke="#b7bec7" stroke-width="2"/>
+<circle cx="694.00" cy="153.32" r="3.5" fill="#b7bec7"></circle>
+<circle cx="1179.00" cy="295.20" r="3.5" fill="#b7bec7"></circle>
+<circle cx="694.00" cy="257.21" r="3.5" fill="#355f8a"></circle>
+<circle cx="694.00" cy="231.85" r="3.5" fill="#355f8a"></circle>
+<circle cx="694.00" cy="417.72" r="3.5" fill="#355f8a"></circle>
+<circle cx="694.00" cy="223.41" r="3.5" fill="#355f8a"></circle>
+<circle cx="694.00" cy="153.32" r="3.5" fill="#355f8a"></circle>
+<rect x="1175.50" y="404.44" width="7" height="7" fill="#d17c2f"></rect>
+<rect x="1175.50" y="341.46" width="7" height="7" fill="#d17c2f"></rect>
+<rect x="1175.50" y="444.18" width="7" height="7" fill="#d17c2f"></rect>
+<rect x="1175.50" y="361.41" width="7" height="7" fill="#d17c2f"></rect>
+<rect x="1175.50" y="291.70" width="7" height="7" fill="#d17c2f"></rect>
+<circle cx="99" cy="88" r="3.5" fill="#355f8a"/>
+<text x="107" y="91" font-size="9">baseline</text>
+<circle cx="171.0" cy="88" r="3.5" fill="#d17c2f"/>
+<text x="179.0" y="91" font-size="9">all_on</text>
+<circle cx="699" cy="88" r="3.5" fill="#355f8a"/>
+<text x="707" y="91" font-size="9">baseline</text>
+<circle cx="771.0" cy="88" r="3.5" fill="#d17c2f"/>
+<text x="779.0" y="91" font-size="9">all_on</text>
+</svg>

@@ -6,7 +6,8 @@ Run in the WSL inference environment::
         --arrival-rate 16 --shared-prefix-len 512 --max-admission-wait-ms 2000
 
 The report compares admission off, admission with cache-hit estimation disabled,
-and the default cache-aware admission policy.
+and the default cache-aware admission policy. ``--variants`` can select a
+subset for parameter sweeps that reuse a separately measured control.
 """
 from __future__ import annotations
 
@@ -27,11 +28,19 @@ from nanovllm.server import GenerationManager
 from nanovllm.sampling_params import SamplingParams
 
 try:
-    from .bench import add_workload_args, build_workload, env_info, summarize
-    from .scheduling_ablation import build_arrival_trace, workload_fingerprint
+    from .bench import (add_workload_args, build_workload_data, env_info,
+                        input_length_bucket, summarize)
+    from .scheduling_ablation import (
+        arrival_description, build_arrival_trace, trace_arrival_summary,
+        workload_fingerprint,
+    )
 except ImportError:
-    from bench import add_workload_args, build_workload, env_info, summarize
-    from scheduling_ablation import build_arrival_trace, workload_fingerprint
+    from bench import (add_workload_args, build_workload_data, env_info,
+                       input_length_bucket, summarize)
+    from scheduling_ablation import (
+        arrival_description, build_arrival_trace, trace_arrival_summary,
+        workload_fingerprint,
+    )
 
 
 def parse_args():
@@ -39,8 +48,10 @@ def parse_args():
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--model", default=os.path.expanduser("~/huggingface/Qwen3-0.6B/"))
     add_workload_args(parser)
-    parser.add_argument("--arrival-mode", choices=("poisson", "constant", "burst"),
-                        default="poisson")
+    parser.add_argument("--arrival-mode",
+                        choices=("auto", "trace", "poisson", "constant", "burst"),
+                        default="auto",
+                        help="auto uses request-file arrivals when present, otherwise poisson")
     parser.add_argument("--arrival-rate", type=float, default=16.0)
     parser.add_argument("--max-model-len", type=int, default=4096)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
@@ -71,19 +82,87 @@ def parse_args():
     parser.add_argument("--slo-tpot-ms", type=float, default=80.0,
                         help="measured average inter-token latency SLO")
     parser.add_argument("--admission-soft-pressure", type=float, default=0.85)
+    parser.add_argument(
+        "--variants", nargs="+",
+        choices=("dynamic_off", "dynamic_on_no_cache",
+                 "dynamic_on_cache_aware"),
+        default=None,
+        help="run only these variants; the default runs all three",
+    )
     parser.add_argument("--output", default=None)
     return parser.parse_args()
 
 
+def _grouped_admission_summary(rows: list[dict], wall: float, key: str) -> dict:
+    groups = {}
+    for row in rows:
+        value = row.get(key)
+        label = "unassigned" if value in (None, "") else str(value)
+        groups.setdefault(label, []).append(row)
+    summaries = {}
+    for label, group_rows in sorted(groups.items()):
+        accepted = [row for row in group_rows if row["status"] == "accepted"]
+        ttft = [row["ttft_ms"] for row in accepted if row.get("ttft_ms") is not None]
+        tpot = [row["tpot_ms"] for row in accepted if row.get("tpot_ms") is not None]
+        e2e = [row["e2e_ms"] for row in accepted if row.get("e2e_ms") is not None]
+        joint = [row for row in accepted if row.get("joint_slo_met") is True]
+        output_tokens = sum(row.get("completion_tokens", 0) for row in accepted)
+        summaries[label] = {
+            "arrived": len(group_rows),
+            "accepted": len(accepted),
+            "rejected": sum(row["status"] == "rejected" for row in group_rows),
+            "failed": sum(row["status"] == "failed" for row in group_rows),
+            "accept_rate_percent": 100.0 * len(accepted) / max(1, len(group_rows)),
+            "prompt_tokens": summarize(
+                row.get("prompt_tokens") for row in group_rows),
+            "output_tokens": output_tokens,
+            "output_tokens_per_second": output_tokens / wall if wall else 0.0,
+            "ttft_ms": summarize(ttft),
+            "tpot_ms": summarize(tpot),
+            "e2e_ms": summarize(e2e),
+            "joint_slo_requests": len(joint),
+            "joint_slo_output_tokens": sum(
+                row.get("completion_tokens", 0) for row in joint),
+            "prefix_hit_requests": sum(
+                row.get("actual_cache_hit_tokens", 0) > 0 for row in accepted),
+            "estimated_prefix_hit_tokens": sum(
+                row.get("estimated_cache_hit_tokens") or 0 for row in accepted),
+            "actual_prefix_hit_tokens": sum(
+                row.get("actual_cache_hit_tokens", 0) for row in accepted),
+        }
+    return summaries
+
+
 async def run_variant(args, prompts, sampling_params, arrival_times,
                       dynamic_admission: bool,
-                      prefix_cache_aware_admission: bool = True) -> dict:
+                      prefix_cache_aware_admission: bool = True, *,
+                      request_metadata: list[dict] | None = None,
+                      ttft_slo_targets_ms: list[float] | None = None,
+                      tpot_slo_targets_ms: list[float] | None = None) -> dict:
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
     executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="admission-bench")
     loop = asyncio.get_running_loop()
     engine = None
     manager = None
+    if request_metadata is None:
+        request_metadata = [{"request_id": f"request-{i:06d}",
+                             "prompt_tokens": len(prompt),
+                             "user_prompt_tokens": len(prompt),
+                             "prefix_tokens": 0,
+                             "input_length_bucket": input_length_bucket(len(prompt)),
+                             "prefix_group": None,
+                             "content_class": None,
+                             "prompt_token_hash": None}
+                            for i, prompt in enumerate(prompts)]
+    if ttft_slo_targets_ms is None:
+        ttft_slo_targets_ms = [args.slo_ttft_ms] * len(prompts)
+    if tpot_slo_targets_ms is None:
+        tpot_slo_targets_ms = [args.slo_tpot_ms] * len(prompts)
+    if (len(request_metadata) != len(prompts)
+            or len(ttft_slo_targets_ms) != len(prompts)
+            or len(tpot_slo_targets_ms) != len(prompts)):
+        raise ValueError("request metadata and SLO targets must match request count")
     try:
         engine = await loop.run_in_executor(executor, lambda: LLM(
             args.model,
@@ -146,15 +225,33 @@ async def run_variant(args, prompts, sampling_params, arrival_times,
             delay = arrival - time.perf_counter()
             if delay > 0:
                 await asyncio.sleep(delay)
+            metadata = request_metadata[index]
+            ttft_target = ttft_slo_targets_ms[index]
+            tpot_target = tpot_slo_targets_ms[index]
+            trace_fields = {
+                "index": index,
+                "request_id": metadata["request_id"],
+                "prefix_group": metadata.get("prefix_group"),
+                "content_class": metadata.get("content_class"),
+                "input_length_bucket": metadata.get("input_length_bucket"),
+                "prompt_tokens": metadata.get("prompt_tokens", len(prompts[index])),
+                "user_prompt_tokens": metadata.get(
+                    "user_prompt_tokens", len(prompts[index])),
+                "prefix_tokens": metadata.get("prefix_tokens", 0),
+                "prompt_token_hash": metadata.get("prompt_token_hash"),
+                "arrival_time_s": arrival_times[index],
+                "ttft_slo_ms": ttft_target,
+                "tpot_slo_ms": tpot_target,
+            }
             try:
                 handle = await manager.submit(
                     prompts[index], sampling_params[index], submitted_at=arrival,
-                    ttft_slo_ms=args.slo_ttft_ms,
-                    tpot_slo_ms=args.slo_tpot_ms)
+                    ttft_slo_ms=ttft_target,
+                    tpot_slo_ms=tpot_target)
             except HTTPException as exc:
                 detail = exc.detail if isinstance(exc.detail, dict) else {}
                 rejected_row = {
-                    "index": index,
+                    **trace_fields,
                     "status": "rejected",
                     "status_code": exc.status_code,
                     "sampling_max_tokens": sampling_params[index].max_tokens,
@@ -177,11 +274,11 @@ async def run_variant(args, prompts, sampling_params, arrival_times,
                        (handle.completed_at - handle.first_token_at) * 1000.0
                        / (completion_tokens - 1))
             ttft_slo_met = (None if ttft_ms is None else
-                            ttft_ms <= args.slo_ttft_ms)
+                            ttft_ms <= ttft_target)
             tpot_slo_met = (None if tpot_ms is None else
-                            tpot_ms <= args.slo_tpot_ms)
+                            tpot_ms <= tpot_target)
             return {
-                "index": index,
+                **trace_fields,
                 "status": "accepted" if "error" not in result else "failed",
                 "admission_decision": handle.admission_decision,
                 "admission_wait_ms": handle.admission_wait_ms,
@@ -202,6 +299,9 @@ async def run_variant(args, prompts, sampling_params, arrival_times,
             }
 
         rows = await asyncio.gather(*(submit_one(i) for i in range(len(prompts))))
+        row_indexes = [row["index"] for row in rows]
+        if len(row_indexes) != len(prompts) or len(set(row_indexes)) != len(prompts):
+            raise AssertionError("admission run did not return one unique row per arrival")
         torch.cuda.synchronize()
         wall = time.perf_counter() - start
         admission = manager.admission_snapshot()
@@ -211,7 +311,8 @@ async def run_variant(args, prompts, sampling_params, arrival_times,
         total_output_tokens = sum(row["completion_tokens"] for row in accepted)
         ttfts = [row["ttft_ms"] for row in accepted if row["ttft_ms"] is not None]
         e2es = [row["e2e_ms"] for row in accepted if row["e2e_ms"] is not None]
-        slo_met = [value <= args.slo_ttft_ms for value in ttfts]
+        slo_met = [row["ttft_ms"] <= row["ttft_slo_ms"] for row in accepted
+                   if row.get("ttft_ms") is not None]
         hit_rows = [row for row in accepted
                     if row["estimated_cache_hit_tokens"] is not None]
         hit_deltas = [row["estimated_cache_hit_tokens"] - row["actual_cache_hit_tokens"]
@@ -227,8 +328,8 @@ async def run_variant(args, prompts, sampling_params, arrival_times,
         # 未被拒的请求里，TTFT 是否真的落在目标内（准入的目标就是 admission_target_ttft_ms）
         served = [row for row in rows if row["status"] != "rejected"]
         served_ttfts = [row["ttft_ms"] for row in served if row["ttft_ms"] is not None]
-        served_slo_met = [value <= args.slo_ttft_ms
-                          for value in served_ttfts]
+        served_slo_met = [row["ttft_ms"] <= row["ttft_slo_ms"]
+                          for row in served if row.get("ttft_ms") is not None]
         joint_slo_rows = [row for row in accepted if row["joint_slo_met"]]
         joint_slo_output_tokens = sum(row["completion_tokens"] for row in joint_slo_rows)
         return {
@@ -261,8 +362,16 @@ async def run_variant(args, prompts, sampling_params, arrival_times,
             "e2e_ms": summarize(e2es),
             "target_ttft_met_percent": 100.0 * sum(slo_met) / max(1, len(slo_met)),
             "slo_goodput": {
-                "ttft_target_ms": args.slo_ttft_ms,
-                "tpot_target_ms": args.slo_tpot_ms,
+                "ttft_target_ms": (ttft_slo_targets_ms[0]
+                                   if min(ttft_slo_targets_ms)
+                                   == max(ttft_slo_targets_ms) else None),
+                "ttft_target_ms_min": min(ttft_slo_targets_ms),
+                "ttft_target_ms_max": max(ttft_slo_targets_ms),
+                "tpot_target_ms": (tpot_slo_targets_ms[0]
+                                   if min(tpot_slo_targets_ms)
+                                   == max(tpot_slo_targets_ms) else None),
+                "tpot_target_ms_min": min(tpot_slo_targets_ms),
+                "tpot_target_ms_max": max(tpot_slo_targets_ms),
                 "joint_slo_requests": len(joint_slo_rows),
                 "joint_slo_request_rate_per_second": (
                     len(joint_slo_rows) / max(wall, 1e-9)),
@@ -297,6 +406,12 @@ async def run_variant(args, prompts, sampling_params, arrival_times,
                 "decode_cudagraph": engine_metrics.get("decode_cudagraph", {}),
             },
             "per_request": rows,
+            "by_input_length_bucket": _grouped_admission_summary(
+                rows, wall, "input_length_bucket"),
+            "by_prefix_group": _grouped_admission_summary(
+                rows, wall, "prefix_group"),
+            "by_content_class": _grouped_admission_summary(
+                rows, wall, "content_class"),
         }
     finally:
         try:
@@ -316,7 +431,9 @@ async def run_variant(args, prompts, sampling_params, arrival_times,
                 torch.cuda.empty_cache()
 
 
-async def async_main(args, prompts, sampling_params, arrival_times) -> dict:
+async def async_main(args, prompts, sampling_params, arrival_times,
+                     request_metadata, ttft_slo_targets_ms,
+                     tpot_slo_targets_ms) -> dict:
     runs = {}
     # 三档对照：关闭准入 / 准入但不感知缓存 / 准入且感知缓存。
     # 三个变体都以相同随机种子重建引擎并按同一到达 trace 提交，缓存初始为空。
@@ -325,12 +442,21 @@ async def async_main(args, prompts, sampling_params, arrival_times) -> dict:
         ("dynamic_on_no_cache", True, False),
         ("dynamic_on_cache_aware", True, True),
     )
+    if args.variants is not None:
+        selected = set(args.variants)
+        variants = tuple(variant for variant in variants
+                         if variant[0] in selected)
+    if args.seed % 2:
+        variants = tuple(reversed(variants))
     for name, dynamic, cache_aware in variants:
-        print(f"running {name}: {len(prompts)} requests, {args.arrival_mode}, "
-              f"{args.arrival_rate:g} req/s (dynamic={dynamic}, "
+        print(f"running {name}: {len(prompts)} requests, "
+              f"{arrival_description(args)} (dynamic={dynamic}, "
               f"cache_aware={cache_aware}) ...", flush=True)
         runs[name] = await run_variant(
-            args, prompts, sampling_params, arrival_times, dynamic, cache_aware)
+            args, prompts, sampling_params, arrival_times, dynamic, cache_aware,
+            request_metadata=request_metadata,
+            ttft_slo_targets_ms=ttft_slo_targets_ms,
+            tpot_slo_targets_ms=tpot_slo_targets_ms)
         result = runs[name]
         hits = result["cache_hits"]
         error = hits["mean_estimate_error_tokens"]
@@ -359,10 +485,37 @@ def main() -> None:
     if args.prompts_file:
         from transformers import AutoTokenizer
         tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=True)
-    prompts, sampling_params = build_workload(args, tokenizer)
-    arrivals = build_arrival_trace(len(prompts), args.arrival_mode,
-                                   args.arrival_rate, args.seed + 1)
-    runs = asyncio.run(async_main(args, prompts, sampling_params, arrivals))
+    workload_data = build_workload_data(args, tokenizer)
+    prompts, sampling_params = workload_data.prompts, workload_data.sampling_params
+    if args.arrival_mode in ("auto", "trace") and workload_data.has_arrival_trace:
+        args.arrival_mode = "trace"
+        arrivals = [request["arrival_time_s"] for request in workload_data.requests]
+    else:
+        if args.arrival_mode == "trace":
+            raise ValueError("--arrival-mode trace requires arrival_time_s on every prompt row")
+        if args.arrival_mode == "auto":
+            args.arrival_mode = "poisson"
+        arrivals = build_arrival_trace(len(prompts), args.arrival_mode,
+                                       args.arrival_rate, args.seed + 1)
+    args.trace_arrival_summary = (
+        trace_arrival_summary(workload_data.requests, arrivals)
+        if args.arrival_mode == "trace" else None)
+    args.reported_arrival_rate = (
+        args.trace_arrival_summary["reported_rate_requests_per_second"]
+        if args.trace_arrival_summary is not None else args.arrival_rate)
+    ttft_slo_targets_ms = [
+        request["ttft_slo_ms"] if request["ttft_slo_ms"] is not None
+        else args.slo_ttft_ms
+        for request in workload_data.requests
+    ]
+    tpot_slo_targets_ms = [
+        request["tpot_slo_ms"] if request["tpot_slo_ms"] is not None
+        else args.slo_tpot_ms
+        for request in workload_data.requests
+    ]
+    runs = asyncio.run(async_main(
+        args, prompts, sampling_params, arrivals, workload_data.requests,
+        ttft_slo_targets_ms, tpot_slo_targets_ms))
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     output_path = args.output or os.path.join(
         "results", f"admission_ablation_{timestamp}.json")
@@ -371,19 +524,32 @@ def main() -> None:
         json.dump({
             "meta": {"model": args.model, "date": timestamp, **env_info()},
             "config": vars(args),
+            "execution_order": list(runs),
             "workload": {
                 "num_requests": len(prompts),
+                "source": workload_data.source,
                 "arrival_mode": args.arrival_mode,
-                "arrival_rate": args.arrival_rate,
+                "arrival_rate": args.reported_arrival_rate,
+                "trace_arrival_summary": args.trace_arrival_summary,
                 "arrival_times_seconds": arrivals,
                 "prompt_tokens": [len(prompt) for prompt in prompts],
+                "user_prompt_tokens": [request["user_prompt_tokens"]
+                                       for request in workload_data.requests],
                 "max_output_tokens": [params.max_tokens for params in sampling_params],
-                "ttft_slo_targets_ms": [args.slo_ttft_ms] * len(prompts),
-                "tpot_slo_targets_ms": [args.slo_tpot_ms] * len(prompts),
+                "ttft_slo_targets_ms": ttft_slo_targets_ms,
+                "tpot_slo_targets_ms": tpot_slo_targets_ms,
+                "request_ids": [request["request_id"]
+                                for request in workload_data.requests],
+                "prompt_token_hashes": [request["prompt_token_hash"]
+                                         for request in workload_data.requests],
+                "prefix_groups": [request["prefix_group"]
+                                  for request in workload_data.requests],
+                "content_classes": [request["content_class"]
+                                    for request in workload_data.requests],
                 "fingerprint": workload_fingerprint(
                     prompts, sampling_params, arrivals,
-                    [args.slo_ttft_ms] * len(prompts),
-                    [args.slo_tpot_ms] * len(prompts), args.seed),
+                    ttft_slo_targets_ms, tpot_slo_targets_ms, args.seed,
+                    workload_data.requests),
                 "seed": args.seed,
             },
             "runs": runs,

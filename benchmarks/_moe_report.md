@@ -379,6 +379,18 @@ wsl -e bash /mnt/d/Project/nano-vllm/benchmarks/run_in_wsl.sh \
 
 原始结果：[固定 MLA KV / 行序回放 JSON](../results/moe_int4_mla_row_permutation_rep5_20261012.json)。
 
+### 4d.4 2026-10-15 新增在线筛查与 MLA query range 修正
+
+**新增微基准**：DeepSeek-V2-Lite、TP=1、INT4 group64，覆盖 1/4/16/64/128 行。segment-fused 相对 expert loop 的 median speedup 依次为 23.75×、42.95×、11.90×、22.60×、13.35×。26 层 × 2 seeds × 5 row counts 共 260 个 case 中，segment-split 与 segment-fused 都相对 loop bitwise 精确匹配 260/260。该结果只代表 kernel 微基准。
+
+**真实 prompt 在线筛查**：ShareGPT prompts 经 DeepSeek-V2-Lite tokenizer 编码，16 请求、8/16 req/s、16/64/128 输出上限、100/150 ms TPOT、3 seeds；每个条件仅 1 次 split/fused 配对，共 36 对。吞吐 median delta +0.91%，范围 -14.94%～+23.07%，20 胜 / 16 负；joint-SLO output-goodput 百分比 median -5.46%（27 个可计算点）。所有请求输出完全一致的配对为 19/36。由于区间跨零、每条件只有一次且 token parity 不完整，这批数据没有证明稳定的服务级融合收益；保持 fusion experimental。
+
+**单条件配对重复**：对 8 req/s、16 请求、128-token 输出上限、100 ms TPOT 补做 5 seeds × 5 repeats，共 25 对。fused 输出吞吐 median delta +0.51%（范围 -12.87%～+16.46%，14 胜 / 11 负），均值 bootstrap 95% CI 为 -0.35%～+5.11%；联合 SLO output-goodput 差值中位 +10.35 token/s，输出 token 完全一致 14/25 对。区间跨零且只覆盖一个在线条件，因此仍未观察到可确认的稳定服务收益；完整配对表见 [`results/supplemental/report/moe_online_repeat_pairs.csv`](../results/supplemental/report/moe_online_repeat_pairs.csv)。
+
+在线诊断后发现 `MLAAttention._assemble` 把每行的 query 起始偏移当作累积边界。现改为每行 `query_end = query_start + qlen`，并校验 query start/length 数量与 row 数相同。post-change seed42 复现（8 req/s、16 请求、16 输出、100 ms TPOT）仍记录 15/16 请求完全一致，request 5 在 0-based output token 14 首次不同，因此这项改动没有关闭所有在线 mismatch。该诊断不是性能运行，不能据其耗时作比较。
+
+总表、图、KV/FP8 与投机解码结果见 [`benchmarks/_supplemental_report.md`](benchmarks/_supplemental_report.md) 和 [`benchmarks/_supplemental_figures/`](benchmarks/_supplemental_figures/)；重放 JSON 与配对原始数据留在本地被 Git 忽略的 `results/supplemental/`。
+
 ## 5. 引擎吞吐（toy 12-seq × 16-token decode，多次运行取区间）
 
 | 模式 | 多运行区间（tok/s） | vs 同运行 fp16 |
@@ -437,5 +449,7 @@ toy decode 单次 2588 tok/s（此前 loop 档 927-1110）；fp16/fp8 仍在时�
   到 E·max_n（浮点 segment_backend 的边界见 4c）；int4 dual-path 因 w_deq 自动获益
   （引擎 ~2.4-2.8× 观察），纯 INT4 segment 在真实 V2-Lite 层级和 serving trace 上的测量见 4d。
 - 诚实边界：本报告的随机 Qwen3-MoE toy 没有真实模型精度数字；DeepSeek-V2-Lite 的
-  INT4 MoE 结果仅覆盖指定层形状与两轮短 trace，绝对吞吐受 WSL 时钟与运行噪声影响，
-  不外推到其他模型或硬件。
+  INT4 MoE 已有 36 对在线 screening 条件，但每条件仅一轮，吞吐区间跨零且 17/36 对
+  存在 token mismatch。另一个 8 req/s、128-token 输出、100 ms TPOT 条件完成 5 seeds × 5
+  repeats，吞吐中位变化 +0.51%（均值 95% CI -0.35%～+5.11%），输出完全匹配 14/25 对；
+  这个单一条件仍未证明稳定收益。绝对吞吐受负载与运行时钟影响，不外推到其他模型或硬件。

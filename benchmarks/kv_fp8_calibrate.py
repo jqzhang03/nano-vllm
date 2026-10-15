@@ -544,7 +544,9 @@ def main() -> None:
     if csv_rows:
         import csv
         with open(summary_csv, "w", encoding="utf-8", newline="") as csv_file:
-            writer = csv.DictWriter(csv_file, fieldnames=list(csv_rows[0]))
+            fieldnames = list(dict.fromkeys(
+                key for row in csv_rows for key in row))
+            writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
             writer.writeheader()
             writer.writerows(csv_rows)
     print(f"Calibration token IDs: {calibration_path}")

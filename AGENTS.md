@@ -16,6 +16,18 @@ Root-level `example.py` and `bench.py` are runnable demos; `assets/` holds image
 prompt, sampling, arrival-time, seed, and SLO workload fingerprints match. Admission reports
 include joint TTFT/TPOT SLO request and output-token goodput.
 
+`benchmarks/admission_ablation.py --variants` can select a subset of admission variants for
+parameter screens that reuse a separately measured control; the default still runs all three.
+`benchmarks/supplemental_report.py` aggregates the local supplemental JSON/CSV outputs and
+generates the maintained report and figures.
+
+`benchmarks/sharegpt_trace.py` builds de-identified ShareGPT request traces; it uses
+reference assistant reply length only to derive a capped `max_tokens` budget and can
+generate synthetic arrival timestamps. `benchmarks/derive_trace_variants.py` creates
+smoke, calibration, held-out, and prefix variants. The benchmark loaders retain
+prompt-only JSONL support and can replay recorded `arrival_time_s` with
+`--arrival-mode trace`; synthetic arrivals must not be described as production traffic.
+
 `benchmarks/moe_int4_ablation.py` profiles real packed-INT4 MoE layers by input-token count
 and reports independent routing, dispatch, gate/up, activation, down, and scatter timings.
 `benchmarks/moe_int4_fuse_sweep.py` compares split/fused serving on paired seeded arrival
@@ -101,6 +113,17 @@ For the HTTP path, `create_app()` and `nanovllm-serve` default to eager mixed pr
 batches; `--mixed-cudagraph` opts into lazy capture. The direct `LLM`/`Config` default remains
 unchanged. This serving default follows the 2026-10-09 Qwen3-0.6B/RTX 5060 Ti same-trace result;
 other models and GPUs need their own GPU validation.
+
+### 2026-10-15 supplemental screening
+
+The Qwen3-0.6B ShareGPT scheduling screen used five paired 500-request traces at 8 req/s. The all-on bundle averaged -6.50% output throughput (paired-bootstrap 95% CI -7.99% to -4.52%) and -59.09% joint-SLO output goodput (-68.30% to -49.89%); both metrics fell in all five seeds. A seed-0 one-factor screen improved when TPOT-aware scheduling was disabled, but it was a single screening run and remained below the separate baseline run. Do not treat these measurements as support for enabling the bundle by default.
+
+Admission-off had higher joint-SLO output goodput at the tested full-trace operating points (24 req/s with 0/20/50% shared-prefix requests, and 32/48/64/96 req/s without shared prefixes). The supplement added 12 target/work points at TPOT≤20 ms, 24 soft-pressure/wait points at TPOT≤80 ms, three calibration seeds for a selected candidate across TPOT 20/40/80/120 ms, and two held-out seeds on 100 prompts at 384 req/s. At TPOT≤80 ms the selected cache-aware candidate had lower calibration goodput and a higher reject rate than admission-off; at TPOT≤20 ms it produced goodput where admission-off produced zero. The held-out trace used a different size and offered rate. There is no product rejection budget, so no default threshold is recommended. The synthetic Qwen KV matrix measured 425 BF16 blocks / 108,800 token slots and 835 FP8 E4M3 blocks / 213,760 slots. The default cost policy recomputed its two observed preemptions; a forced swap-path comparison recorded 470 vs 511 output token/s across three repeats (-8.1%), which is a path diagnostic and not a serving gain. FP8 held-out logit checks cover 16 prompts at the first decode position only.
+The 20%/50% shared-prefix variants used a synthetic 256-token common template, not a real system prompt.
+
+INT4 MoE segment split/fused matched the loop bitwise for 26 layers × 2 seeds × 5 row counts (260 cases per variant). The fused microbenchmark was 11.90×–42.95× faster across 1/4/16/64/128 rows, but this is kernel-local. In 36 online ShareGPT pairs, fused throughput had +0.91% median delta (-14.94% to +23.07%; 20 wins/16 losses), and every-request output parity held in 19/36 pairs. A repeated 8 req/s, 128-output, 100 ms TPOT condition (5 seeds × 5 repeats) measured +0.51% median throughput delta (-12.87% to +16.46%; 14 wins/11 losses) and full output parity in 14/25 pairs; keep fusion experimental. `MLAAttention._assemble` now derives each query end from its per-row start plus query length. The post-change seed-42 replay still had one mismatching request out of 16, so this does not close the online divergence. Speculative screening covered n-gram only; trained EAGLE/Medusa weights were unavailable.
+
+See [`benchmarks/_supplemental_report.md`](benchmarks/_supplemental_report.md), [`benchmarks/_supplemental_figures/`](benchmarks/_supplemental_figures/), and `python -m benchmarks.supplemental_report` for generated tables and charts. The raw results are ignored under `results/supplemental/` and are local experiment artifacts.
 
 ## Documentation maintenance
 

@@ -15,10 +15,18 @@ from __future__ import annotations
 
 import argparse
 import csv
+import gc
+import hashlib
 import json
+import math
 import os
 import random
+import statistics
 import time
+from collections import Counter
+from datetime import datetime, timezone
+from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 
@@ -26,131 +34,515 @@ from transformers import AutoTokenizer
 
 from nanovllm import LLM, SamplingParams
 
+try:
+    from .bench import build_workload_data, env_info, prompt_token_hash
+except ImportError:
+    from bench import build_workload_data, env_info, prompt_token_hash
+
 MODEL = os.path.expanduser("~/huggingface/Qwen3-0.6B/")
 EOS_IDS = {151643, 151645, 151646, 151647}  # Qwen3 special tokens（仅用于构造重复文本时避开）
 
 
-def build_prompts(style: str, tokenizer, num_seqs: int, min_len: int, max_len: int, seed: int):
-    """返回 prompts 文本列表。"""
+def build_prompts(style: str, tokenizer, num_seqs: int, min_len: int,
+                  max_len: int, seed: int) -> list[list[int]]:
+    """Create one deterministic, distinct prompt per request."""
     rng = random.Random(seed)
     if style == "free":
-        # 随机token段落（不经过tokenizer；与bench.py的synthetic workload同款）
-        return [None] * num_seqs, lambda: [rng.sample(range(0, 10000), rng.randint(min_len, max_len))
-                                           for _ in range(num_seqs)]
-    if style == "repeat":
-        # echo任务：模型被强提示复读同一数字 → 草稿=续写（最好情况，α→高）
-        text = "Repeat exactly, continuing the same digit forever: 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5 5"
-        return [text] * num_seqs, None
-    # json：结构化记录续写
-    records = []
-    for i in range(20):
-        records.append(f'{{"id": {i}, "name": "user_{i}", "score": {i / 20:.2f}, '
-                       f'"active": {i % 2 == 0}, "tags": ["a", "b", "c_{i % 3}"]}}')
-    text = "Complete the JSON array with more records of the same format:\n[" + ",\n".join(records) + "]"
-    return [text] * num_seqs, None
+        vocab = int(getattr(tokenizer, "vocab_size", 32000))
+        special_ids = set(getattr(tokenizer, "all_special_ids", []))
+        candidates = [token for token in range(vocab) if token not in special_ids]
+        return [[rng.choice(candidates) for _ in range(rng.randint(min_len, max_len))]
+                for _ in range(num_seqs)]
+    texts = []
+    for index in range(num_seqs):
+        if style == "repeat":
+            digit = rng.randrange(10)
+            pattern = " ".join(str((digit + offset) % 10) for offset in range(8))
+            texts.append(
+                f"Request {index}: repeat this numeric cycle and continue it: {pattern} "
+                f"{pattern} {pattern}")
+        elif style == "json":
+            records = []
+            for offset in range(12):
+                item_id = index * 100 + offset
+                records.append(
+                    f'{{"id": {item_id}, "name": "user_{item_id}", '
+                    f'"score": {(item_id % 100) / 100:.2f}, '
+                    f'"active": {item_id % 2 == 0}, '
+                    f'"tags": ["a", "b", "c_{item_id % 3}"]}}')
+            texts.append(
+                f"Request {index}: complete this JSON array with distinct records "
+                f"that follow the schema exactly:\n[" + ",\n".join(records) + "]")
+        else:
+            raise ValueError(f"unsupported synthetic prompt style: {style}")
+    return [list(tokenizer.encode(text)) for text in texts]
 
 
-def run_case(style: str, speculative: str, prompts, tokenize, tokenizer, args):
-    if tokenize is not None:
-        prompts_tok = tokenize()
-    else:
-        prompts_tok = [tokenizer.encode(t) for t in prompts]
+def _summary(values: list[float]) -> dict:
+    values = sorted(value for value in values if value is not None)
+    if not values:
+        return {"count": 0, "p50": None, "p95": None, "p99": None, "mean": None}
+    pick = lambda q: values[min(int(len(values) * q), len(values) - 1)]
+    return {"count": len(values), "p50": pick(0.50), "p95": pick(0.95),
+            "p99": pick(0.99), "mean": statistics.fmean(values)}
+
+
+def _output_stats(token_ids: list[int]) -> dict:
+    grams = [tuple(token_ids[index:index + 4])
+             for index in range(max(0, len(token_ids) - 3))]
+    distinct = len(set(grams)) / len(grams) if grams else None
+    counts = {}
+    for token_id in token_ids:
+        counts[token_id] = counts.get(token_id, 0) + 1
+    entropy = 0.0
+    for count in counts.values():
+        probability = count / max(1, len(token_ids))
+        entropy -= probability * math.log2(probability)
+    return {
+        "tokens": len(token_ids),
+        "distinct_4": distinct,
+        "fourgram_repeat_rate": (1.0 - distinct if distinct is not None else None),
+        "token_entropy_bits": entropy if token_ids else None,
+    }
+
+
+def _bootstrap_median_ci(values: list[float], seed: int,
+                         samples: int = 2000) -> dict:
+    values = [value for value in values if value is not None]
+    if not values:
+        return {"count": 0, "median": None, "ci95_low": None, "ci95_high": None}
+    rng = random.Random(seed)
+    medians = []
+    for _ in range(samples):
+        resample = [values[rng.randrange(len(values))] for _ in values]
+        medians.append(statistics.median(resample))
+    medians.sort()
+    return {
+        "count": len(values),
+        "median": statistics.median(values),
+        "ci95_low": medians[int(samples * 0.025)],
+        "ci95_high": medians[min(samples - 1, int(samples * 0.975))],
+    }
+
+
+def run_case(style: str, speculative: str, prompts_tok: list[list[int]],
+             tokenizer, args, *, seed: int,
+             request_metadata: list[dict] | None = None) -> dict:
     llm = LLM(args.model, speculative=speculative,
               medusa_path=args.medusa_path if speculative == "medusa" else "",
               eagle_path=args.eagle_path if speculative == "eagle" else "",
               max_draft_len=args.max_draft_len,
               kv_cache_dtype="fp8_e4m3" if args.fp8 else "auto",
-              max_model_len=args.max_model_len, gpu_memory_utilization=args.gpu_memory_utilization)
-    llm.generate(["warm up"] * 4, SamplingParams(temperature=0.6, max_tokens=8), use_tqdm=False)
-    sps = [SamplingParams(temperature=0.6, max_tokens=args.max_output_len, ignore_eos=True)] * len(prompts_tok)
-    t0 = time.perf_counter()
-    llm.generate(prompts_tok, sps, use_tqdm=False)
-    wall = time.perf_counter() - t0
-    m = llm.collect_metrics()
-    stats = m["step_stats"]
-    ttft = _summarize([r["t_first_token"] - r["t_submitted"] for r in m["per_request"]])
-    tpot = _summarize([(r["t_completed"] - r["t_first_token"]) / (r["completion_tokens"] - 1)
-                       for r in m["per_request"] if r["completion_tokens"] > 1])
-    row = {
-        "style": style, "speculative": speculative,
-        "wall_s": round(wall, 3),
-        "throughput_tok_per_s": round(stats["decode_tokens"] / wall, 1),
-        "ttft_p50_ms": ttft, "tpot_p50_ms": tpot,
-        "preemptions": m.get("num_preemptions", 0),
-        "prefill_steps": stats["prefill_steps"], "decode_steps": stats["decode_steps"],
+              max_model_len=args.max_model_len,
+              max_num_seqs=max(8, len(prompts_tok)),
+              gpu_memory_utilization=args.gpu_memory_utilization)
+    try:
+        if args.sampling_mode == "greedy":
+            llm.model_runner.sampler.forward = lambda logits, _temps: logits.argmax(dim=-1)
+        warmup_rng = random.Random(seed + 100003)
+        vocab = int(getattr(tokenizer, "vocab_size", 32000))
+        warmups = [[warmup_rng.randrange(max(1, vocab - 4)) for _ in range(64)]
+                   for _ in range(min(4, len(prompts_tok)))]
+        llm.generate(warmups, SamplingParams(temperature=0.6, max_tokens=8),
+                     use_tqdm=False)
+        llm.reset_benchmark_metrics()
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        sampling_temperature = 1.0 if args.sampling_mode == "greedy" else args.temperature
+        sampling_params = [SamplingParams(
+            temperature=sampling_temperature,
+            max_tokens=args.max_output_len,
+            ignore_eos=args.ignore_eos,
+        ) for _ in prompts_tok]
+        started = time.perf_counter()
+        outputs = llm.generate(prompts_tok, sampling_params, use_tqdm=False)
+        torch.cuda.synchronize()
+        wall = time.perf_counter() - started
+        metrics = llm.collect_metrics()
+        per_request = sorted(metrics["per_request"], key=lambda row: row["seq_id"])
+        if len(per_request) != len(prompts_tok):
+            raise RuntimeError(
+                f"expected {len(prompts_tok)} request metrics, received {len(per_request)}")
+        if len({row["seq_id"] for row in per_request}) != len(per_request):
+            raise RuntimeError("speculative benchmark returned duplicate request metrics")
+        rows = []
+        for index, (request, output) in enumerate(zip(per_request, outputs)):
+            token_stats = _output_stats(output["token_ids"])
+            rows.append({
+                "request_index": index,
+                "request_id": (request_metadata[index].get("request_id")
+                               if request_metadata is not None else None),
+                "content_class": (request_metadata[index].get("content_class", style)
+                                  if request_metadata is not None else style),
+                "prompt_tokens": len(prompts_tok[index]),
+                "prompt_token_hash": prompt_token_hash(prompts_tok[index]),
+                "ttft_ms": (None if request["t_first_token"] is None else
+                            (request["t_first_token"] - request["t_submitted"]) * 1000),
+                "tpot_ms": (None if request["completion_tokens"] <= 1 else
+                            (request["t_completed"] - request["t_first_token"])
+                            * 1000 / (request["completion_tokens"] - 1)),
+                "e2e_ms": (None if request["t_completed"] is None else
+                           (request["t_completed"] - request["t_submitted"]) * 1000),
+                "spec_proposed_tokens": request.get("spec_proposed_tokens", 0),
+                "spec_accepted_tokens": request.get("spec_accepted_tokens", 0),
+                "spec_verify_steps": request.get("spec_verify_steps", 0),
+                "alpha": (request.get("spec_accepted_tokens", 0)
+                          / request["spec_proposed_tokens"]
+                          if request.get("spec_proposed_tokens", 0) else None),
+                **token_stats,
+            })
+        stats = metrics["step_stats"]
+        alpha = (stats["spec_accepted_drafts"] / stats["spec_draft_tokens"]
+                 if stats.get("spec_draft_tokens") else None)
+        output_tokens = sum(len(output["token_ids"]) for output in outputs)
+        return {
+            "style": style,
+            "speculative": speculative,
+            "seed": seed,
+            "wall_seconds": wall,
+            "output_tokens": output_tokens,
+            "throughput_tok_per_s": output_tokens / max(wall, 1e-9),
+            "ttft_ms": _summary([row["ttft_ms"] for row in rows]),
+            "tpot_ms": _summary([row["tpot_ms"] for row in rows]),
+            "e2e_ms": _summary([row["e2e_ms"] for row in rows]),
+            "preemptions": metrics.get("num_preemptions", 0),
+            "prefill_steps": stats["prefill_steps"],
+            "decode_steps": stats["decode_steps"],
+            "spec_steps": stats.get("spec_steps", 0),
+            "spec_verify_tokens": stats.get("spec_verify_tokens", 0),
+            "spec_proposed_tokens": stats.get("spec_draft_tokens", 0),
+            "spec_accepted_tokens": stats.get("spec_accepted_drafts", 0),
+            "alpha": alpha,
+            "avg_draft_len": (stats["spec_draft_tokens"] / stats["spec_rows"]
+                              if stats.get("spec_rows") else None),
+            "peak_memory_allocated_bytes": torch.cuda.max_memory_allocated(),
+            "peak_memory_reserved_bytes": torch.cuda.max_memory_reserved(),
+            "output_token_fingerprint": hashlib.sha256(json.dumps(
+                [output["token_ids"] for output in outputs],
+                separators=(",", ":")).encode("utf-8")).hexdigest(),
+            "content_metrics": {
+                "distinct_4": _summary([row["distinct_4"] for row in rows]),
+                "fourgram_repeat_rate": _summary(
+                    [row["fourgram_repeat_rate"] for row in rows]),
+                "token_entropy_bits": _summary(
+                    [row["token_entropy_bits"] for row in rows]),
+                "per_request_alpha": _summary(
+                    [row["alpha"] for row in rows]),
+            },
+            "per_request": rows,
+        }
+    finally:
+        llm.exit()
+        del llm
+        gc.collect()
+        torch.cuda.empty_cache()
+
+
+def _parse_ints(value: str, name: str) -> list[int]:
+    try:
+        values = [int(item.strip()) for item in value.split(",") if item.strip()]
+    except ValueError as exc:
+        raise ValueError(f"{name} must be comma-separated integers") from exc
+    if not values or any(value < 1 for value in values):
+        raise ValueError(f"{name} must contain positive integers")
+    return values
+
+
+def _parse_seeds(value: str) -> list[int]:
+    try:
+        seeds = [int(item.strip()) for item in value.split(",") if item.strip()]
+    except ValueError as exc:
+        raise ValueError("--seeds must be comma-separated non-negative integers") from exc
+    if not seeds or any(seed < 0 for seed in seeds):
+        raise ValueError("--seeds must contain non-negative integers")
+    return seeds
+
+
+def _format_ms(value: float | None) -> str:
+    return "n/a" if value is None else f"{value:.1f}"
+
+
+def _trace_prompts(style: str, prompts: list[list[int]], metadata: list[dict],
+                   count: int, seed: int) -> tuple[list[list[int]], list[dict]]:
+    if style == "sharegpt":
+        accepted_classes = {"sharegpt", "sharegpt_summary"}
+    else:
+        accepted_classes = {style}
+    candidates = [index for index, row in enumerate(metadata)
+                  if row.get("content_class") in accepted_classes]
+    if style == "sharegpt" and not any(row.get("content_class") for row in metadata):
+        candidates = list(range(len(prompts)))
+    if len(candidates) < count:
+        raise ValueError(
+            f"content class {style!r} has {len(candidates)} prompts, needs {count}")
+    selected = random.Random(seed).sample(candidates, count)
+    return [prompts[index] for index in selected], [metadata[index] for index in selected]
+
+
+def _prompt_fingerprint(prompts: list[list[int]], output_len: int,
+                        ignore_eos: bool) -> str:
+    payload = {"prompts": prompts, "max_output_len": output_len,
+               "ignore_eos": ignore_eos}
+    encoded = json.dumps(payload, separators=(",", ":"),
+                         allow_nan=False).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--model", default=MODEL, help="model directory (default Qwen3-0.6B)")
+    parser.add_argument("--styles", default="free,json,repeat",
+                        help="free,json,repeat,sharegpt,structured,sharegpt_summary,open_ended")
+    parser.add_argument("--prompts-file", default=None,
+                        help="optional request JSONL built by sharegpt_trace.py")
+    parser.add_argument("--speculative", default="none,ngram",
+                        help="comma-separated modes: none,ngram,medusa,eagle")
+    parser.add_argument("--medusa-path", default="results/medusa_heads.pt")
+    parser.add_argument("--eagle-path", default="results/eagle_layer.pt")
+    parser.add_argument("--max-draft-len", type=int, default=4,
+                        help="fallback draft length gamma")
+    parser.add_argument("--max-draft-lens", default=None,
+                        help="optional gamma sweep, for example 2,4")
+    parser.add_argument("--num-seqs", type=int, default=64)
+    parser.add_argument("--batch-sizes", default=None,
+                        help="comma-separated batch sizes; defaults to --num-seqs")
+    parser.add_argument("--max-input-len", type=int, default=256)
+    parser.add_argument("--min-input-len", type=int, default=256)
+    parser.add_argument("--max-output-len", type=int, default=96)
+    parser.add_argument("--max-model-len", type=int, default=4096)
+    parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
+    parser.add_argument("--fp8", action="store_true", help="use FP8 KV cache")
+    parser.add_argument("--seeds", default=None,
+                        help="comma-separated input/sampler seeds; defaults to --seed")
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--repeats", type=int, default=1)
+    parser.add_argument("--sampling-mode", choices=("random", "greedy"), default="random")
+    parser.add_argument("--temperature", type=float, default=0.6)
+    eos_group = parser.add_mutually_exclusive_group()
+    eos_group.add_argument("--ignore-eos", dest="ignore_eos", action="store_true")
+    eos_group.add_argument("--natural-stop", dest="ignore_eos", action="store_false")
+    parser.set_defaults(ignore_eos=True)
+    parser.add_argument("--output", default="results/spec_bench_supplemental.json")
+    args = parser.parse_args()
+    args.model = os.path.expanduser(args.model)
+    if args.repeats < 1 or args.num_seqs < 1:
+        raise ValueError("--repeats and --num-seqs must be positive")
+    if args.max_output_len < 1 or args.temperature <= 0:
+        raise ValueError("output length and random-sampling temperature must be positive")
+
+    seeds = (_parse_seeds(args.seeds) if args.seeds is not None
+             else [args.seed])
+    batch_sizes = (_parse_ints(args.batch_sizes, "--batch-sizes")
+                   if args.batch_sizes is not None else [args.num_seqs])
+    draft_lengths = (_parse_ints(args.max_draft_lens, "--max-draft-lens")
+                     if args.max_draft_lens is not None else [args.max_draft_len])
+    spec_modes = [item.strip() for item in args.speculative.split(",") if item.strip()]
+    if not spec_modes or "none" not in spec_modes:
+        raise ValueError("--speculative must include the none baseline")
+    if any(mode not in {"none", "ngram", "medusa", "eagle"} for mode in spec_modes):
+        raise ValueError("unsupported speculative mode")
+    if "medusa" in spec_modes and not os.path.isfile(args.medusa_path):
+        raise FileNotFoundError(f"Medusa weights do not exist: {args.medusa_path}")
+    if "eagle" in spec_modes and not os.path.isfile(args.eagle_path):
+        raise FileNotFoundError(f"EAGLE weights do not exist: {args.eagle_path}")
+
+    tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=True,
+                                              local_files_only=True)
+    trace_prompts = []
+    trace_metadata = []
+    if args.prompts_file:
+        loader_args = SimpleNamespace(
+            seed=args.seed,
+            prompts_file=args.prompts_file,
+            num_seqs=0,
+            min_input_len=args.min_input_len,
+            max_input_len=args.max_input_len,
+            min_output_len=args.max_output_len,
+            max_output_len=args.max_output_len,
+            shared_prefix_len=0,
+        )
+        workload = build_workload_data(loader_args, tokenizer)
+        trace_prompts, trace_metadata = workload.prompts, workload.requests
+
+    pair_results = []
+    flat_rows = []
+    condition_index = 0
+    styles = [item.strip() for item in args.styles.split(",") if item.strip()]
+    for style in styles:
+        if style not in {"free", "json", "repeat", "sharegpt", "structured",
+                         "sharegpt_summary", "open_ended"}:
+            raise ValueError(f"unsupported prompt style: {style}")
+        if style not in {"free", "json", "repeat"} and not args.prompts_file:
+            raise ValueError(f"style {style!r} requires --prompts-file")
+        for batch_size in batch_sizes:
+            if style in {"free", "json", "repeat"}:
+                if batch_size != args.num_seqs and args.batch_sizes is None:
+                    raise ValueError("batch-size mismatch")
+            for draft_len in draft_lengths:
+                args.max_draft_len = draft_len
+                for seed in seeds:
+                    if style in {"free", "json", "repeat"}:
+                        prompts = build_prompts(
+                            style, tokenizer, batch_size, args.min_input_len,
+                            args.max_input_len, seed)
+                        metadata = [{"content_class": style} for _ in prompts]
+                    else:
+                        prompts, metadata = _trace_prompts(
+                            style, trace_prompts, trace_metadata, batch_size, seed)
+                    if max(map(len, prompts)) + args.max_output_len > args.max_model_len:
+                        raise ValueError(
+                            f"prompt + output exceeds --max-model-len for {style}")
+                    fingerprint = _prompt_fingerprint(
+                        prompts, args.max_output_len, args.ignore_eos)
+                    condition_index += 1
+                    for repeat_index in range(args.repeats):
+                        order = (list(spec_modes) if (condition_index + repeat_index) % 2 == 0
+                                 else list(reversed(spec_modes)))
+                        runs = {}
+                        print(
+                            f"\nstyle={style} batch={batch_size} gamma={draft_len} "
+                            f"seed={seed} repeat={repeat_index + 1}/{args.repeats} "
+                            f"order={' -> '.join(order)} fingerprint={fingerprint[:16]}",
+                            flush=True,
+                        )
+                        for speculative in order:
+                            run = run_case(style, speculative, prompts, tokenizer,
+                                           args, seed=seed + repeat_index * 1009,
+                                           request_metadata=metadata)
+                            run.update({
+                                "batch_size": batch_size,
+                                "max_draft_len": draft_len,
+                                "repeat_index": repeat_index + 1,
+                                "input_fingerprint": fingerprint,
+                            })
+                            runs[speculative] = run
+                            flat_rows.append({
+                                "style": style,
+                                "batch_size": batch_size,
+                                "max_draft_len": draft_len,
+                                "seed": seed,
+                                "repeat_index": repeat_index + 1,
+                                "speculative": speculative,
+                                "content_class": ",".join(sorted({
+                                    row.get("content_class", style)
+                                    for row in metadata})),
+                                "wall_seconds": run["wall_seconds"],
+                                "output_tokens": run["output_tokens"],
+                                "throughput_tok_per_s": run["throughput_tok_per_s"],
+                                "ttft_p50_ms": run["ttft_ms"]["p50"],
+                                "ttft_p95_ms": run["ttft_ms"]["p95"],
+                                "tpot_p50_ms": run["tpot_ms"]["p50"],
+                                "tpot_p95_ms": run["tpot_ms"]["p95"],
+                                "e2e_p95_ms": run["e2e_ms"]["p95"],
+                                "alpha": run["alpha"],
+                                "spec_proposed_tokens": run["spec_proposed_tokens"],
+                                "spec_accepted_tokens": run["spec_accepted_tokens"],
+                                "input_fingerprint": fingerprint,
+                                "output_token_fingerprint": run[
+                                    "output_token_fingerprint"],
+                            })
+                            print(
+                                f"  {speculative:<7} {run['throughput_tok_per_s']:.1f} tok/s | "
+                                f"TTFT p50/p95 {_format_ms(run['ttft_ms']['p50'])}/"
+                                f"{_format_ms(run['ttft_ms']['p95'])} ms | "
+                                f"TPOT p50/p95 {_format_ms(run['tpot_ms']['p50'])}/"
+                                f"{_format_ms(run['tpot_ms']['p95'])} ms | alpha={run['alpha']}",
+                                flush=True,
+                            )
+                        if len({run["input_fingerprint"] for run in runs.values()}) != 1:
+                            raise AssertionError("paired modes received different prompt inputs")
+                        baseline = runs["none"]
+                        comparisons = {}
+                        for speculative in spec_modes:
+                            if speculative == "none":
+                                continue
+                            measured = runs[speculative]
+                            speedup = 100.0 * (
+                                measured["throughput_tok_per_s"]
+                                / max(baseline["throughput_tok_per_s"], 1e-12) - 1.0)
+                            comparisons[speculative] = {
+                                "throughput_delta_percent": speedup,
+                                "ttft_p50_delta_ms": (
+                                    measured["ttft_ms"]["p50"]
+                                    - baseline["ttft_ms"]["p50"]),
+                                "tpot_p50_delta_ms": (
+                                    measured["tpot_ms"]["p50"]
+                                    - baseline["tpot_ms"]["p50"]),
+                                "output_token_match": (
+                                    measured["output_token_fingerprint"]
+                                    == baseline["output_token_fingerprint"]),
+                            }
+                        pair_results.append({
+                            "style": style,
+                            "batch_size": batch_size,
+                            "max_draft_len": draft_len,
+                            "seed": seed,
+                            "repeat_index": repeat_index + 1,
+                            "execution_order": order,
+                            "input_fingerprint": fingerprint,
+                            "content_class_counts": dict(Counter(
+                                row.get("content_class") or style
+                                for row in metadata)),
+                            "comparisons": comparisons,
+                            "runs": runs,
+                        })
+
+    grouped = {}
+    for pair in pair_results:
+        for speculative, comparison in pair["comparisons"].items():
+            key = (pair["style"], pair["batch_size"],
+                   pair["max_draft_len"], speculative)
+            grouped.setdefault(key, []).append(comparison["throughput_delta_percent"])
+    aggregate = {
+        f"{style}_batch{batch}_gamma{gamma}_{speculative}": {
+            "style": style,
+            "batch_size": batch,
+            "max_draft_len": gamma,
+            "speculative": speculative,
+            **_bootstrap_median_ci(values, args.seed + batch + gamma),
+            "wins": sum(value > 0 for value in values),
+            "losses": sum(value < 0 for value in values),
+        }
+        for (style, batch, gamma, speculative), values in grouped.items()
     }
-    if speculative != "none":
-        d, acc = stats["spec_draft_tokens"], stats["spec_accepted_drafts"]
-        rows_spec = stats["spec_rows"]
-        row.update({
-            "alpha": round(acc / d, 3) if d else None,
-            "avg_draft_len": round(d / rows_spec, 2) if rows_spec else None,
-            "spec_steps": stats["spec_steps"],
-            "spec_verify_tokens": stats["spec_verify_tokens"],
-        })
-    llm.exit()
-    torch.cuda.empty_cache()  # 同进程多引擎必须显式归还显存（caching allocator不自动还驱动）
-    return row
-
-
-def _summarize(vals):
-    vals = sorted(v for v in vals if v is not None)
-    if not vals:
-        return None
-    return round(vals[min(int(len(vals) * 0.5), len(vals) - 1)] * 1000, 1)
-
-
-def main():
-    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--model", default=MODEL, help="模型目录（默认 Qwen3-0.6B）")
-    p.add_argument("--styles", default="free,json,repeat")
-    p.add_argument("--speculative", default="none,ngram",
-                   help="逗号分隔的spec模式（none/ngram/medusa）；medusa需--medusa-path")
-    p.add_argument("--medusa-path", default="results/medusa_heads.pt")
-    p.add_argument("--eagle-path", default="results/eagle_layer.pt",
-                   help="EAGLE草稿层权重（speculative含eagle时用）")
-    p.add_argument("--max-draft-len", type=int, default=4,
-                   help="最大草稿数γ（草稿成本/特征误差累积的权衡）")
-    p.add_argument("--num-seqs", type=int, default=64)
-    p.add_argument("--max-input-len", type=int, default=256)
-    p.add_argument("--max-output-len", type=int, default=96)
-    p.add_argument("--max-model-len", type=int, default=4096)
-    p.add_argument("--gpu-memory-utilization", type=float, default=0.9)
-    p.add_argument("--fp8", action="store_true", help="fp8 KV cache（与fp16对比）")
-    p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--output", default="results/spec_bench.csv")
-    args = p.parse_args()
-    args.model = os.path.expanduser(args.model)  # bash argv 不展开 ~ → 手动展开
-
-    os.makedirs("results", exist_ok=True)
-    tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=True)
-    rows = []
-    for style in [s.strip() for s in args.styles.split(",")]:
-        prompts, tokenize = build_prompts(style, tokenizer, args.num_seqs,
-                                          args.max_input_len, args.max_input_len, args.seed)
-        print(f"\n=== style={style} (fp8={args.fp8}) ===")
-        for spec_mode in [s.strip() for s in args.speculative.split(",")]:
-            row = run_case(style, spec_mode, prompts, tokenize, tokenizer, args)
-            rows.append(row)
-            if spec_mode == "none":
-                base = row
-                print(f"  baseline: {base['throughput_tok_per_s']:7.1f} tok/s | "
-                      f"TTFT {base['ttft_p50_ms']}ms | TPOT {base['tpot_p50_ms']}ms")
-            else:
-                speedup = row["throughput_tok_per_s"] / base["throughput_tok_per_s"]
-                print(f"  {spec_mode:<6}: {row['throughput_tok_per_s']:7.1f} tok/s ({speedup:+.2f}x) | "
-                      f"TTFT {row['ttft_p50_ms']}ms | TPOT {row['tpot_p50_ms']}ms | "
-                      f"α={row.get('alpha')} | avg γ={row.get('avg_draft_len')}")
-
-    with open(args.output, "w", newline="") as f:
-        fieldnames = list(dict.fromkeys(k for r in rows for k in r.keys()))
-        w = csv.DictWriter(f, fieldnames=fieldnames)
-        w.writeheader()
-        w.writerows(rows)
-    with open(args.output.replace(".csv", ".json"), "w", encoding="utf-8") as f:
-        json.dump({"meta": {"model": args.model, "num_seqs": args.num_seqs, "fp8": args.fp8},
-                   "rows": rows}, f, indent=2)
-    print(f"\nCSV -> {args.output}, JSON -> {args.output.replace('.csv', '.json')}")
+    output_path = Path(args.output).expanduser()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    csv_path = output_path.with_suffix(".csv")
+    with csv_path.open("w", encoding="utf-8", newline="") as csv_file:
+        fieldnames = list(dict.fromkeys(key for row in flat_rows for key in row))
+        writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(flat_rows)
+    payload = {
+        "meta": {
+            "model": args.model,
+            "created_utc": datetime.now(timezone.utc).isoformat(),
+            "spec_bench_source": os.path.abspath(__file__),
+            **env_info(),
+        },
+        "config": {
+            "styles": styles,
+            "speculative_modes": spec_modes,
+            "batch_sizes": batch_sizes,
+            "seeds": seeds,
+            "repeats": args.repeats,
+            "max_draft_lens": draft_lengths,
+            "max_output_len": args.max_output_len,
+            "ignore_eos": args.ignore_eos,
+            "sampling_mode": args.sampling_mode,
+            "temperature": args.temperature,
+            "fp8_kv": args.fp8,
+            "prompts_file": args.prompts_file,
+        },
+        "aggregate": aggregate,
+        "pairs": pair_results,
+    }
+    with output_path.open("w", encoding="utf-8") as result_file:
+        json.dump(payload, result_file, indent=2)
+    print(f"\nJSON -> {output_path}, CSV -> {csv_path}")
 
 
 if __name__ == "__main__":

@@ -91,6 +91,47 @@ fusion stays experimental. See [`INTERVIEW.md` §10.3.18](INTERVIEW.md),
 [`benchmarks/_moe_report.md`](benchmarks/_moe_report.md), and
 [`benchmarks/moe_int4_arrival_diag.py`](benchmarks/moe_int4_arrival_diag.py).
 
+### 2026-10-15 supplemental screening
+
+The new ShareGPT screening did not support enabling the all-on scheduling bundle or
+the current predictive-admission thresholds by default. Five 8 req/s scheduling pairs
+showed lower output throughput and joint-SLO goodput. Admission screening covered 12
+target/work points at TPOT≤20 ms and 24 soft-pressure/wait points at TPOT≤80 ms;
+candidate checks used three calibration seeds across TPOT 20/40/80/120 ms and two
+held-out seeds on 100 prompts at 384 req/s. At 96 req/s / 400 prompts / TPOT≤80 ms,
+the cache-aware candidate rejected a median 58.2% of arrivals and produced 4458 token/s
+joint goodput, versus 33.8% and 5217 token/s for admission-off. At TPOT≤20 ms it
+increased goodput from zero but raised rejection by about 25 percentage points. The
+held-out trace was shorter and used a different offered rate, so these measurements do
+not establish a default threshold; no product rejection budget is defined.
+
+`benchmarks/sharegpt_trace.py` creates de-identified request JSONL; reference assistant
+reply length only supplies a capped `max_tokens` budget, and arrival timestamps are
+synthetic. `bench.py`, `scheduling_ablation.py`, and `admission_ablation.py` retain
+prompt-only JSONL compatibility and can replay stored arrival times. The results below
+use synthetic Poisson arrivals, not production request logs. Shared-prefix variants use
+a synthetic 256-token template, not a real system prompt.
+
+On Qwen3-0.6B, the measured BF16 and FP8 KV pools held 425 and 835 blocks respectively.
+The default cost policy recomputed its two observed preemptions. A forced-path diagnostic
+with recompute cost comparison disabled produced 470 token/s with swap enabled versus
+511 token/s without swap across three repeats (-8.1%); this verifies offload execution,
+not a serving benefit. FP8 quality checks used 16 held-out prompts at the first decode
+position, so they do not establish long-generation quality.
+
+DeepSeek-V2-Lite INT4 segment split/fused kernels matched the loop bitwise across 260
+layer/seed/batch cases, while the 36-pair online sweep had a +0.91% median throughput
+delta with a -14.94% to +23.07% range and only 19/36 pairs with identical request
+outputs. A follow-up 5-seed × 5-repeat condition measured +0.51% median throughput
+delta (95% bootstrap CI -0.35% to +5.11%) and identical request outputs in 14/25 pairs.
+Keep fusion experimental. MLA cache assembly now computes each query end as
+`start + qlen`; a follow-up 16-request replay still recorded one output mismatch, so
+the earlier online divergence is not fully resolved. N-gram acceptance tracked output
+repetition in the sampled content classes, but no Medusa/EAGLE draft weights were
+available. Full conditions and limits are in
+[`benchmarks/_supplemental_report.md`](benchmarks/_supplemental_report.md); raw files
+are under the ignored `results/supplemental/` directory.
+
 ### NVFP4 weight experiments
 
 `quantization="nvfp4"` packs E2M1 values two per byte, stores one E4M3 scale per

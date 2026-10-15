@@ -1814,6 +1814,69 @@ block table / slot mapping。此结果不构成修改 MoE fused GEMM 的证据�
 [MoE 实验报告](benchmarks/_moe_report.md)，原始结果为
 [moe_int4_mla_row_permutation_rep5_20261012.json](results/moe_int4_mla_row_permutation_rep5_20261012.json)。
 
+### 10.3.19 2026-10-15 实验补充：调度、准入、KV、MoE 与投机解码
+
+ShareGPT 请求 trace 由 `benchmarks/sharegpt_trace.py` 生成，参考 assistant 回复长度只用于派生截断的 `max_tokens` 预算，回复文本不进入模型输入；到达时间为合成 Poisson。`benchmarks/derive_trace_variants.py` 生成 smoke、calibration、held-out 与 prefix 变体。基准 loader 同时支持完整 request trace 和 prompt-only JSONL。
+
+本轮基于 HEAD `143ce1b` 的 dirty 工作区，在 RTX 5060 Ti 16 GB / TP=1 上完成。环境为 Python 3.12.13、PyTorch 2.8.0+cu128、CUDA 12.8、Triton 3.4.0。调度与准入使用清理后的 ShareGPT Vicuna 500 条 user prompt 和合成 Poisson 到达；MoE trace 另用 DeepSeek-V2-Lite tokenizer。它们不是生产 HTTP 到达日志。
+
+#### 调度与准入
+
+Qwen3-0.6B BF16、500 请求、8 req/s、2 s TTFT / 80 ms TPOT 下完成五个配对 seed。`all_on` 相对 baseline 的输出吞吐平均变化为 -6.50%（paired bootstrap 95% CI -7.99%～-4.52%），联合 SLO 输出 goodput 平均变化为 -59.09%（-68.30%～-49.89%）；两项都在 5/5 seed 下降。seed0 单因素筛查中关闭 TPOT-aware 后，输出吞吐从 1556.3 升至 1592.9 token/s，联合 goodput 从 69.1 升至 88.3 token/s；这是单次筛查，仍低于单独 baseline 配对结果，不构成默认策略依据。
+
+500 请求准入结果中，24 req/s 下 cache-aware 对比 admission-off：
+
+20%/50% 共享前缀条件由合成的 256-token 公共模板构造，不是线上 system prompt。
+
+| 共享前缀比例 | admission-off 接收 / goodput (token/s) | cache-aware 接收 / goodput (token/s) |
+|---:|---:|---:|
+| 0% | 500/500 / 4823 | 331/500 / 3610 |
+| 20% | 500/500 / 4713 | 402/500 / 4357 |
+| 50% | 500/500 / 4632 | 208/500 / 2276 |
+
+无共享前缀时，32/48/64/96 req/s 的 admission-off / cache-aware 接收率分别为 96.6/80.6/72.0/63.8% 与 40.2/55.0/48.2/28.8%；联合 goodput 分别为 5161/5276/5291/5253 与 2789/4573/4699/4064 token/s。之后完成 400 请求、96 req/s 的 12 点 target/work 网格（TPOT≤20 ms），再在首轮挑出的高-goodput与低拒绝率 target/work 组合上做 24 点 soft-pressure / max-wait 筛查（TPOT≤80 ms）。第一阶段 seed0 的最高 goodput 点是 target=500/work=5000 ms、拒绝率 65.5%、goodput 4237 token/s；第二阶段 seed0 的最高点为 target/work/soft/wait=500/5000/1.0/500，拒绝率 53.5%、goodput 4802 token/s。两阶段使用不同 TPOT SLO，不能拼成一条 Pareto 曲线。
+
+对 target=500/work=5000/soft=1.0/wait=500 的选定参数，96 req/s 校准 3-seed 配对显示：TPOT≤20 ms 时 cache-aware goodput 中位数 1607 token/s，admission-off 为 0；拒绝率中位数分别为 58.5% 和 33.5%。TPOT≤40/80/120 ms 时 cache-aware 的 goodput 均低于 admission-off，配对均值差约 -975/-803/-974 token/s，bootstrap 95% CI 分别为 -1095～-744、-974～-677、-1180～-679；cache-aware 多拒绝约 25 个百分点。admission-off 仍受固定队列上限影响，并非无限制地接收所有请求。held-out 检查使用另外 100 条 prompt、384 req/s、seed 3/4；target=500 候选中位 goodput 3774 vs 4507 token/s、拒绝率 16.5% vs 0%，target=2000 候选无拒绝，goodput 差 +23 token/s，95% CI -298～+344。held-out 条件的请求数和到达率与 calibration 不同，只能作为短 trace 压力观察。没有业务拒绝率预算，不推荐新的默认阈值。完整参数表与配对差值见 [准入校准表](results/supplemental/report/admission_calibration.csv)、[配对验证表](results/supplemental/report/admission_validation_pairs.csv) 和 [实验补充报告](benchmarks/_supplemental_report.md)。
+
+#### KV 容量与精度
+
+BF16 synthetic KV pool 为 425 blocks / 108,800 token slots；FP8 E4M3 为 835 / 213,760。按 pool 账本折算，BF16 512/1024/2048/4096-token 完整上下文上限分别为 141/85/47/25 条；FP8 在 2048/4096-token 上限为 92/49 条。这是容量折算，不是并发服务保证。真实 ShareGPT prompt BF16 矩阵有 9 行，池为 423 blocks / 108,288 slots。原始 4096-token、48/64 并发点未发生 swap；后续 4096 输入、32 并发、512 输出压力诊断在默认成本策略下有 2 次抢占且都选择重算。关闭重算成本比较后强制测量 3 次：swap-on 吞吐 470.2 token/s（18 次抢占，其中 12 swap/6 重算），no-swap 511.4 token/s（6 次抢占、全重算），swap-on 低 8.1%。这证明 offload 路径被触发，但不构成 serving 加速，且没有触发 OOM 或测到物理 KV 极限。
+
+FP8 校准用 32 条 prompt / 4332 tokens，held-out 用 16 条 / 691 tokens，只对齐比较首个 decode 位置：
+
+| scale margin | 首 token 一致率 | logits top-1 | top-5 overlap | KL(ref‖FP8) | 最大范围利用率 | 超 limit 组件数 |
+|---:|---:|---:|---:|---:|---:|---:|
+| 0.90 | 100.0% | 100.0% | 92.5% | 0.00991 | 1.348 | 48 |
+| 1.00 | 100.0% | 93.8% | 93.8% | 0.00506 | 1.214 | 8 |
+| 1.10 | 100.0% | 93.8% | 96.3% | 0.00551 | 1.103 | 3 |
+| 1.25 | 100.0% | 93.8% | 97.5% | 0.00588 | 0.971 | 0 |
+
+该小样本只描述首步 logits，不代表长文本生成质量，也不足以单独确定生产 scale margin。
+
+#### INT4 MoE 与 MLA 诊断
+
+DeepSeek-V2-Lite、INT4 group64、TP=1 的微基准覆盖 1/4/16/64/128 行。fused segment 相对 expert loop 的 speedup 依次为 23.75× / 42.95× / 11.90× / 22.60× / 13.35×；这些是 CUDA-event kernel 局部结果。26 层 × 2 seeds × 5 row counts 共 260 个 case 中，split 和 fused 都对 loop bitwise 精确匹配 260/260。
+
+真实 prompt 在线筛查包含 36 个配对条件（16 请求、8/16 req/s、16/64/128 输出上限、100/150 ms TPOT、3 seeds、每条件 1 次）。fused 输出吞吐 median delta +0.91%，范围 -14.94%～+23.07%，20 胜 / 16 负；全请求输出完全一致的配对为 19/36。可计算的联合 SLO goodput 百分比变化 median 为 -5.46%。另对 8 req/s、16 请求、128 输出、100 ms TPOT 做 5 seeds × 5 repeats：fused 吞吐中位差 +0.51%（-12.87%～+16.46%；14 胜 / 11 负），bootstrap 均值 95% CI -0.35%～+5.11%；goodput 差值中位 +10.35 token/s，输出完全一致 14/25。重复条件的区间仍跨零，不能确认稳定收益，segment fusion 继续保持实验选项。
+
+在线诊断促成了 `MLAAttention._assemble` 的修正：`q_off` 是每行的 query 起始偏移，query 结束位置应为 `start + qlen`，不能把相邻 query 起点当累积边界；同时验证 start/length 数量与 row 数一致。修改后的 seed42、8 req/s、16 请求复现仍记录 1 个请求输出不一致（request 5，0-based output token 14；15/16 请求匹配），所以早先在线差异没有完全关闭。复现 artifact 为 `results/supplemental/moe_int4_mla_assemble_repro_seed42.json`；不得把这次代码修正写成已证明的端到端 parity 修复。
+
+#### 投机解码
+
+batch=8、γ=4 内容分层三 seed 的 n-gram 结果：
+
+| 类别 | α median | 吞吐 speedup median |
+|---|---:|---:|
+| 重复文本 | 0.997 | 4.584× |
+| JSON | 0.213 | 1.302× |
+| 结构化输出 | 0.142 | 1.302× |
+| ShareGPT | 0.154 | 1.513× |
+| 开放式问答 | 0.180 | 1.599× |
+
+free / repeat 的 batch 1/8/32、γ=2/4 扩展中，free 的 α / speedup median 为 0.602 / 1.215×，repeat 为 0.993 / 2.799×。51 条 n-gram 记录里，α 与输出 4-gram 重复率 Spearman ρ=0.929，与 distinct-4 为 -0.929；这是混合类别与 batch 的相关性，不是因果关系。未测自然停止、Medusa/EAGLE draft head（无对应训练权重），也不据此推断整体请求分布。
+
+汇总脚本为 [`benchmarks/supplemental_report.py`](benchmarks/supplemental_report.py)，配对表和结论见 [`benchmarks/_supplemental_report.md`](benchmarks/_supplemental_report.md)，配图在 [`benchmarks/_supplemental_figures/`](benchmarks/_supplemental_figures/)。原始 JSON/CSV 留在本地被 Git 忽略的 `results/supplemental/` 下。仍需明确的边界：held-out admission 只有 100 条 prompt 且使用不同到达率，产品拒绝率预算缺失；swap 测量是禁用重算成本比较后的路径诊断；MoE 5×5 重复只覆盖一个在线条件；投机解码只测了 n-gram。
+
 ### 10.4 Profiling
 
 **torch.profiler（CPU 侧；WSL 下 CUPTI 不可用，无 CUDA kernel 时间）**：

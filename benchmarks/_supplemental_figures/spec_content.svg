@@ -1,0 +1,88 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1220" height="610" viewBox="0 0 1220 610">
+<rect width="100%" height="100%" fill="#ffffff"/>
+<style>text{font-family:Arial,Helvetica,sans-serif;fill:#263238}</style>
+<text x="610" y="26" text-anchor="middle" font-size="17" font-weight="600">N-gram draft results by content class</text>
+<text x="312.5" y="67" text-anchor="middle" font-size="13" font-weight="600">Acceptance by content class</text>
+<line x1="94" y1="503.00" x2="579" y2="503.00" stroke="#d7dce1" stroke-width="1"/>
+<text x="86" y="507.00" text-anchor="end" font-size="10">-0.1</text>
+<line x1="94" y1="406.75" x2="579" y2="406.75" stroke="#d7dce1" stroke-width="1"/>
+<text x="86" y="410.75" text-anchor="end" font-size="10">0.2</text>
+<line x1="94" y1="310.50" x2="579" y2="310.50" stroke="#d7dce1" stroke-width="1"/>
+<text x="86" y="314.50" text-anchor="end" font-size="10">0.5</text>
+<line x1="94" y1="214.25" x2="579" y2="214.25" stroke="#d7dce1" stroke-width="1"/>
+<text x="86" y="218.25" text-anchor="end" font-size="10">0.8</text>
+<line x1="94" y1="118.00" x2="579" y2="118.00" stroke="#d7dce1" stroke-width="1"/>
+<text x="86" y="122.00" text-anchor="end" font-size="10">1.1</text>
+<line x1="142.50" y1="118" x2="142.50" y2="503" stroke="#edf0f2" stroke-width="1"/>
+<text x="142.50" y="521" text-anchor="end" font-size="9" transform="rotate(-38 142.50 521)">json</text>
+<line x1="239.50" y1="118" x2="239.50" y2="503" stroke="#edf0f2" stroke-width="1"/>
+<text x="239.50" y="521" text-anchor="end" font-size="9" transform="rotate(-38 239.50 521)">open_ended</text>
+<line x1="336.50" y1="118" x2="336.50" y2="503" stroke="#edf0f2" stroke-width="1"/>
+<text x="336.50" y="521" text-anchor="end" font-size="9" transform="rotate(-38 336.50 521)">repeat</text>
+<line x1="433.50" y1="118" x2="433.50" y2="503" stroke="#edf0f2" stroke-width="1"/>
+<text x="433.50" y="521" text-anchor="end" font-size="9" transform="rotate(-38 433.50 521)">sharegpt</text>
+<line x1="530.50" y1="118" x2="530.50" y2="503" stroke="#edf0f2" stroke-width="1"/>
+<text x="530.50" y="521" text-anchor="end" font-size="9" transform="rotate(-38 530.50 521)">structured</text>
+<line x1="94" y1="503" x2="579" y2="503" stroke="#64727a"/>
+<line x1="94" y1="118" x2="94" y2="503" stroke="#64727a"/>
+<text x="336.5" y="569" text-anchor="middle" font-size="11">Prompt / output class</text>
+<text x="36" y="310.5" text-anchor="middle" font-size="11" transform="rotate(-90 36 310.5)">Accepted / proposed draft tokens (α)</text>
+<circle cx="328.74" cy="150.08" r="3.5" fill="#2d708e"></circle>
+<circle cx="336.50" cy="151.14" r="3.5" fill="#2d708e"></circle>
+<circle cx="344.26" cy="161.95" r="3.5" fill="#2d708e"></circle>
+<circle cx="134.74" cy="395.41" r="3.5" fill="#2d708e"></circle>
+<circle cx="142.50" cy="402.71" r="3.5" fill="#2d708e"></circle>
+<circle cx="150.26" cy="407.51" r="3.5" fill="#2d708e"></circle>
+<circle cx="425.74" cy="421.41" r="3.5" fill="#2d708e"></circle>
+<circle cx="433.50" cy="428.94" r="3.5" fill="#2d708e"></circle>
+<circle cx="441.26" cy="417.50" r="3.5" fill="#2d708e"></circle>
+<circle cx="522.74" cy="425.40" r="3.5" fill="#2d708e"></circle>
+<circle cx="530.50" cy="414.76" r="3.5" fill="#2d708e"></circle>
+<circle cx="538.26" cy="435.58" r="3.5" fill="#2d708e"></circle>
+<circle cx="231.74" cy="425.62" r="3.5" fill="#2d708e"></circle>
+<circle cx="239.50" cy="389.57" r="3.5" fill="#2d708e"></circle>
+<circle cx="247.26" cy="413.11" r="3.5" fill="#2d708e"></circle>
+<text x="912.5" y="67" text-anchor="middle" font-size="13" font-weight="600">N-gram vs baseline</text>
+<line x1="694" y1="503.00" x2="1179" y2="503.00" stroke="#d7dce1" stroke-width="1"/>
+<text x="686" y="507.00" text-anchor="end" font-size="10">-0.52</text>
+<line x1="694" y1="406.75" x2="1179" y2="406.75" stroke="#d7dce1" stroke-width="1"/>
+<text x="686" y="410.75" text-anchor="end" font-size="10">1.04</text>
+<line x1="694" y1="310.50" x2="1179" y2="310.50" stroke="#d7dce1" stroke-width="1"/>
+<text x="686" y="314.50" text-anchor="end" font-size="10">2.61</text>
+<line x1="694" y1="214.25" x2="1179" y2="214.25" stroke="#d7dce1" stroke-width="1"/>
+<text x="686" y="218.25" text-anchor="end" font-size="10">4.17</text>
+<line x1="694" y1="118.00" x2="1179" y2="118.00" stroke="#d7dce1" stroke-width="1"/>
+<text x="686" y="122.00" text-anchor="end" font-size="10">5.73</text>
+<line x1="742.50" y1="118" x2="742.50" y2="503" stroke="#edf0f2" stroke-width="1"/>
+<text x="742.50" y="521" text-anchor="end" font-size="9" transform="rotate(-38 742.50 521)">json</text>
+<line x1="839.50" y1="118" x2="839.50" y2="503" stroke="#edf0f2" stroke-width="1"/>
+<text x="839.50" y="521" text-anchor="end" font-size="9" transform="rotate(-38 839.50 521)">open_ended</text>
+<line x1="936.50" y1="118" x2="936.50" y2="503" stroke="#edf0f2" stroke-width="1"/>
+<text x="936.50" y="521" text-anchor="end" font-size="9" transform="rotate(-38 936.50 521)">repeat</text>
+<line x1="1033.50" y1="118" x2="1033.50" y2="503" stroke="#edf0f2" stroke-width="1"/>
+<text x="1033.50" y="521" text-anchor="end" font-size="9" transform="rotate(-38 1033.50 521)">sharegpt</text>
+<line x1="1130.50" y1="118" x2="1130.50" y2="503" stroke="#edf0f2" stroke-width="1"/>
+<text x="1130.50" y="521" text-anchor="end" font-size="9" transform="rotate(-38 1130.50 521)">structured</text>
+<line x1="694" y1="503" x2="1179" y2="503" stroke="#64727a"/>
+<line x1="694" y1="118" x2="694" y2="503" stroke="#64727a"/>
+<text x="936.5" y="569" text-anchor="middle" font-size="11">Prompt / output class</text>
+<text x="636" y="310.5" text-anchor="middle" font-size="11" transform="rotate(-90 636 310.5)">Output throughput speedup (×)</text>
+<circle cx="928.74" cy="150.08" r="3.5" fill="#d17c2f"></circle>
+<circle cx="936.50" cy="249.78" r="3.5" fill="#d17c2f"></circle>
+<circle cx="944.26" cy="188.75" r="3.5" fill="#d17c2f"></circle>
+<circle cx="734.74" cy="383.82" r="3.5" fill="#d17c2f"></circle>
+<circle cx="742.50" cy="390.77" r="3.5" fill="#d17c2f"></circle>
+<circle cx="750.26" cy="392.37" r="3.5" fill="#d17c2f"></circle>
+<circle cx="1025.74" cy="377.78" r="3.5" fill="#d17c2f"></circle>
+<circle cx="1033.50" cy="381.41" r="3.5" fill="#d17c2f"></circle>
+<circle cx="1041.26" cy="356.40" r="3.5" fill="#d17c2f"></circle>
+<circle cx="1122.74" cy="390.75" r="3.5" fill="#d17c2f"></circle>
+<circle cx="1130.50" cy="391.78" r="3.5" fill="#d17c2f"></circle>
+<circle cx="1138.26" cy="377.13" r="3.5" fill="#d17c2f"></circle>
+<circle cx="831.74" cy="372.47" r="3.5" fill="#d17c2f"></circle>
+<circle cx="839.50" cy="358.17" r="3.5" fill="#d17c2f"></circle>
+<circle cx="847.26" cy="384.41" r="3.5" fill="#d17c2f"></circle>
+<line x1="694" y1="409.36" x2="1179" y2="409.36" stroke="#555555" stroke-width="1.2" stroke-dasharray="4 4"/>
+<line x1="694" y1="88" x2="708" y2="88" stroke="#555555" stroke-width="2" stroke-dasharray="4 3"/>
+<text x="707" y="91" font-size="9">baseline</text>
+</svg>

@@ -20,12 +20,18 @@ Run from the WSL conda env (see INTERVIEW.md §10):
 from __future__ import annotations
 
 import argparse
+import csv
+from dataclasses import dataclass
+import hashlib
 import json
+import math
 import os
 import random
 import statistics
+import subprocess
 import time
 from datetime import datetime, timezone
+from typing import Any
 
 import torch
 
@@ -37,7 +43,8 @@ from nanovllm import LLM, SamplingParams
 # ---------------------------------------------------------------------------
 
 def add_workload_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--num-seqs", type=int, default=256)
+    parser.add_argument("--num-seqs", type=int, default=256,
+                        help="request count; 0 consumes every row in --prompts-file")
     parser.add_argument("--min-input-len", type=int, default=128)
     parser.add_argument("--max-input-len", type=int, default=1024)
     parser.add_argument("--min-output-len", type=int, default=64)
@@ -45,31 +52,239 @@ def add_workload_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--shared-prefix-len", type=int, default=0,
                         help="common prefix shared by all prompts (prefix-cache workload)")
     parser.add_argument("--prompts-file", default=None,
-                        help="JSONL of {\"prompt\": ...} lines; overrides synthetic lengths")
+                        help="JSONL prompt/request trace; supports prompt, max_tokens, "
+                             "arrival_time_s, request_id, prefix_group, SLO targets, "
+                             "and prompt_token_hash. Legacy {\"prompt\": ...} is supported")
+
+
+@dataclass(slots=True)
+class WorkloadData:
+    prompts: list[list[int]]
+    sampling_params: list[SamplingParams]
+    requests: list[dict[str, Any]]
+    source: str
+    has_arrival_trace: bool
+
+
+def prompt_token_hash(token_ids: list[int]) -> str:
+    """Return a stable hash for one concrete tokenizer output."""
+    encoded = json.dumps(token_ids, separators=(",", ":"),
+                         ensure_ascii=True).encode("ascii")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def input_length_bucket(token_count: int) -> str:
+    if token_count <= 256:
+        return "1-256"
+    if token_count <= 512:
+        return "257-512"
+    if token_count <= 1024:
+        return "513-1024"
+    if token_count <= 2048:
+        return "1025-2048"
+    return ">2048"
+
+
+def _finite_positive(value: Any, field: str, *, allow_zero: bool = False) -> float:
+    try:
+        result = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{field} must be a finite number") from exc
+    if not math.isfinite(result) or result < 0 or (result == 0 and not allow_zero):
+        condition = "non-negative" if allow_zero else "positive"
+        raise ValueError(f"{field} must be finite and {condition}")
+    return result
+
+
+def _read_jsonl_prompts(path: str) -> list[dict[str, Any]]:
+    rows = []
+    with open(path, encoding="utf-8") as file:
+        for line_number, line in enumerate(file, 1):
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"invalid JSONL at {path}:{line_number}: {exc}") from exc
+            if not isinstance(row, dict):
+                raise ValueError(f"JSONL row {line_number} must be an object")
+            if "prompt" not in row or not isinstance(row["prompt"], str):
+                raise ValueError(f"JSONL row {line_number} needs a string prompt")
+            rows.append(row)
+    if not rows:
+        raise ValueError(f"prompt file is empty: {path}")
+    return rows
+
+
+def build_workload_data(args, tokenizer=None) -> WorkloadData:
+    """Build tokenized requests and retain optional trace metadata.
+
+    Request-trace files are consumed in order and must match ``--num-seqs``;
+    use zero to consume all rows. Legacy prompt-only files retain seeded
+    sampling and synthetic output-length behavior.
+    """
+    rng = random.Random(args.seed)
+    source = "synthetic"
+    requests: list[dict[str, Any]] = []
+    has_arrival_trace = False
+    if args.prompts_file:
+        if tokenizer is None:
+            raise ValueError("--prompts-file requires a tokenizer")
+        rows = _read_jsonl_prompts(args.prompts_file)
+        trace_fields = {
+            "request_id", "max_tokens", "arrival_time_s", "prefix_group",
+            "ttft_slo_ms", "tpot_slo_ms", "prompt_token_hash",
+            "prompt_prefix_token_ids", "content_class",
+        }
+        has_request_trace = any(any(field in row for field in trace_fields)
+                                for row in rows)
+        if has_request_trace:
+            if args.num_seqs < 0:
+                raise ValueError("--num-seqs must be non-negative")
+            if args.num_seqs not in (0, len(rows)):
+                raise ValueError(
+                    f"request trace has {len(rows)} rows but --num-seqs is "
+                    f"{args.num_seqs}; pass the exact count or 0 to use all rows")
+            source = "request_trace"
+        else:
+            if args.num_seqs < 0:
+                raise ValueError("--num-seqs must be non-negative")
+            if args.num_seqs and len(rows) > args.num_seqs:
+                rows = rng.sample(rows, args.num_seqs)
+            source = "prompt_jsonl"
+
+        arrival_presence = ["arrival_time_s" in row for row in rows]
+        if any(arrival_presence) and not all(arrival_presence):
+            raise ValueError("arrival_time_s must be present on every row or none")
+        has_arrival_trace = bool(rows) and all(arrival_presence)
+        if has_arrival_trace:
+            previous_arrival = -1.0
+            for index, row in enumerate(rows):
+                arrival = _finite_positive(row["arrival_time_s"],
+                                           f"row {index} arrival_time_s",
+                                           allow_zero=True)
+                if arrival < previous_arrival:
+                    raise ValueError("arrival_time_s values must be non-decreasing")
+                previous_arrival = arrival
+
+        prompts = []
+        sampling_params = []
+        seen_request_ids = set()
+        for index, row in enumerate(rows):
+            body_tokens = list(tokenizer.encode(row["prompt"]))
+            prefix_value = row.get("prompt_prefix_token_ids", [])
+            if not isinstance(prefix_value, list) or any(
+                    not isinstance(token_id, int) or token_id < 0
+                    for token_id in prefix_value):
+                raise ValueError(
+                    f"row {index} prompt_prefix_token_ids must be non-negative integers")
+            if prefix_value and args.shared_prefix_len:
+                raise ValueError(
+                    "do not combine prompt_prefix_token_ids with --shared-prefix-len")
+            prefix_tokens = list(prefix_value)
+            prompt_tokens = prefix_tokens + body_tokens
+            expected_hash = row.get("prompt_token_hash")
+            actual_hash = prompt_token_hash(prompt_tokens)
+            if expected_hash is not None and expected_hash != actual_hash:
+                raise ValueError(
+                    f"row {index} prompt_token_hash mismatch; check tokenizer/model version")
+            if not prompt_tokens:
+                raise ValueError(f"row {index} tokenizes to an empty prompt")
+            max_tokens_value = row.get("max_tokens")
+            if max_tokens_value is None:
+                max_tokens_value = rng.randint(args.min_output_len,
+                                               args.max_output_len)
+            if (not isinstance(max_tokens_value, int)
+                    or isinstance(max_tokens_value, bool) or max_tokens_value < 1):
+                raise ValueError(f"row {index} max_tokens must be a positive integer")
+            request_id = str(row.get("request_id", f"request-{index:06d}"))
+            if not request_id or request_id in seen_request_ids:
+                raise ValueError(f"request_id is empty or duplicated: {request_id!r}")
+            seen_request_ids.add(request_id)
+            ttft_target = row.get("ttft_slo_ms")
+            tpot_target = row.get("tpot_slo_ms")
+            if ttft_target is not None:
+                ttft_target = _finite_positive(
+                    ttft_target, f"row {index} ttft_slo_ms")
+            if tpot_target is not None:
+                tpot_target = _finite_positive(
+                    tpot_target, f"row {index} tpot_slo_ms")
+            if ttft_target is not None:
+                ttft_presence = row.get("ttft_slo_ms") is not None
+            prompts.append(prompt_tokens)
+            sampling_params.append(SamplingParams(
+                temperature=float(row.get("temperature", 0.6)),
+                ignore_eos=bool(row.get("ignore_eos", True)),
+                max_tokens=max_tokens_value,
+            ))
+            requests.append({
+                "request_id": request_id,
+                "prompt_token_hash": actual_hash,
+                "prompt_tokens": len(prompt_tokens),
+                "user_prompt_tokens": len(body_tokens),
+                "prefix_tokens": len(prefix_tokens),
+                "input_length_bucket": input_length_bucket(len(prompt_tokens)),
+                "prefix_group": row.get("prefix_group"),
+                "prefix_kind": row.get("prefix_kind"),
+                "content_class": row.get("content_class"),
+                "arrival_time_s": (float(row["arrival_time_s"])
+                                   if has_arrival_trace else None),
+                "arrival_mode": row.get("arrival_mode"),
+                "arrival_rate_requests_per_second": row.get(
+                    "arrival_rate_requests_per_second"),
+                "max_tokens": max_tokens_value,
+                "ttft_slo_ms": ttft_target,
+                "tpot_slo_ms": tpot_target,
+            })
+    else:
+        if args.num_seqs < 1:
+            raise ValueError("--num-seqs must be positive for a synthetic workload")
+        prompts = [rng.sample(range(0, 10000), rng.randint(args.min_input_len, args.max_input_len))
+                   for _ in range(args.num_seqs)]
+        sampling_params = [SamplingParams(
+            temperature=0.6, ignore_eos=True,
+            max_tokens=rng.randint(args.min_output_len, args.max_output_len))
+            for _ in prompts]
+        requests = [{
+            "request_id": f"request-{index:06d}",
+            "prompt_token_hash": prompt_token_hash(prompt),
+            "prompt_tokens": len(prompt),
+            "user_prompt_tokens": len(prompt),
+            "prefix_tokens": 0,
+            "input_length_bucket": input_length_bucket(len(prompt)),
+            "prefix_group": None,
+            "prefix_kind": None,
+            "content_class": None,
+            "arrival_time_s": None,
+            "arrival_mode": None,
+            "arrival_rate_requests_per_second": None,
+            "max_tokens": params.max_tokens,
+            "ttft_slo_ms": None,
+            "tpot_slo_ms": None,
+        } for index, (prompt, params) in enumerate(zip(prompts, sampling_params))]
+
+    if args.shared_prefix_len > 0:
+        if args.prompts_file and any(row["prefix_tokens"] for row in requests):
+            raise ValueError(
+                "do not combine trace prefixes with --shared-prefix-len")
+        prefix = rng.sample(range(0, 10000), args.shared_prefix_len)
+        prompts = [prefix + prompt for prompt in prompts]
+        for index, (prompt, request) in enumerate(zip(prompts, requests)):
+            request["prefix_tokens"] = len(prefix)
+            request["prompt_tokens"] = len(prompt)
+            request["prompt_token_hash"] = prompt_token_hash(prompt)
+            request["input_length_bucket"] = input_length_bucket(len(prompt))
+            request["prefix_group"] = "synthetic_shared_prefix"
+            request["prefix_kind"] = "synthetic_token_ids"
+
+    return WorkloadData(prompts, sampling_params, requests, source,
+                        has_arrival_trace)
 
 
 def build_workload(args, tokenizer=None):
-    """Return (prompts, sampling_params): token-id lists + per-seq params.
-
-    prompt长度不超过max_model_len即可（默认范围在4096以内）。"""
-    rng = random.Random(args.seed)
-    if args.prompts_file:
-        assert tokenizer is not None, "--prompts-file requires a tokenizer"
-        with open(args.prompts_file, encoding="utf-8") as f:
-            texts = [json.loads(line)["prompt"] for line in f if line.strip()]
-        if len(texts) > args.num_seqs:
-            texts = rng.sample(texts, args.num_seqs)
-        prompts = [tokenizer.encode(t) for t in texts]
-    else:
-        prompts = [rng.sample(range(0, 10000), rng.randint(args.min_input_len, args.max_input_len))
-                   for _ in range(args.num_seqs)]
-    if args.shared_prefix_len > 0:
-        prefix = rng.sample(range(0, 10000), args.shared_prefix_len)
-        prompts = [prefix + p for p in prompts]
-    sampling_params = [SamplingParams(temperature=0.6, ignore_eos=True,
-                                      max_tokens=rng.randint(args.min_output_len, args.max_output_len))
-                       for _ in prompts]
-    return prompts, sampling_params
+    """Backward-compatible (prompts, sampling_params) workload helper."""
+    workload = build_workload_data(args, tokenizer)
+    return workload.prompts, workload.sampling_params
 
 
 def scheduler_options(args, overrides=None):
@@ -129,6 +344,7 @@ def summarize(values):
     return {
         "avg": statistics.fmean(vals),
         "p50": percentile(vals, 0.50),
+        "p95": percentile(vals, 0.95),
         "p99": percentile(vals, 0.99),
         "min": vals[0],
         "max": vals[-1],
@@ -429,11 +645,57 @@ def env_info():
         "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
         "gpu_mem_gb": round(torch.cuda.get_device_properties(0).total_memory / 2**30, 1) if torch.cuda.is_available() else None,
     }
+    for module_name, key in (("triton", "triton"),
+                             ("transformers", "transformers")):
+        try:
+            module = __import__(module_name)
+            info[key] = getattr(module, "__version__", None)
+        except ImportError:
+            info[key] = None
     try:
         import flash_attn
         info["flash_attn"] = flash_attn.__version__
     except ImportError:
         info["flash_attn"] = None
+    try:
+        revision = subprocess.run(
+            ["git", "rev-parse", "HEAD"], check=True, capture_output=True,
+            text=True, cwd=os.path.dirname(os.path.dirname(__file__)),
+        ).stdout.strip()
+        status = subprocess.run(
+            ["git", "status", "--porcelain"], check=True, capture_output=True,
+            text=True, cwd=os.path.dirname(os.path.dirname(__file__)),
+        ).stdout
+        info["git_revision"] = revision
+        info["git_worktree_dirty"] = bool(status.strip())
+    except (OSError, subprocess.CalledProcessError):
+        info["git_revision"] = None
+        info["git_worktree_dirty"] = None
+    try:
+        query = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name,temperature.gpu,clocks.current.sm,"
+             "clocks.current.graphics,clocks.current.memory,power.draw,memory.used,"
+             "memory.total,utilization.gpu", "--format=csv,noheader,nounits"],
+            check=True, capture_output=True, text=True, timeout=5,
+        ).stdout.splitlines()
+        if query:
+            values = next(csv.reader([query[0]]))
+            keys = ("name", "temperature_c", "sm_clock_mhz", "graphics_clock_mhz",
+                    "memory_clock_mhz", "power_w", "memory_used_mib",
+                    "memory_total_mib", "utilization_percent")
+            snapshot = {}
+            for key, value in zip(keys, values):
+                value = value.strip()
+                try:
+                    snapshot[key] = float(value)
+                    if snapshot[key].is_integer():
+                        snapshot[key] = int(snapshot[key])
+                except ValueError:
+                    snapshot[key] = value or None
+            info["gpu_snapshot_at_report"] = snapshot
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired,
+            StopIteration, csv.Error):
+        info["gpu_snapshot_at_report"] = None
     return info
 
 
@@ -549,9 +811,10 @@ def main():
     args.model = os.path.expanduser(args.model)  # bash argv 不展开 ~ → 手动展开
     from transformers import AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=True) if args.prompts_file else None
-    prompts, sampling_params = build_workload(args, tokenizer)
+    workload_data = build_workload_data(args, tokenizer)
+    prompts, sampling_params = workload_data.prompts, workload_data.sampling_params
 
-    print(f"running nano-vllm ({args.num_seqs} seqs, input {args.min_input_len}-{args.max_input_len}, "
+    print(f"running nano-vllm ({len(prompts)} seqs, input {args.min_input_len}-{args.max_input_len}, "
           f"output {args.min_output_len}-{args.max_output_len}, shared-prefix {args.shared_prefix_len}, "
           f"eager={args.enforce_eager}) ...")
     batches, kv_info = run_nanovllm(args, prompts, sampling_params)
@@ -568,13 +831,45 @@ def main():
     out_path = args.output or os.path.join("results", f"bench_{tag}_{ts}.json")
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
 
+    request_fingerprint_input = [{
+        "request_id": request["request_id"],
+        "prompt_token_hash": request["prompt_token_hash"],
+        "max_tokens": params.max_tokens,
+        "arrival_time_s": request["arrival_time_s"],
+        "ttft_slo_ms": request["ttft_slo_ms"],
+        "tpot_slo_ms": request["tpot_slo_ms"],
+    } for request, params in zip(workload_data.requests, sampling_params)]
+    workload_fingerprint = hashlib.sha256(json.dumps(
+        {"seed": args.seed, "requests": request_fingerprint_input},
+        sort_keys=True, separators=(",", ":"), allow_nan=False,
+    ).encode("utf-8")).hexdigest()
+
     payload = {
         "meta": {"model": args.model, **env_info(), "date": ts, "kv_cache": kv_info},
-        "workload": {"num_seqs": args.num_seqs, "min_input_len": args.min_input_len,
+        "workload": {"num_seqs": len(prompts), "min_input_len": args.min_input_len,
                      "max_input_len": args.max_input_len, "min_output_len": args.min_output_len,
                      "max_output_len": args.max_output_len, "shared_prefix_len": args.shared_prefix_len,
                      "prompts_file": args.prompts_file, "enforce_eager": args.enforce_eager, "tp": args.tp,
-                     "repeat_batches": args.repeat_batches},
+                     "repeat_batches": args.repeat_batches,
+                     "source": workload_data.source,
+                     "arrival_trace_used": workload_data.has_arrival_trace,
+                     "fingerprint": workload_fingerprint,
+                     "request_ids": [row["request_id"] for row in workload_data.requests],
+                     "prompt_tokens": [row["prompt_tokens"] for row in workload_data.requests],
+                     "user_prompt_tokens": [row["user_prompt_tokens"] for row in workload_data.requests],
+                     "max_output_tokens": [params.max_tokens for params in sampling_params],
+                     "arrival_times_seconds": [row["arrival_time_s"]
+                                                for row in workload_data.requests],
+                     "ttft_slo_targets_ms": [row["ttft_slo_ms"]
+                                              for row in workload_data.requests],
+                     "tpot_slo_targets_ms": [row["tpot_slo_ms"]
+                                              for row in workload_data.requests],
+                     "prefix_groups": [row["prefix_group"]
+                                       for row in workload_data.requests],
+                     "content_classes": [row["content_class"]
+                                         for row in workload_data.requests],
+                     "prompt_token_hashes": [row["prompt_token_hash"]
+                                              for row in workload_data.requests]},
         "scheduler": scheduler_options(args),
         "benchmark_config": {
             "quantization": args.quantization,

@@ -1,0 +1,169 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1500" height="950" viewBox="0 0 1500 950">
+<rect width="100%" height="100%" fill="#ffffff"/>
+<style>text{font-family:Arial,Helvetica,sans-serif;fill:#263238}</style>
+<text x="750" y="26" text-anchor="middle" font-size="17" font-weight="600">INT4 MoE fused/split · paired real-prompt traces</text>
+<text x="748" y="64" text-anchor="middle" font-size="13" font-weight="600">Fused throughput delta (%)</text>
+<line x1="102" y1="380.00" x2="1442" y2="380.00" stroke="#d7dce1" stroke-width="1"/>
+<text x="94" y="384.00" text-anchor="end" font-size="10">-18.7</text>
+<line x1="102" y1="313.75" x2="1442" y2="313.75" stroke="#d7dce1" stroke-width="1"/>
+<text x="94" y="317.75" text-anchor="end" font-size="10">-7.33</text>
+<line x1="102" y1="247.50" x2="1442" y2="247.50" stroke="#d7dce1" stroke-width="1"/>
+<text x="94" y="251.50" text-anchor="end" font-size="10">4.07</text>
+<line x1="102" y1="181.25" x2="1442" y2="181.25" stroke="#d7dce1" stroke-width="1"/>
+<text x="94" y="185.25" text-anchor="end" font-size="10">15.5</text>
+<line x1="102" y1="115.00" x2="1442" y2="115.00" stroke="#d7dce1" stroke-width="1"/>
+<text x="94" y="119.00" text-anchor="end" font-size="10">26.9</text>
+<line x1="157.83" y1="115" x2="157.83" y2="380" stroke="#edf0f2" stroke-width="1"/>
+<text x="157.83" y="398" text-anchor="end" font-size="9" transform="rotate(-38 157.83 398)">100/8/16</text>
+<line x1="269.50" y1="115" x2="269.50" y2="380" stroke="#edf0f2" stroke-width="1"/>
+<text x="269.50" y="398" text-anchor="end" font-size="9" transform="rotate(-38 269.50 398)">100/8/64</text>
+<line x1="381.17" y1="115" x2="381.17" y2="380" stroke="#edf0f2" stroke-width="1"/>
+<text x="381.17" y="398" text-anchor="end" font-size="9" transform="rotate(-38 381.17 398)">100/8/128</text>
+<line x1="492.83" y1="115" x2="492.83" y2="380" stroke="#edf0f2" stroke-width="1"/>
+<text x="492.83" y="398" text-anchor="end" font-size="9" transform="rotate(-38 492.83 398)">100/16/16</text>
+<line x1="604.50" y1="115" x2="604.50" y2="380" stroke="#edf0f2" stroke-width="1"/>
+<text x="604.50" y="398" text-anchor="end" font-size="9" transform="rotate(-38 604.50 398)">100/16/64</text>
+<line x1="716.17" y1="115" x2="716.17" y2="380" stroke="#edf0f2" stroke-width="1"/>
+<text x="716.17" y="398" text-anchor="end" font-size="9" transform="rotate(-38 716.17 398)">100/16/128</text>
+<line x1="827.83" y1="115" x2="827.83" y2="380" stroke="#edf0f2" stroke-width="1"/>
+<text x="827.83" y="398" text-anchor="end" font-size="9" transform="rotate(-38 827.83 398)">150/8/16</text>
+<line x1="939.50" y1="115" x2="939.50" y2="380" stroke="#edf0f2" stroke-width="1"/>
+<text x="939.50" y="398" text-anchor="end" font-size="9" transform="rotate(-38 939.50 398)">150/8/64</text>
+<line x1="1051.17" y1="115" x2="1051.17" y2="380" stroke="#edf0f2" stroke-width="1"/>
+<text x="1051.17" y="398" text-anchor="end" font-size="9" transform="rotate(-38 1051.17 398)">150/8/128</text>
+<line x1="1162.83" y1="115" x2="1162.83" y2="380" stroke="#edf0f2" stroke-width="1"/>
+<text x="1162.83" y="398" text-anchor="end" font-size="9" transform="rotate(-38 1162.83 398)">150/16/16</text>
+<line x1="1274.50" y1="115" x2="1274.50" y2="380" stroke="#edf0f2" stroke-width="1"/>
+<text x="1274.50" y="398" text-anchor="end" font-size="9" transform="rotate(-38 1274.50 398)">150/16/64</text>
+<line x1="1386.17" y1="115" x2="1386.17" y2="380" stroke="#edf0f2" stroke-width="1"/>
+<text x="1386.17" y="398" text-anchor="end" font-size="9" transform="rotate(-38 1386.17 398)">150/16/128</text>
+<line x1="102" y1="380" x2="1442" y2="380" stroke="#64727a"/>
+<line x1="102" y1="115" x2="102" y2="380" stroke="#64727a"/>
+<text x="772" y="446" text-anchor="middle" font-size="11">TPOT target / arrival rate / output cap</text>
+<text x="44" y="247.5" text-anchor="middle" font-size="11" transform="rotate(-90 44 247.5)">Fused throughput delta (%)</text>
+<circle cx="157.83" cy="183.34" r="3.5" fill="#2d708e"><title>TPOT 100 ms, rate 8 req/s, output cap 16, seed 7: 15.110</title></circle>
+<circle cx="269.50" cy="357.92" r="3.5" fill="#2d708e"><title>TPOT 100 ms, rate 8 req/s, output cap 64, seed 7: -14.936</title></circle>
+<circle cx="381.17" cy="171.98" r="3.5" fill="#2d708e"><title>TPOT 100 ms, rate 8 req/s, output cap 128, seed 7: 17.065</title></circle>
+<circle cx="492.83" cy="236.77" r="3.5" fill="#2d708e"><title>TPOT 100 ms, rate 16 req/s, output cap 16, seed 7: 5.914</title></circle>
+<circle cx="604.50" cy="296.57" r="3.5" fill="#2d708e"><title>TPOT 100 ms, rate 16 req/s, output cap 64, seed 7: -4.378</title></circle>
+<circle cx="716.17" cy="287.63" r="3.5" fill="#2d708e"><title>TPOT 100 ms, rate 16 req/s, output cap 128, seed 7: -2.839</title></circle>
+<circle cx="166.77" cy="342.42" r="3.5" fill="#2d708e"><title>TPOT 100 ms, rate 8 req/s, output cap 16, seed 17: -12.269</title></circle>
+<circle cx="278.43" cy="319.80" r="3.5" fill="#2d708e"><title>TPOT 100 ms, rate 8 req/s, output cap 64, seed 17: -8.376</title></circle>
+<circle cx="390.10" cy="267.45" r="3.5" fill="#2d708e"><title>TPOT 100 ms, rate 8 req/s, output cap 128, seed 17: 0.634</title></circle>
+<circle cx="501.77" cy="266.89" r="3.5" fill="#2d708e"><title>TPOT 100 ms, rate 16 req/s, output cap 16, seed 17: 0.730</title></circle>
+<circle cx="613.43" cy="227.63" r="3.5" fill="#2d708e"><title>TPOT 100 ms, rate 16 req/s, output cap 64, seed 17: 7.487</title></circle>
+<circle cx="725.10" cy="276.09" r="3.5" fill="#2d708e"><title>TPOT 100 ms, rate 16 req/s, output cap 128, seed 17: -0.854</title></circle>
+<circle cx="148.90" cy="145.46" r="3.5" fill="#2d708e"><title>TPOT 100 ms, rate 8 req/s, output cap 16, seed 42: 21.629</title></circle>
+<circle cx="260.57" cy="211.42" r="3.5" fill="#2d708e"><title>TPOT 100 ms, rate 8 req/s, output cap 64, seed 42: 10.278</title></circle>
+<circle cx="372.23" cy="202.82" r="3.5" fill="#2d708e"><title>TPOT 100 ms, rate 8 req/s, output cap 128, seed 42: 11.758</title></circle>
+<circle cx="483.90" cy="291.98" r="3.5" fill="#2d708e"><title>TPOT 100 ms, rate 16 req/s, output cap 16, seed 42: -3.589</title></circle>
+<circle cx="595.57" cy="175.42" r="3.5" fill="#2d708e"><title>TPOT 100 ms, rate 16 req/s, output cap 64, seed 42: 16.473</title></circle>
+<circle cx="707.23" cy="292.71" r="3.5" fill="#2d708e"><title>TPOT 100 ms, rate 16 req/s, output cap 128, seed 42: -3.714</title></circle>
+<circle cx="827.83" cy="239.87" r="3.5" fill="#d17c2f"><title>TPOT 150 ms, rate 8 req/s, output cap 16, seed 7: 5.380</title></circle>
+<circle cx="939.50" cy="219.53" r="3.5" fill="#d17c2f"><title>TPOT 150 ms, rate 8 req/s, output cap 64, seed 7: 8.881</title></circle>
+<circle cx="1051.17" cy="239.46" r="3.5" fill="#d17c2f"><title>TPOT 150 ms, rate 8 req/s, output cap 128, seed 7: 5.451</title></circle>
+<circle cx="1162.83" cy="307.94" r="3.5" fill="#d17c2f"><title>TPOT 150 ms, rate 16 req/s, output cap 16, seed 7: -6.334</title></circle>
+<circle cx="1274.50" cy="332.84" r="3.5" fill="#d17c2f"><title>TPOT 150 ms, rate 16 req/s, output cap 64, seed 7: -10.621</title></circle>
+<circle cx="1386.17" cy="303.61" r="3.5" fill="#d17c2f"><title>TPOT 150 ms, rate 16 req/s, output cap 128, seed 7: -5.589</title></circle>
+<circle cx="836.77" cy="302.83" r="3.5" fill="#d17c2f"><title>TPOT 150 ms, rate 8 req/s, output cap 16, seed 17: -5.455</title></circle>
+<circle cx="948.43" cy="307.08" r="3.5" fill="#d17c2f"><title>TPOT 150 ms, rate 8 req/s, output cap 64, seed 17: -6.186</title></circle>
+<circle cx="1060.10" cy="212.47" r="3.5" fill="#d17c2f"><title>TPOT 150 ms, rate 8 req/s, output cap 128, seed 17: 10.097</title></circle>
+<circle cx="1171.77" cy="251.14" r="3.5" fill="#d17c2f"><title>TPOT 150 ms, rate 16 req/s, output cap 16, seed 17: 3.441</title></circle>
+<circle cx="1283.43" cy="201.46" r="3.5" fill="#d17c2f"><title>TPOT 150 ms, rate 16 req/s, output cap 64, seed 17: 11.991</title></circle>
+<circle cx="1395.10" cy="324.24" r="3.5" fill="#d17c2f"><title>TPOT 150 ms, rate 16 req/s, output cap 128, seed 17: -9.141</title></circle>
+<circle cx="818.90" cy="264.80" r="3.5" fill="#d17c2f"><title>TPOT 150 ms, rate 8 req/s, output cap 16, seed 42: 1.091</title></circle>
+<circle cx="930.57" cy="137.08" r="3.5" fill="#d17c2f"><title>TPOT 150 ms, rate 8 req/s, output cap 64, seed 42: 23.071</title></circle>
+<circle cx="1042.23" cy="243.26" r="3.5" fill="#d17c2f"><title>TPOT 150 ms, rate 8 req/s, output cap 128, seed 42: 4.798</title></circle>
+<circle cx="1153.90" cy="283.20" r="3.5" fill="#d17c2f"><title>TPOT 150 ms, rate 16 req/s, output cap 16, seed 42: -2.077</title></circle>
+<circle cx="1265.57" cy="180.36" r="3.5" fill="#d17c2f"><title>TPOT 150 ms, rate 16 req/s, output cap 64, seed 42: 15.623</title></circle>
+<circle cx="1377.23" cy="324.28" r="3.5" fill="#d17c2f"><title>TPOT 150 ms, rate 16 req/s, output cap 128, seed 42: -9.147</title></circle>
+<line x1="102" y1="271.13" x2="1442" y2="271.13" stroke="#555555" stroke-width="1.2" stroke-dasharray="4 4"/>
+<text x="748" y="489" text-anchor="middle" font-size="13" font-weight="600">Goodput depends on the SLO threshold</text>
+<line x1="102" y1="805.00" x2="1442" y2="805.00" stroke="#d7dce1" stroke-width="1"/>
+<text x="94" y="809.00" text-anchor="end" font-size="10">-93.9</text>
+<line x1="102" y1="738.75" x2="1442" y2="738.75" stroke="#d7dce1" stroke-width="1"/>
+<text x="94" y="742.75" text-anchor="end" font-size="10">-29</text>
+<line x1="102" y1="672.50" x2="1442" y2="672.50" stroke="#d7dce1" stroke-width="1"/>
+<text x="94" y="676.50" text-anchor="end" font-size="10">35.9</text>
+<line x1="102" y1="606.25" x2="1442" y2="606.25" stroke="#d7dce1" stroke-width="1"/>
+<text x="94" y="610.25" text-anchor="end" font-size="10">101</text>
+<line x1="102" y1="540.00" x2="1442" y2="540.00" stroke="#d7dce1" stroke-width="1"/>
+<text x="94" y="544.00" text-anchor="end" font-size="10">166</text>
+<line x1="157.83" y1="540" x2="157.83" y2="805" stroke="#edf0f2" stroke-width="1"/>
+<text x="157.83" y="823" text-anchor="end" font-size="9" transform="rotate(-38 157.83 823)">100/8/16</text>
+<line x1="269.50" y1="540" x2="269.50" y2="805" stroke="#edf0f2" stroke-width="1"/>
+<text x="269.50" y="823" text-anchor="end" font-size="9" transform="rotate(-38 269.50 823)">100/8/64</text>
+<line x1="381.17" y1="540" x2="381.17" y2="805" stroke="#edf0f2" stroke-width="1"/>
+<text x="381.17" y="823" text-anchor="end" font-size="9" transform="rotate(-38 381.17 823)">100/8/128</text>
+<line x1="492.83" y1="540" x2="492.83" y2="805" stroke="#edf0f2" stroke-width="1"/>
+<text x="492.83" y="823" text-anchor="end" font-size="9" transform="rotate(-38 492.83 823)">100/16/16</text>
+<line x1="604.50" y1="540" x2="604.50" y2="805" stroke="#edf0f2" stroke-width="1"/>
+<text x="604.50" y="823" text-anchor="end" font-size="9" transform="rotate(-38 604.50 823)">100/16/64</text>
+<line x1="716.17" y1="540" x2="716.17" y2="805" stroke="#edf0f2" stroke-width="1"/>
+<text x="716.17" y="823" text-anchor="end" font-size="9" transform="rotate(-38 716.17 823)">100/16/128</text>
+<line x1="827.83" y1="540" x2="827.83" y2="805" stroke="#edf0f2" stroke-width="1"/>
+<text x="827.83" y="823" text-anchor="end" font-size="9" transform="rotate(-38 827.83 823)">150/8/16</text>
+<line x1="939.50" y1="540" x2="939.50" y2="805" stroke="#edf0f2" stroke-width="1"/>
+<text x="939.50" y="823" text-anchor="end" font-size="9" transform="rotate(-38 939.50 823)">150/8/64</text>
+<line x1="1051.17" y1="540" x2="1051.17" y2="805" stroke="#edf0f2" stroke-width="1"/>
+<text x="1051.17" y="823" text-anchor="end" font-size="9" transform="rotate(-38 1051.17 823)">150/8/128</text>
+<line x1="1162.83" y1="540" x2="1162.83" y2="805" stroke="#edf0f2" stroke-width="1"/>
+<text x="1162.83" y="823" text-anchor="end" font-size="9" transform="rotate(-38 1162.83 823)">150/16/16</text>
+<line x1="1274.50" y1="540" x2="1274.50" y2="805" stroke="#edf0f2" stroke-width="1"/>
+<text x="1274.50" y="823" text-anchor="end" font-size="9" transform="rotate(-38 1274.50 823)">150/16/64</text>
+<line x1="1386.17" y1="540" x2="1386.17" y2="805" stroke="#edf0f2" stroke-width="1"/>
+<text x="1386.17" y="823" text-anchor="end" font-size="9" transform="rotate(-38 1386.17 823)">150/16/128</text>
+<line x1="102" y1="805" x2="1442" y2="805" stroke="#64727a"/>
+<line x1="102" y1="540" x2="102" y2="805" stroke="#64727a"/>
+<text x="772" y="871" text-anchor="middle" font-size="11">TPOT target / arrival rate / output cap</text>
+<text x="44" y="672.5" text-anchor="middle" font-size="11" transform="rotate(-90 44 672.5)">Joint-SLO output goodput delta (tokens/s)</text>
+<circle cx="157.83" cy="669.04" r="3.5" fill="#2d708e"><title>TPOT 100 ms, rate 8 req/s, output cap 16, seed 7: 39.338</title></circle>
+<circle cx="269.50" cy="782.92" r="3.5" fill="#2d708e"><title>TPOT 100 ms, rate 8 req/s, output cap 64, seed 7: -72.296</title></circle>
+<circle cx="381.17" cy="562.08" r="3.5" fill="#2d708e"><title>TPOT 100 ms, rate 8 req/s, output cap 128, seed 7: 144.190</title></circle>
+<circle cx="492.83" cy="709.17" r="3.5" fill="#2d708e"><title>TPOT 100 ms, rate 16 req/s, output cap 16, seed 7: 0.000</title></circle>
+<circle cx="604.50" cy="774.53" r="3.5" fill="#2d708e"><title>TPOT 100 ms, rate 16 req/s, output cap 64, seed 7: -64.072</title></circle>
+<circle cx="716.17" cy="782.30" r="3.5" fill="#2d708e"><title>TPOT 100 ms, rate 16 req/s, output cap 128, seed 7: -71.687</title></circle>
+<circle cx="166.77" cy="715.34" r="3.5" fill="#2d708e"><title>TPOT 100 ms, rate 8 req/s, output cap 16, seed 17: -6.050</title></circle>
+<circle cx="278.43" cy="721.97" r="3.5" fill="#2d708e"><title>TPOT 100 ms, rate 8 req/s, output cap 64, seed 17: -12.546</title></circle>
+<circle cx="390.10" cy="718.21" r="3.5" fill="#2d708e"><title>TPOT 100 ms, rate 8 req/s, output cap 128, seed 17: -8.867</title></circle>
+<circle cx="501.77" cy="708.28" r="3.5" fill="#2d708e"><title>TPOT 100 ms, rate 16 req/s, output cap 16, seed 17: 0.869</title></circle>
+<circle cx="613.43" cy="700.04" r="3.5" fill="#2d708e"><title>TPOT 100 ms, rate 16 req/s, output cap 64, seed 17: 8.950</title></circle>
+<circle cx="725.10" cy="710.60" r="3.5" fill="#2d708e"><title>TPOT 100 ms, rate 16 req/s, output cap 128, seed 17: -1.406</title></circle>
+<circle cx="148.90" cy="651.62" r="3.5" fill="#2d708e"><title>TPOT 100 ms, rate 8 req/s, output cap 16, seed 42: 56.420</title></circle>
+<circle cx="260.57" cy="614.44" r="3.5" fill="#2d708e"><title>TPOT 100 ms, rate 8 req/s, output cap 64, seed 42: 92.868</title></circle>
+<circle cx="372.23" cy="588.74" r="3.5" fill="#2d708e"><title>TPOT 100 ms, rate 8 req/s, output cap 128, seed 42: 118.061</title></circle>
+<circle cx="483.90" cy="713.70" r="3.5" fill="#2d708e"><title>TPOT 100 ms, rate 16 req/s, output cap 16, seed 42: -4.441</title></circle>
+<circle cx="595.57" cy="652.57" r="3.5" fill="#2d708e"><title>TPOT 100 ms, rate 16 req/s, output cap 64, seed 42: 55.487</title></circle>
+<circle cx="707.23" cy="709.17" r="3.5" fill="#2d708e"><title>TPOT 100 ms, rate 16 req/s, output cap 128, seed 42: 0.000</title></circle>
+<circle cx="827.83" cy="677.11" r="3.5" fill="#d17c2f"><title>TPOT 150 ms, rate 8 req/s, output cap 16, seed 7: 31.430</title></circle>
+<circle cx="939.50" cy="698.62" r="3.5" fill="#d17c2f"><title>TPOT 150 ms, rate 8 req/s, output cap 64, seed 7: 10.344</title></circle>
+<circle cx="1051.17" cy="701.88" r="3.5" fill="#d17c2f"><title>TPOT 150 ms, rate 8 req/s, output cap 128, seed 7: 7.149</title></circle>
+<circle cx="1162.83" cy="745.80" r="3.5" fill="#d17c2f"><title>TPOT 150 ms, rate 16 req/s, output cap 16, seed 7: -35.915</title></circle>
+<circle cx="1274.50" cy="723.87" r="3.5" fill="#d17c2f"><title>TPOT 150 ms, rate 16 req/s, output cap 64, seed 7: -14.410</title></circle>
+<circle cx="1386.17" cy="717.77" r="3.5" fill="#d17c2f"><title>TPOT 150 ms, rate 16 req/s, output cap 128, seed 7: -8.429</title></circle>
+<circle cx="836.77" cy="714.19" r="3.5" fill="#d17c2f"><title>TPOT 150 ms, rate 8 req/s, output cap 16, seed 17: -4.922</title></circle>
+<circle cx="948.43" cy="718.35" r="3.5" fill="#d17c2f"><title>TPOT 150 ms, rate 8 req/s, output cap 64, seed 17: -8.999</title></circle>
+<circle cx="1060.10" cy="694.81" r="3.5" fill="#d17c2f"><title>TPOT 150 ms, rate 8 req/s, output cap 128, seed 17: 14.076</title></circle>
+<circle cx="1171.77" cy="705.11" r="3.5" fill="#d17c2f"><title>TPOT 150 ms, rate 16 req/s, output cap 16, seed 17: 3.974</title></circle>
+<circle cx="1283.43" cy="693.12" r="3.5" fill="#d17c2f"><title>TPOT 150 ms, rate 16 req/s, output cap 64, seed 17: 15.729</title></circle>
+<circle cx="1395.10" cy="723.93" r="3.5" fill="#d17c2f"><title>TPOT 150 ms, rate 16 req/s, output cap 128, seed 17: -14.474</title></circle>
+<circle cx="818.90" cy="708.50" r="3.5" fill="#d17c2f"><title>TPOT 150 ms, rate 8 req/s, output cap 16, seed 42: 0.655</title></circle>
+<circle cx="930.57" cy="648.80" r="3.5" fill="#d17c2f"><title>TPOT 150 ms, rate 8 req/s, output cap 64, seed 42: 59.177</title></circle>
+<circle cx="1042.23" cy="660.03" r="3.5" fill="#d17c2f"><title>TPOT 150 ms, rate 8 req/s, output cap 128, seed 42: 48.171</title></circle>
+<circle cx="1153.90" cy="710.42" r="3.5" fill="#d17c2f"><title>TPOT 150 ms, rate 16 req/s, output cap 16, seed 42: -1.231</title></circle>
+<circle cx="1265.57" cy="651.57" r="3.5" fill="#d17c2f"><title>TPOT 150 ms, rate 16 req/s, output cap 64, seed 42: 56.467</title></circle>
+<circle cx="1377.23" cy="736.45" r="3.5" fill="#d17c2f"><title>TPOT 150 ms, rate 16 req/s, output cap 128, seed 42: -26.745</title></circle>
+<line x1="102" y1="709.17" x2="1442" y2="709.17" stroke="#555555" stroke-width="1.2" stroke-dasharray="4 4"/>
+<circle cx="107" cy="85" r="3.5" fill="#2d708e"/>
+<text x="115" y="88" font-size="9">TPOT 100 ms</text>
+<circle cx="197.0" cy="85" r="3.5" fill="#d17c2f"/>
+<text x="205.0" y="88" font-size="9">TPOT 150 ms</text>
+<line x1="282.0" y1="85" x2="296.0" y2="85" stroke="#555555" stroke-width="2" stroke-dasharray="4 3"/>
+<text x="295.0" y="88" font-size="9">no change</text>
+<circle cx="107" cy="510" r="3.5" fill="#2d708e"/>
+<text x="115" y="513" font-size="9">TPOT 100 ms</text>
+<circle cx="197.0" cy="510" r="3.5" fill="#d17c2f"/>
+<text x="205.0" y="513" font-size="9">TPOT 150 ms</text>
+<line x1="282.0" y1="510" x2="296.0" y2="510" stroke="#555555" stroke-width="2" stroke-dasharray="4 3"/>
+<text x="295.0" y="513" font-size="9">no change</text>
+</svg>

@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="590" viewBox="0 0 1000 590">
+<rect width="100%" height="100%" fill="#ffffff"/>
+<style>text{font-family:Arial,Helvetica,sans-serif;fill:#263238}</style>
+<text x="500" y="26" text-anchor="middle" font-size="17" font-weight="600">ShareGPT prompt buckets · BF16 KV · no swap</text>
+<text x="500" y="65" text-anchor="middle" font-size="13" font-weight="600">Real prompt lengths grouped by maximum bucket</text>
+<line x1="104" y1="491.00" x2="944" y2="491.00" stroke="#d7dce1" stroke-width="1"/>
+<text x="96" y="495.00" text-anchor="end" font-size="10">0</text>
+<line x1="104" y1="397.25" x2="944" y2="397.25" stroke="#d7dce1" stroke-width="1"/>
+<text x="96" y="401.25" text-anchor="end" font-size="10">481</text>
+<line x1="104" y1="303.50" x2="944" y2="303.50" stroke="#d7dce1" stroke-width="1"/>
+<text x="96" y="307.50" text-anchor="end" font-size="10">963</text>
+<line x1="104" y1="209.75" x2="944" y2="209.75" stroke="#d7dce1" stroke-width="1"/>
+<text x="96" y="213.75" text-anchor="end" font-size="10">1,444</text>
+<line x1="104" y1="116.00" x2="944" y2="116.00" stroke="#d7dce1" stroke-width="1"/>
+<text x="96" y="120.00" text-anchor="end" font-size="10">1,926</text>
+<line x1="104.00" y1="116" x2="104.00" y2="491" stroke="#edf0f2" stroke-width="1"/>
+<text x="104.00" y="509" text-anchor="middle" font-size="9">0.58</text>
+<line x1="314.00" y1="116" x2="314.00" y2="491" stroke="#edf0f2" stroke-width="1"/>
+<text x="314.00" y="509" text-anchor="middle" font-size="9">2.54</text>
+<line x1="524.00" y1="116" x2="524.00" y2="491" stroke="#edf0f2" stroke-width="1"/>
+<text x="524.00" y="509" text-anchor="middle" font-size="9">4.5</text>
+<line x1="734.00" y1="116" x2="734.00" y2="491" stroke="#edf0f2" stroke-width="1"/>
+<text x="734.00" y="509" text-anchor="middle" font-size="9">6.46</text>
+<line x1="944.00" y1="116" x2="944.00" y2="491" stroke="#edf0f2" stroke-width="1"/>
+<text x="944.00" y="509" text-anchor="middle" font-size="9">8.42</text>
+<line x1="104" y1="491" x2="944" y2="491" stroke="#64727a"/>
+<line x1="104" y1="116" x2="104" y2="491" stroke="#64727a"/>
+<text x="524" y="557" text-anchor="middle" font-size="11">Simultaneous requests</text>
+<text x="46" y="303.5" text-anchor="middle" font-size="11" transform="rotate(-90 46 303.5)">TTFT p99 (ms)</text>
+<polyline points="149.00,290.03 470.43,339.71 899.00,374.35" fill="none" stroke="#2d708e" stroke-width="2"/>
+<circle cx="149.00" cy="290.03" r="3.5" fill="#2d708e"></circle>
+<circle cx="470.43" cy="339.71" r="3.5" fill="#2d708e"></circle>
+<circle cx="899.00" cy="374.35" r="3.5" fill="#2d708e"></circle>
+<polyline points="149.00,470.99 470.43,329.84 899.00,257.03" fill="none" stroke="#3b9b73" stroke-width="2"/>
+<circle cx="149.00" cy="470.99" r="3.5" fill="#3b9b73"></circle>
+<circle cx="470.43" cy="329.84" r="3.5" fill="#3b9b73"></circle>
+<circle cx="899.00" cy="257.03" r="3.5" fill="#3b9b73"></circle>
+<polyline points="149.00,462.47 470.43,335.94 899.00,143.78" fill="none" stroke="#e1a340" stroke-width="2"/>
+<circle cx="149.00" cy="462.47" r="3.5" fill="#e1a340"></circle>
+<circle cx="470.43" cy="335.94" r="3.5" fill="#e1a340"></circle>
+<circle cx="899.00" cy="143.78" r="3.5" fill="#e1a340"></circle>
+<line x1="104" y1="101.59" x2="944" y2="101.59" stroke="#555555" stroke-width="1.2" stroke-dasharray="4 4"/>
+<circle cx="109" cy="86" r="3.5" fill="#2d708e"/>
+<text x="117" y="89" font-size="9">≤512 tokens</text>
+<circle cx="199.0" cy="86" r="3.5" fill="#3b9b73"/>
+<text x="207.0" y="89" font-size="9">≤1024 tokens</text>
+<circle cx="295.0" cy="86" r="3.5" fill="#e1a340"/>
+<text x="303.0" y="89" font-size="9">≤2048 tokens</text>
+<line x1="386.0" y1="86" x2="400.0" y2="86" stroke="#555555" stroke-width="2" stroke-dasharray="4 3"/>
+<text x="399.0" y="89" font-size="9">2 s TTFT target</text>
+</svg>

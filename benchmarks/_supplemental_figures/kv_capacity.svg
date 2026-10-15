@@ -1,0 +1,121 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1320" height="620" viewBox="0 0 1320 620">
+<rect width="100%" height="100%" fill="#ffffff"/>
+<style>text{font-family:Arial,Helvetica,sans-serif;fill:#263238}</style>
+<text x="660" y="26" text-anchor="middle" font-size="17" font-weight="600">KV capacity and service boundary</text>
+<text x="340.5" y="67" text-anchor="middle" font-size="13" font-weight="600">BF16 KV · synthetic exact-length prompts</text>
+<line x1="92" y1="508.00" x2="637" y2="508.00" stroke="#d7dce1" stroke-width="1"/>
+<text x="84" y="512.00" text-anchor="end" font-size="10">0</text>
+<line x1="92" y1="410.50" x2="637" y2="410.50" stroke="#d7dce1" stroke-width="1"/>
+<text x="84" y="414.50" text-anchor="end" font-size="10">4,156</text>
+<line x1="92" y1="313.00" x2="637" y2="313.00" stroke="#d7dce1" stroke-width="1"/>
+<text x="84" y="317.00" text-anchor="end" font-size="10">8,311</text>
+<line x1="92" y1="215.50" x2="637" y2="215.50" stroke="#d7dce1" stroke-width="1"/>
+<text x="84" y="219.50" text-anchor="end" font-size="10">12,467</text>
+<line x1="92" y1="118.00" x2="637" y2="118.00" stroke="#d7dce1" stroke-width="1"/>
+<text x="84" y="122.00" text-anchor="end" font-size="10">16,622</text>
+<line x1="92.00" y1="118" x2="92.00" y2="508" stroke="#edf0f2" stroke-width="1"/>
+<text x="92.00" y="526" text-anchor="middle" font-size="9">1</text>
+<line x1="100.65" y1="118" x2="100.65" y2="508" stroke="#edf0f2" stroke-width="1"/>
+<text x="100.65" y="526" text-anchor="middle" font-size="9">2</text>
+<line x1="117.95" y1="118" x2="117.95" y2="508" stroke="#edf0f2" stroke-width="1"/>
+<text x="117.95" y="526" text-anchor="middle" font-size="9">4</text>
+<line x1="152.56" y1="118" x2="152.56" y2="508" stroke="#edf0f2" stroke-width="1"/>
+<text x="152.56" y="526" text-anchor="middle" font-size="9">8</text>
+<line x1="221.76" y1="118" x2="221.76" y2="508" stroke="#edf0f2" stroke-width="1"/>
+<text x="221.76" y="526" text-anchor="middle" font-size="9">16</text>
+<line x1="360.17" y1="118" x2="360.17" y2="508" stroke="#edf0f2" stroke-width="1"/>
+<text x="360.17" y="526" text-anchor="middle" font-size="9">32</text>
+<line x1="498.59" y1="118" x2="498.59" y2="508" stroke="#edf0f2" stroke-width="1"/>
+<text x="498.59" y="526" text-anchor="middle" font-size="9">48</text>
+<line x1="637.00" y1="118" x2="637.00" y2="508" stroke="#edf0f2" stroke-width="1"/>
+<text x="637.00" y="526" text-anchor="middle" font-size="9">64</text>
+<line x1="92" y1="508" x2="637" y2="508" stroke="#64727a"/>
+<line x1="92" y1="118" x2="92" y2="508" stroke="#64727a"/>
+<text x="364.5" y="574" text-anchor="middle" font-size="11">Simultaneous requests</text>
+<text x="34" y="313" text-anchor="middle" font-size="11" transform="rotate(-90 34 313)">TTFT p99 (ms)</text>
+<polyline points="92.00,479.17 100.65,495.78 117.95,493.20 152.56,491.48 221.76,480.65 360.17,474.36" fill="none" stroke="#2d708e" stroke-width="2"/>
+<circle cx="92.00" cy="479.17" r="3.5" fill="#2d708e"></circle>
+<circle cx="100.65" cy="495.78" r="3.5" fill="#2d708e"></circle>
+<circle cx="117.95" cy="493.20" r="3.5" fill="#2d708e"></circle>
+<circle cx="152.56" cy="491.48" r="3.5" fill="#2d708e"></circle>
+<circle cx="221.76" cy="480.65" r="3.5" fill="#2d708e"></circle>
+<circle cx="360.17" cy="474.36" r="3.5" fill="#2d708e"></circle>
+<polyline points="92.00,504.00 100.65,497.46 117.95,487.06 152.56,470.68 221.76,457.47 360.17,456.46" fill="none" stroke="#3b9b73" stroke-width="2"/>
+<circle cx="92.00" cy="504.00" r="3.5" fill="#3b9b73"></circle>
+<circle cx="100.65" cy="497.46" r="3.5" fill="#3b9b73"></circle>
+<circle cx="117.95" cy="487.06" r="3.5" fill="#3b9b73"></circle>
+<circle cx="152.56" cy="470.68" r="3.5" fill="#3b9b73"></circle>
+<circle cx="221.76" cy="457.47" r="3.5" fill="#3b9b73"></circle>
+<circle cx="360.17" cy="456.46" r="3.5" fill="#3b9b73"></circle>
+<polyline points="92.00,504.20 100.65,497.24 117.95,482.51 152.56,467.68 221.76,438.37 360.17,432.58" fill="none" stroke="#e1a340" stroke-width="2"/>
+<circle cx="92.00" cy="504.20" r="3.5" fill="#e1a340"></circle>
+<circle cx="100.65" cy="497.24" r="3.5" fill="#e1a340"></circle>
+<circle cx="117.95" cy="482.51" r="3.5" fill="#e1a340"></circle>
+<circle cx="152.56" cy="467.68" r="3.5" fill="#e1a340"></circle>
+<circle cx="221.76" cy="438.37" r="3.5" fill="#e1a340"></circle>
+<circle cx="360.17" cy="432.58" r="3.5" fill="#e1a340"></circle>
+<polyline points="92.00,502.13 100.65,492.26 117.95,476.94 152.56,443.09 221.76,410.67 360.17,332.25" fill="none" stroke="#a63a50" stroke-width="2"/>
+<circle cx="92.00" cy="502.13" r="3.5" fill="#a63a50"></circle>
+<circle cx="100.65" cy="492.26" r="3.5" fill="#a63a50"></circle>
+<circle cx="117.95" cy="476.94" r="3.5" fill="#a63a50"></circle>
+<circle cx="152.56" cy="443.09" r="3.5" fill="#a63a50"></circle>
+<circle cx="221.76" cy="410.67" r="3.5" fill="#a63a50"></circle>
+<circle cx="360.17" cy="332.25" r="3.5" fill="#a63a50"></circle>
+<polyline points="498.59,237.58 637.00,146.89" fill="none" stroke="#a63a50" stroke-width="2" stroke-dasharray="5 4"/>
+<circle cx="498.59" cy="237.58" r="3.5" fill="#a63a50"></circle>
+<circle cx="637.00" cy="146.89" r="3.5" fill="#a63a50"></circle>
+<polyline points="498.59,237.29 637.00,146.92" fill="none" stroke="#a63a50" stroke-width="2" stroke-dasharray="5 4"/>
+<rect x="495.09" y="233.79" width="7" height="7" fill="#a63a50"></rect>
+<rect x="633.50" y="143.42" width="7" height="7" fill="#a63a50"></rect>
+<line x1="92" y1="461.07" x2="637" y2="461.07" stroke="#555555" stroke-width="1.2" stroke-dasharray="4 4"/>
+<text x="987.5" y="67" text-anchor="middle" font-size="13" font-weight="600">FP8 E4M3 KV · no swap</text>
+<line x1="749" y1="508.00" x2="1274" y2="508.00" stroke="#d7dce1" stroke-width="1"/>
+<text x="741" y="512.00" text-anchor="end" font-size="10">0</text>
+<line x1="749" y1="410.50" x2="1274" y2="410.50" stroke="#d7dce1" stroke-width="1"/>
+<text x="741" y="414.50" text-anchor="end" font-size="10">3,360</text>
+<line x1="749" y1="313.00" x2="1274" y2="313.00" stroke="#d7dce1" stroke-width="1"/>
+<text x="741" y="317.00" text-anchor="end" font-size="10">6,719</text>
+<line x1="749" y1="215.50" x2="1274" y2="215.50" stroke="#d7dce1" stroke-width="1"/>
+<text x="741" y="219.50" text-anchor="end" font-size="10">10,079</text>
+<line x1="749" y1="118.00" x2="1274" y2="118.00" stroke="#d7dce1" stroke-width="1"/>
+<text x="741" y="122.00" text-anchor="end" font-size="10">13,439</text>
+<line x1="749.00" y1="118" x2="749.00" y2="508" stroke="#edf0f2" stroke-width="1"/>
+<text x="749.00" y="526" text-anchor="middle" font-size="9">8</text>
+<line x1="924.00" y1="118" x2="924.00" y2="508" stroke="#edf0f2" stroke-width="1"/>
+<text x="924.00" y="526" text-anchor="middle" font-size="9">16</text>
+<line x1="1274.00" y1="118" x2="1274.00" y2="508" stroke="#edf0f2" stroke-width="1"/>
+<text x="1274.00" y="526" text-anchor="middle" font-size="9">32</text>
+<line x1="749" y1="508" x2="1274" y2="508" stroke="#64727a"/>
+<line x1="749" y1="118" x2="749" y2="508" stroke="#64727a"/>
+<text x="1011.5" y="574" text-anchor="middle" font-size="11">Simultaneous requests</text>
+<text x="691" y="313" text-anchor="middle" font-size="11" transform="rotate(-90 691 313)">TTFT p99 (ms)</text>
+<polyline points="749.00,391.18 924.00,422.06 1274.00,412.12" fill="none" stroke="#e1a340" stroke-width="2"/>
+<circle cx="749.00" cy="391.18" r="3.5" fill="#e1a340"></circle>
+<circle cx="924.00" cy="422.06" r="3.5" fill="#e1a340"></circle>
+<circle cx="1274.00" cy="412.12" r="3.5" fill="#e1a340"></circle>
+<polyline points="749.00,146.89 924.00,296.42 1274.00,320.54" fill="none" stroke="#a63a50" stroke-width="2"/>
+<circle cx="749.00" cy="146.89" r="3.5" fill="#a63a50"></circle>
+<circle cx="924.00" cy="296.42" r="3.5" fill="#a63a50"></circle>
+<circle cx="1274.00" cy="320.54" r="3.5" fill="#a63a50"></circle>
+<line x1="749" y1="449.96" x2="1274" y2="449.96" stroke="#555555" stroke-width="1.2" stroke-dasharray="4 4"/>
+<circle cx="97" cy="88" r="3.5" fill="#2d708e"/>
+<text x="105" y="91" font-size="9">512 tokens</text>
+<circle cx="181.0" cy="88" r="3.5" fill="#3b9b73"/>
+<text x="189.0" y="91" font-size="9">1024 tokens</text>
+<circle cx="271.0" cy="88" r="3.5" fill="#e1a340"/>
+<text x="279.0" y="91" font-size="9">2048 tokens</text>
+<circle cx="361.0" cy="88" r="3.5" fill="#a63a50"/>
+<text x="369.0" y="91" font-size="9">4096 tokens</text>
+<circle cx="451.0" cy="88" r="3.5" fill="#a63a50"/>
+<text x="459.0" y="91" font-size="9">4096 no-swap extension</text>
+<circle cx="97" cy="102" r="3.5" fill="#a63a50"/>
+<text x="105" y="105" font-size="9">4096 swap enabled</text>
+<line x1="218.0" y1="102" x2="232.0" y2="102" stroke="#555555" stroke-width="2" stroke-dasharray="4 3"/>
+<text x="231.0" y="105" font-size="9">2 s TTFT target</text>
+<circle cx="754" cy="88" r="3.5" fill="#e1a340"/>
+<text x="762" y="91" font-size="9">2048 tokens</text>
+<circle cx="844.0" cy="88" r="3.5" fill="#a63a50"/>
+<text x="852.0" y="91" font-size="9">4096 tokens</text>
+<line x1="929.0" y1="88" x2="943.0" y2="88" stroke="#555555" stroke-width="2" stroke-dasharray="4 3"/>
+<text x="942.0" y="91" font-size="9">2 s TTFT target</text>
+</svg>

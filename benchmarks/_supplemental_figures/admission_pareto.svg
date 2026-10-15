@@ -1,0 +1,78 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1120" height="650" viewBox="0 0 1120 650">
+<rect width="100%" height="100%" fill="#ffffff"/>
+<style>text{font-family:Arial,Helvetica,sans-serif;fill:#263238}</style>
+<text x="560" y="26" text-anchor="middle" font-size="17" font-weight="600">Admission operating points · 500-request trace</text>
+<text x="560" y="65" text-anchor="middle" font-size="13" font-weight="600">Lower rejection and higher goodput are preferred</text>
+<line x1="99" y1="531.00" x2="1069" y2="531.00" stroke="#d7dce1" stroke-width="1"/>
+<text x="91" y="535.00" text-anchor="end" font-size="10">1,621</text>
+<line x1="99" y1="427.25" x2="1069" y2="427.25" stroke="#d7dce1" stroke-width="1"/>
+<text x="91" y="431.25" text-anchor="end" font-size="10">2,622</text>
+<line x1="99" y1="323.50" x2="1069" y2="323.50" stroke="#d7dce1" stroke-width="1"/>
+<text x="91" y="327.50" text-anchor="end" font-size="10">3,623</text>
+<line x1="99" y1="219.75" x2="1069" y2="219.75" stroke="#d7dce1" stroke-width="1"/>
+<text x="91" y="223.75" text-anchor="end" font-size="10">4,624</text>
+<line x1="99" y1="116.00" x2="1069" y2="116.00" stroke="#d7dce1" stroke-width="1"/>
+<text x="91" y="120.00" text-anchor="end" font-size="10">5,625</text>
+<line x1="99.00" y1="116" x2="99.00" y2="531" stroke="#edf0f2" stroke-width="1"/>
+<text x="99.00" y="549" text-anchor="middle" font-size="9">-7.12</text>
+<line x1="341.50" y1="116" x2="341.50" y2="531" stroke="#edf0f2" stroke-width="1"/>
+<text x="341.50" y="549" text-anchor="middle" font-size="9">14.2</text>
+<line x1="584.00" y1="116" x2="584.00" y2="531" stroke="#edf0f2" stroke-width="1"/>
+<text x="584.00" y="549" text-anchor="middle" font-size="9">35.6</text>
+<line x1="826.50" y1="116" x2="826.50" y2="531" stroke="#edf0f2" stroke-width="1"/>
+<text x="826.50" y="549" text-anchor="middle" font-size="9">57</text>
+<line x1="1069.00" y1="116" x2="1069.00" y2="531" stroke="#edf0f2" stroke-width="1"/>
+<text x="1069.00" y="549" text-anchor="middle" font-size="9">78.3</text>
+<line x1="99" y1="531" x2="1069" y2="531" stroke="#64727a"/>
+<line x1="99" y1="116" x2="99" y2="531" stroke="#64727a"/>
+<text x="584" y="597" text-anchor="middle" font-size="11">Rejected requests (% of arrivals)</text>
+<text x="41" y="323.5" text-anchor="middle" font-size="11" transform="rotate(-90 41 323.5)">Joint-SLO output goodput (tokens/s)</text>
+<circle cx="179.83" cy="199.12" r="3.5" fill="#355f8a"><title>dynamic_off; rate=24.0 req/s; prefix=0%; TTFT p99=132.03939756431282 ms</title></circle>
+<text x="184.83" y="194.12" font-size="8">24r/0%</text>
+<circle cx="179.83" cy="210.46" r="3.5" fill="#355f8a"><title>dynamic_off; rate=24.0 req/s; prefix=20%; TTFT p99=138.47197958466495 ms</title></circle>
+<text x="184.83" y="205.46" font-size="8">24r/20%</text>
+<circle cx="179.83" cy="218.91" r="3.5" fill="#355f8a"><title>dynamic_off; rate=24.0 req/s; prefix=50%; TTFT p99=282.9698891762291 ms</title></circle>
+<text x="184.83" y="213.91" font-size="8">24r/50%</text>
+<circle cx="218.43" cy="164.09" r="3.5" fill="#355f8a"><title>dynamic_off; rate=32.0 req/s; prefix=0%; TTFT p99=348.49029188217173 ms</title></circle>
+<text x="223.43" y="159.09" font-size="8">32r/0%</text>
+<circle cx="400.08" cy="152.18" r="3.5" fill="#355f8a"><title>dynamic_off; rate=48.0 req/s; prefix=0%; TTFT p99=441.5800450115057 ms</title></circle>
+<text x="405.08" y="147.18" font-size="8">48r/0%</text>
+<circle cx="497.72" cy="150.58" r="3.5" fill="#355f8a"><title>dynamic_off; rate=64.0 req/s; prefix=0%; TTFT p99=495.74528844095767 ms</title></circle>
+<text x="502.72" y="145.58" font-size="8">64r/0%</text>
+<circle cx="590.81" cy="154.55" r="3.5" fill="#355f8a"><title>dynamic_off; rate=96.0 req/s; prefix=0%; TTFT p99=188.7408403572408 ms</title></circle>
+<text x="595.81" y="149.55" font-size="8">96r/0%</text>
+<rect x="412.48" y="248.02" width="7" height="7" fill="#3b9b73"><title>dynamic_on_no_cache; rate=24.0 req/s; prefix=0%; TTFT p99=1676.4094503280376 ms</title></rect>
+<text x="420.98" y="246.52" font-size="8">24r/0%</text>
+<rect x="605.48" y="327.74" width="7" height="7" fill="#3b9b73"><title>dynamic_on_no_cache; rate=24.0 req/s; prefix=20%; TTFT p99=1908.464001028733 ms</title></rect>
+<text x="613.98" y="326.24" font-size="8">24r/20%</text>
+<rect x="939.25" y="492.92" width="7" height="7" fill="#3b9b73"><title>dynamic_on_no_cache; rate=24.0 req/s; prefix=50%; TTFT p99=2010.7689471205958 ms</title></rect>
+<text x="947.75" y="491.42" font-size="8">24r/50%</text>
+<rect x="893.84" y="433.15" width="7" height="7" fill="#3b9b73"><title>dynamic_on_no_cache; rate=32.0 req/s; prefix=0%; TTFT p99=1973.1850205366754 ms</title></rect>
+<text x="902.34" y="431.65" font-size="8">32r/0%</text>
+<rect x="632.72" y="194.73" width="7" height="7" fill="#3b9b73"><title>dynamic_on_no_cache; rate=48.0 req/s; prefix=0%; TTFT p99=1533.1046309329395 ms</title></rect>
+<text x="641.22" y="193.23" font-size="8">48r/0%</text>
+<rect x="764.42" y="192.12" width="7" height="7" fill="#3b9b73"><title>dynamic_on_no_cache; rate=64.0 req/s; prefix=0%; TTFT p99=1050.7131244185075 ms</title></rect>
+<text x="772.92" y="190.62" font-size="8">64r/0%</text>
+<rect x="982.40" y="267.07" width="7" height="7" fill="#3b9b73"><title>dynamic_on_no_cache; rate=96.0 req/s; prefix=0%; TTFT p99=1014.9721763832531 ms</title></rect>
+<text x="990.90" y="265.57" font-size="8">96r/0%</text>
+<path d="M 563.56 320.82 L 567.56 328.32 L 559.56 328.32 Z" fill="#d17c2f"><title>dynamic_on_cache_aware; rate=24.0 req/s; prefix=0%; TTFT p99=1780.3541929342828 ms</title></path>
+<text x="568.56" y="319.82" font-size="8">24r/0%</text>
+<path d="M 402.35 243.36 L 406.35 250.86 L 398.35 250.86 Z" fill="#d17c2f"><title>dynamic_on_cache_aware; rate=24.0 req/s; prefix=20%; TTFT p99=1790.575221163408 ms</title></path>
+<text x="407.35" y="242.36" font-size="8">24r/20%</text>
+<path d="M 842.85 459.10 L 846.85 466.60 L 838.85 466.60 Z" fill="#d17c2f"><title>dynamic_on_cache_aware; rate=24.0 req/s; prefix=50%; TTFT p99=1945.6120433819706 ms</title></path>
+<text x="847.85" y="458.10" font-size="8">24r/50%</text>
+<path d="M 858.74 405.88 L 862.74 413.38 L 854.74 413.38 Z" fill="#d17c2f"><title>dynamic_on_cache_aware; rate=32.0 req/s; prefix=0%; TTFT p99=1920.938040960209 ms</title></path>
+<text x="863.74" y="404.88" font-size="8">32r/0%</text>
+<path d="M 690.72 221.02 L 694.72 228.52 L 686.72 228.52 Z" fill="#d17c2f"><title>dynamic_on_cache_aware; rate=48.0 req/s; prefix=0%; TTFT p99=1550.5699928685317 ms</title></path>
+<text x="695.72" y="220.02" font-size="8">48r/0%</text>
+<path d="M 767.92 207.93 L 771.92 215.43 L 763.92 215.43 Z" fill="#d17c2f"><title>dynamic_on_cache_aware; rate=64.0 req/s; prefix=0%; TTFT p99=1223.6023051918892 ms</title></path>
+<text x="772.92" y="206.93" font-size="8">64r/0%</text>
+<path d="M 988.17 273.77 L 992.17 281.27 L 984.17 281.27 Z" fill="#d17c2f"><title>dynamic_on_cache_aware; rate=96.0 req/s; prefix=0%; TTFT p99=1048.4331206807838 ms</title></path>
+<text x="993.17" y="272.77" font-size="8">96r/0%</text>
+<circle cx="104" cy="86" r="3.5" fill="#355f8a"/>
+<text x="112" y="89" font-size="9">dynamic_off</text>
+<circle cx="194.0" cy="86" r="3.5" fill="#3b9b73"/>
+<text x="202.0" y="89" font-size="9">dynamic_on_no_cache</text>
+<circle cx="332.0" cy="86" r="3.5" fill="#d17c2f"/>
+<text x="340.0" y="89" font-size="9">dynamic_on_cache_aware</text>
+</svg>

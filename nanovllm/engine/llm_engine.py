@@ -154,6 +154,10 @@ class LLMEngine:
             "seq_id": seq.seq_id,
             "prompt_tokens": seq.num_prompt_tokens,
             "completion_tokens": len(seq.completion_token_ids),
+            "spec_proposed_tokens": seq.spec_proposed_tokens,
+            "spec_accepted_tokens": seq.spec_accepted_tokens,
+            "spec_verify_steps": seq.spec_verify_steps,
+            "spec_verify_tokens": seq.spec_verify_tokens,
             "t_submitted": seq.t_submitted,
             "t_prefill_started": seq.t_prefill_started,
             "t_first_token": seq.t_first_token,
@@ -320,6 +324,10 @@ class LLMEngine:
             samples = token_ids[idx:idx + n]
             idx += n
             accepted, n_acc = verify_drafts(drafts, samples)
+            seq.spec_proposed_tokens += len(drafts)
+            seq.spec_accepted_tokens += max(0, n_acc - 1)
+            seq.spec_verify_steps += 1
+            seq.spec_verify_tokens += n
             token_lists.append(accepted)
             n_decode += n_acc
             n_draft += len(drafts)

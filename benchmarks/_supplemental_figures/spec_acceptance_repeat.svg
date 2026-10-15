@@ -1,0 +1,93 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="590" viewBox="0 0 1000 590">
+<rect width="100%" height="100%" fill="#ffffff"/>
+<style>text{font-family:Arial,Helvetica,sans-serif;fill:#263238}</style>
+<text x="500" y="26" text-anchor="middle" font-size="17" font-weight="600">N-gram acceptance vs generated 4-gram repetition</text>
+<text x="500" y="65" text-anchor="middle" font-size="13" font-weight="600">Spearman ρ=0.93</text>
+<line x1="104" y1="491.00" x2="944" y2="491.00" stroke="#d7dce1" stroke-width="1"/>
+<text x="96" y="495.00" text-anchor="end" font-size="10">0</text>
+<line x1="104" y1="397.25" x2="944" y2="397.25" stroke="#d7dce1" stroke-width="1"/>
+<text x="96" y="401.25" text-anchor="end" font-size="10">0.26</text>
+<line x1="104" y1="303.50" x2="944" y2="303.50" stroke="#d7dce1" stroke-width="1"/>
+<text x="96" y="307.50" text-anchor="end" font-size="10">0.53</text>
+<line x1="104" y1="209.75" x2="944" y2="209.75" stroke="#d7dce1" stroke-width="1"/>
+<text x="96" y="213.75" text-anchor="end" font-size="10">0.79</text>
+<line x1="104" y1="116.00" x2="944" y2="116.00" stroke="#d7dce1" stroke-width="1"/>
+<text x="96" y="120.00" text-anchor="end" font-size="10">1.05</text>
+<line x1="104.00" y1="116" x2="104.00" y2="491" stroke="#edf0f2" stroke-width="1"/>
+<text x="104.00" y="509" text-anchor="middle" font-size="9">0</text>
+<line x1="314.00" y1="116" x2="314.00" y2="491" stroke="#edf0f2" stroke-width="1"/>
+<text x="314.00" y="509" text-anchor="middle" font-size="9">0.25</text>
+<line x1="524.00" y1="116" x2="524.00" y2="491" stroke="#edf0f2" stroke-width="1"/>
+<text x="524.00" y="509" text-anchor="middle" font-size="9">0.5</text>
+<line x1="734.00" y1="116" x2="734.00" y2="491" stroke="#edf0f2" stroke-width="1"/>
+<text x="734.00" y="509" text-anchor="middle" font-size="9">0.75</text>
+<line x1="944.00" y1="116" x2="944.00" y2="491" stroke="#edf0f2" stroke-width="1"/>
+<text x="944.00" y="509" text-anchor="middle" font-size="9">1</text>
+<line x1="104" y1="491" x2="944" y2="491" stroke="#64727a"/>
+<line x1="104" y1="116" x2="104" y2="491" stroke="#64727a"/>
+<text x="524" y="557" text-anchor="middle" font-size="11">Generated-output 4-gram repeat rate</text>
+<text x="46" y="303.5" text-anchor="middle" font-size="11" transform="rotate(-90 46 303.5)">Accepted / proposed draft tokens (α)</text>
+<circle cx="104.00" cy="446.36" r="3.5" fill="#2d708e"></circle>
+<circle cx="817.55" cy="152.02" r="3.5" fill="#2d708e"></circle>
+<circle cx="817.55" cy="152.33" r="3.5" fill="#2d708e"></circle>
+<circle cx="104.00" cy="468.11" r="3.5" fill="#2d708e"></circle>
+<circle cx="844.65" cy="139.03" r="3.5" fill="#2d708e"></circle>
+<circle cx="826.58" cy="159.01" r="3.5" fill="#2d708e"></circle>
+<circle cx="448.35" cy="305.67" r="3.5" fill="#2d708e"></circle>
+<circle cx="490.13" cy="254.62" r="3.5" fill="#2d708e"></circle>
+<circle cx="551.10" cy="248.44" r="3.5" fill="#2d708e"></circle>
+<circle cx="412.23" cy="364.56" r="3.5" fill="#2d708e"></circle>
+<circle cx="342.23" cy="397.16" r="3.5" fill="#2d708e"></circle>
+<circle cx="342.23" cy="392.41" r="3.5" fill="#2d708e"></circle>
+<circle cx="496.06" cy="260.05" r="3.5" fill="#2d708e"></circle>
+<circle cx="573.11" cy="237.09" r="3.5" fill="#2d708e"></circle>
+<circle cx="627.59" cy="236.31" r="3.5" fill="#2d708e"></circle>
+<circle cx="520.05" cy="304.77" r="3.5" fill="#2d708e"></circle>
+<circle cx="541.50" cy="304.20" r="3.5" fill="#2d708e"></circle>
+<circle cx="582.43" cy="291.95" r="3.5" fill="#2d708e"></circle>
+<circle cx="204.48" cy="406.95" r="3.5" fill="#3b9b73"></circle>
+<circle cx="230.45" cy="415.08" r="3.5" fill="#3b9b73"></circle>
+<circle cx="234.97" cy="420.42" r="3.5" fill="#3b9b73"></circle>
+<circle cx="153.68" cy="440.57" r="3.5" fill="#e1a340"></circle>
+<circle cx="323.03" cy="400.45" r="3.5" fill="#e1a340"></circle>
+<circle cx="239.48" cy="426.65" r="3.5" fill="#e1a340"></circle>
+<circle cx="799.48" cy="133.86" r="3.5" fill="#a63a50"></circle>
+<circle cx="806.26" cy="135.04" r="3.5" fill="#a63a50"></circle>
+<circle cx="772.39" cy="147.06" r="3.5" fill="#a63a50"></circle>
+<circle cx="799.48" cy="133.86" r="3.5" fill="#a63a50"></circle>
+<circle cx="799.48" cy="133.86" r="3.5" fill="#a63a50"></circle>
+<circle cx="799.48" cy="133.86" r="3.5" fill="#a63a50"></circle>
+<circle cx="799.48" cy="133.86" r="3.5" fill="#a63a50"></circle>
+<circle cx="799.48" cy="133.86" r="3.5" fill="#a63a50"></circle>
+<circle cx="799.48" cy="133.86" r="3.5" fill="#a63a50"></circle>
+<circle cx="794.97" cy="138.08" r="3.5" fill="#a63a50"></circle>
+<circle cx="712.55" cy="197.88" r="3.5" fill="#a63a50"></circle>
+<circle cx="714.81" cy="177.13" r="3.5" fill="#a63a50"></circle>
+<circle cx="799.48" cy="133.86" r="3.5" fill="#a63a50"></circle>
+<circle cx="806.26" cy="135.04" r="3.5" fill="#a63a50"></circle>
+<circle cx="794.97" cy="137.36" r="3.5" fill="#a63a50"></circle>
+<circle cx="799.48" cy="133.86" r="3.5" fill="#a63a50"></circle>
+<circle cx="736.26" cy="156.99" r="3.5" fill="#a63a50"></circle>
+<circle cx="782.83" cy="142.30" r="3.5" fill="#a63a50"></circle>
+<circle cx="786.50" cy="142.86" r="3.5" fill="#a63a50"></circle>
+<circle cx="753.48" cy="162.76" r="3.5" fill="#a63a50"></circle>
+<circle cx="764.20" cy="167.06" r="3.5" fill="#a63a50"></circle>
+<circle cx="185.29" cy="435.90" r="3.5" fill="#5969a8"></circle>
+<circle cx="203.35" cy="444.27" r="3.5" fill="#5969a8"></circle>
+<circle cx="202.23" cy="431.53" r="3.5" fill="#5969a8"></circle>
+<circle cx="229.32" cy="440.33" r="3.5" fill="#8c6bb1"></circle>
+<circle cx="240.61" cy="428.49" r="3.5" fill="#8c6bb1"></circle>
+<circle cx="157.06" cy="451.67" r="3.5" fill="#8c6bb1"></circle>
+<circle cx="109" cy="86" r="3.5" fill="#2d708e"/>
+<text x="117" y="89" font-size="9">free</text>
+<circle cx="157.0" cy="86" r="3.5" fill="#3b9b73"/>
+<text x="165.0" y="89" font-size="9">json</text>
+<circle cx="205.0" cy="86" r="3.5" fill="#e1a340"/>
+<text x="213.0" y="89" font-size="9">open_ended</text>
+<circle cx="289.0" cy="86" r="3.5" fill="#a63a50"/>
+<text x="297.0" y="89" font-size="9">repeat</text>
+<circle cx="349.0" cy="86" r="3.5" fill="#5969a8"/>
+<text x="357.0" y="89" font-size="9">sharegpt</text>
+<circle cx="421.0" cy="86" r="3.5" fill="#8c6bb1"/>
+<text x="429.0" y="89" font-size="9">structured</text>
+</svg>

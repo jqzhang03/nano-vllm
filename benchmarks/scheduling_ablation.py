@@ -27,9 +27,11 @@ from typing import Callable
 import torch
 
 try:
-    from .bench import add_workload_args, build_workload, env_info, summarize
+    from .bench import (add_workload_args, build_workload_data, env_info,
+                        input_length_bucket, summarize)
 except ImportError:  # direct script execution: python benchmarks/scheduling_ablation.py
-    from bench import add_workload_args, build_workload, env_info, summarize
+    from bench import (add_workload_args, build_workload_data, env_info,
+                       input_length_bucket, summarize)
 
 from nanovllm import LLM, SamplingParams
 
@@ -96,7 +98,7 @@ def build_ttft_slo_targets(num_requests: int, min_ms: float, max_ms: float,
 
 def workload_fingerprint(prompts, sampling_params, arrival_times,
                          ttft_slo_targets_ms, tpot_slo_targets_ms,
-                         seed: int) -> str:
+                         seed: int, request_metadata=None) -> str:
     """Hash the concrete inputs and deadlines so separate runs can be paired."""
     trace = {
         "seed": seed,
@@ -111,9 +113,51 @@ def workload_fingerprint(prompts, sampling_params, arrival_times,
         "ttft_slo_targets_ms": ttft_slo_targets_ms,
         "tpot_slo_targets_ms": tpot_slo_targets_ms,
     }
+    if request_metadata is not None:
+        trace["requests"] = [{
+            "request_id": request.get("request_id"),
+            "prompt_token_hash": request.get("prompt_token_hash"),
+            "prefix_group": request.get("prefix_group"),
+            "content_class": request.get("content_class"),
+        } for request in request_metadata]
     encoded = json.dumps(trace, sort_keys=True, separators=(",", ":"),
                          allow_nan=False).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def trace_arrival_summary(request_metadata: list[dict],
+                          arrival_times: list[float]) -> dict:
+    """Report the declared request rate separately from the finite-trace rate."""
+    modes = {row.get("arrival_mode") for row in request_metadata
+             if row.get("arrival_mode")}
+    rates = {float(row["arrival_rate_requests_per_second"])
+             for row in request_metadata
+             if row.get("arrival_rate_requests_per_second") is not None}
+    source_mode = next(iter(modes)) if len(modes) == 1 else None
+    declared_rate = next(iter(rates)) if len(rates) == 1 else None
+    observed_rate = None
+    if len(arrival_times) > 1 and arrival_times[-1] > arrival_times[0]:
+        observed_rate = (len(arrival_times) - 1) / (
+            arrival_times[-1] - arrival_times[0])
+    reported_rate = (None if source_mode == "burst"
+                     else declared_rate or observed_rate)
+    return {
+        "source_mode": source_mode,
+        "declared_rate_requests_per_second": declared_rate,
+        "observed_rate_requests_per_second": observed_rate,
+        "reported_rate_requests_per_second": reported_rate,
+    }
+
+
+def arrival_description(args) -> str:
+    if args.arrival_mode != "trace":
+        return f"{args.arrival_mode} at {args.arrival_rate:g} req/s"
+    trace = getattr(args, "trace_arrival_summary", {}) or {}
+    source_mode = trace.get("source_mode")
+    rate = trace.get("reported_rate_requests_per_second")
+    if source_mode == "burst" or rate is None:
+        return "burst request trace"
+    return f"{source_mode or 'request'} trace at {rate:g} req/s"
 
 
 def scheduler_list(engine: LLM):
@@ -177,6 +221,8 @@ def create_arrival_engine(args, policy: dict[str, bool]) -> LLM:
 def run_arrival_trace(args, prompts, sampling_params, arrival_times,
                       ttft_slo_targets_ms: list[float],
                       policy: dict[str, bool], *, engine: LLM | None = None,
+                      tpot_slo_targets_ms: list[float] | None = None,
+                      request_metadata: list[dict] | None = None,
                       capture_completion_tokens: bool = False,
                       before_trace: Callable[[LLM], None] | None = None) -> dict:
     torch.manual_seed(args.seed)
@@ -186,7 +232,25 @@ def run_arrival_trace(args, prompts, sampling_params, arrival_times,
         engine = create_arrival_engine(args, policy)
     if not engine.is_finished():
         raise RuntimeError("run_arrival_trace requires an idle, fully drained engine")
+    if tpot_slo_targets_ms is None:
+        tpot_slo_targets_ms = [args.slo_tpot_ms] * len(prompts)
+    if len(ttft_slo_targets_ms) != len(prompts):
+        raise ValueError("TTFT target count must equal the request count")
+    if len(tpot_slo_targets_ms) != len(prompts):
+        raise ValueError("TPOT target count must equal the request count")
+    if request_metadata is None:
+        request_metadata = [{"request_id": f"request-{i:06d}",
+                             "prompt_token_hash": None,
+                             "prompt_tokens": len(prompt),
+                             "user_prompt_tokens": len(prompt),
+                             "prefix_tokens": 0,
+                             "input_length_bucket": input_length_bucket(len(prompt)),
+                             "prefix_group": None,
+                             "prefix_kind": None,
+                             "content_class": None}
+                            for i, prompt in enumerate(prompts)]
     completion_token_ids = {}
+    request_by_seq_id = {}
     try:
         # Compile kernels and warm CUDA without inserting workload prefixes into the cache.
         warmup_count = min(args.warmup_seqs, len(prompts))
@@ -234,12 +298,13 @@ def run_arrival_trace(args, prompts, sampling_params, arrival_times,
             elapsed = now - start
             while (next_request < len(prompts)
                    and arrival_times[next_request] <= elapsed):
-                engine.add_request(
+                seq_id = engine.add_request(
                     prompts[next_request], sampling_params[next_request],
                     submitted_at=start + arrival_times[next_request],
                     ttft_slo_ms=ttft_slo_targets_ms[next_request],
-                    tpot_slo_ms=args.slo_tpot_ms,
+                    tpot_slo_ms=tpot_slo_targets_ms[next_request],
                 )
+                request_by_seq_id[seq_id] = next_request
                 next_request += 1
 
             if engine.is_finished():
@@ -300,7 +365,17 @@ def run_arrival_trace(args, prompts, sampling_params, arrival_times,
             raise AssertionError(
                 f"only {len(set(row_ids))} of {len(prompts)} requests were recorded; "
                 f"the run stopped before every request completed")
-        summary = summarize_requests(metrics, wall, args)
+        if set(row_ids) != set(request_by_seq_id):
+            raise AssertionError("completed request IDs do not match submitted requests")
+        for row in rows:
+            request_index = request_by_seq_id[row["seq_id"]]
+            row["request_index"] = request_index
+            row.update(request_metadata[request_index])
+            row["max_tokens"] = sampling_params[request_index].max_tokens
+            row["ttft_slo_ms"] = ttft_slo_targets_ms[request_index]
+            row["tpot_slo_ms"] = tpot_slo_targets_ms[request_index]
+        summary = summarize_requests(
+            metrics, wall, args, tpot_slo_targets_ms=tpot_slo_targets_ms)
         result = {
             "wall_seconds": wall,
             "summary": summary,
@@ -342,7 +417,52 @@ def run_arrival_trace(args, prompts, sampling_params, arrival_times,
             torch.cuda.empty_cache()
 
 
-def summarize_requests(metrics: dict, wall: float, args) -> dict:
+def _grouped_request_summary(rows: list[dict], wall: float, key: str) -> dict:
+    groups = {}
+    for row in rows:
+        value = row.get(key)
+        label = "unassigned" if value in (None, "") else str(value)
+        groups.setdefault(label, []).append(row)
+    summaries = {}
+    for label, group_rows in sorted(groups.items()):
+        ttft = [(row["t_first_token"] - row["t_submitted"]) * 1000
+                for row in group_rows
+                if row.get("t_first_token") is not None
+                and row.get("t_submitted") is not None]
+        tpot = [(row["t_completed"] - row["t_first_token"]) * 1000
+                / (row["completion_tokens"] - 1) for row in group_rows
+                if row.get("t_completed") is not None
+                and row.get("t_first_token") is not None
+                and row["completion_tokens"] > 1]
+        e2e = [(row["t_completed"] - row["t_submitted"]) * 1000
+               for row in group_rows
+               if row.get("t_completed") is not None
+               and row.get("t_submitted") is not None]
+        joint = [row for row in group_rows
+                 if row.get("ttft_slo_met") is True
+                 and row.get("tpot_slo_met") is True]
+        output_tokens = sum(row["completion_tokens"] for row in group_rows)
+        summaries[label] = {
+            "requests": len(group_rows),
+            "prompt_tokens": summarize(row["prompt_tokens"] for row in group_rows),
+            "output_tokens": output_tokens,
+            "output_tokens_per_second": output_tokens / wall if wall else 0.0,
+            "ttft_ms": summarize(ttft),
+            "tpot_ms": summarize(tpot),
+            "e2e_ms": summarize(e2e),
+            "joint_slo_requests": len(joint),
+            "joint_slo_output_tokens": sum(
+                row["completion_tokens"] for row in joint),
+            "prefix_hit_requests": sum(
+                row.get("prefix_cached_tokens", 0) > 0 for row in group_rows),
+            "prefix_hit_tokens": sum(
+                row.get("prefix_cached_tokens", 0) for row in group_rows),
+        }
+    return summaries
+
+
+def summarize_requests(metrics: dict, wall: float, args,
+                       tpot_slo_targets_ms: list[float] | None = None) -> dict:
     rows = metrics["per_request"]
     ttft = [row["t_first_token"] - row["t_submitted"] for row in rows
             if row["t_first_token"] is not None and row["t_submitted"] is not None]
@@ -364,12 +484,16 @@ def summarize_requests(metrics: dict, wall: float, args) -> dict:
     ]
     joint_slo_output_tokens = sum(row["completion_tokens"] for row in joint_slo_rows)
     stats = metrics["step_stats"]
-    ttft_slo_count = sum(value * 1000 <= args.slo_ttft_ms for value in ttft)
-    tpot_slo_count = sum(value * 1000 <= args.slo_tpot_ms for value in tpot)
+    ttft_slo_count = sum(row.get("ttft_slo_met") is True for row in rows)
+    tpot_slo_count = sum(row.get("tpot_slo_met") is True for row in rows)
     request_slo_rows = [row for row in rows if row.get("ttft_slo_met") is not None]
     request_tpot_slo_rows = [row for row in rows if row.get("tpot_slo_met") is not None]
     request_ttft_targets = [row["ttft_slo_ms"] for row in rows
                             if row.get("ttft_slo_ms") is not None]
+    request_tpot_targets = [row["tpot_slo_ms"] for row in rows
+                            if row.get("tpot_slo_ms") is not None]
+    if tpot_slo_targets_ms is not None and len(tpot_slo_targets_ms) != len(rows):
+        raise ValueError("TPOT target count must equal the completed request count")
     prefill_tps = (stats["prefill_tokens"] / stats["prefill_time"]
                    if stats["prefill_time"] > 0 else None)
     decode_tps = (stats["decode_tokens"] / stats["decode_time"]
@@ -385,7 +509,12 @@ def summarize_requests(metrics: dict, wall: float, args) -> dict:
         "slo_goodput": {
             "ttft_target_ms_min": min(request_ttft_targets, default=None),
             "ttft_target_ms_max": max(request_ttft_targets, default=None),
-            "tpot_target_ms": args.slo_tpot_ms,
+            "tpot_target_ms": (request_tpot_targets[0]
+                                if request_tpot_targets
+                                and min(request_tpot_targets) == max(request_tpot_targets)
+                                else None),
+            "tpot_target_ms_min": min(request_tpot_targets, default=None),
+            "tpot_target_ms_max": max(request_tpot_targets, default=None),
             "joint_slo_requests": len(joint_slo_rows),
             "joint_slo_request_rate_per_second": (
                 len(joint_slo_rows) / wall if wall else 0.0),
@@ -470,6 +599,10 @@ def summarize_requests(metrics: dict, wall: float, args) -> dict:
             "deferred_free_pending_refs": metrics.get(
                 "deferred_free_pending_refs", 0),
         },
+        "by_input_length_bucket": _grouped_request_summary(
+            rows, wall, "input_length_bucket"),
+        "by_prefix_group": _grouped_request_summary(rows, wall, "prefix_group"),
+        "by_content_class": _grouped_request_summary(rows, wall, "content_class"),
     }
 
 
@@ -504,7 +637,7 @@ def comparison_delta(summary: dict, baseline: dict) -> dict[str, float | None]:
         summary["slo_goodput"]["joint_slo_arrival_percent"]
         - baseline["slo_goodput"]["joint_slo_arrival_percent"])
     for metric in ("queue_wait", "ttft", "tpot", "e2e"):
-        for percentile_name in ("p50", "p99"):
+        for percentile_name in ("p50", "p95", "p99"):
             result[f"{metric}_{percentile_name}"] = relative_change(
                 summary[metric][percentile_name], baseline[metric][percentile_name])
     result["ttft_slo_percent_points"] = (
@@ -545,8 +678,10 @@ def parse_args():
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--model", default=os.path.expanduser("~/huggingface/Qwen3-0.6B/"))
     add_workload_args(parser)
-    parser.add_argument("--arrival-mode", choices=("poisson", "constant", "burst"),
-                        default="poisson")
+    parser.add_argument("--arrival-mode",
+                        choices=("auto", "trace", "poisson", "constant", "burst"),
+                        default="auto",
+                        help="auto uses request-file arrivals when present, otherwise poisson")
     parser.add_argument("--arrival-rate", type=float, default=16.0,
                         help="offered request rate for poisson/constant arrivals")
     parser.add_argument("--variants", nargs="+", choices=tuple(variants),
@@ -615,12 +750,40 @@ def main():
     from transformers import AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=True) \
         if args.prompts_file else None
-    prompts, sampling_params = build_workload(args, tokenizer)
-    arrivals = build_arrival_trace(len(prompts), args.arrival_mode,
-                                   args.arrival_rate, args.seed + 1)
-    ttft_slo_targets_ms = build_ttft_slo_targets(
+    workload_data = build_workload_data(args, tokenizer)
+    prompts, sampling_params = workload_data.prompts, workload_data.sampling_params
+    if args.arrival_mode in ("auto", "trace") and workload_data.has_arrival_trace:
+        args.arrival_mode = "trace"
+        arrivals = [request["arrival_time_s"] for request in workload_data.requests]
+    else:
+        if args.arrival_mode == "trace":
+            raise ValueError("--arrival-mode trace requires arrival_time_s on every prompt row")
+        if args.arrival_mode == "auto":
+            args.arrival_mode = "poisson"
+        arrivals = build_arrival_trace(len(prompts), args.arrival_mode,
+                                       args.arrival_rate, args.seed + 1)
+    args.trace_arrival_summary = (
+        trace_arrival_summary(workload_data.requests, arrivals)
+        if args.arrival_mode == "trace" else None)
+    args.reported_arrival_rate = (
+        args.trace_arrival_summary["reported_rate_requests_per_second"]
+        if args.trace_arrival_summary is not None else args.arrival_rate)
+    default_ttft_targets = build_ttft_slo_targets(
         len(prompts), args.min_request_ttft_slo_ms,
         args.max_request_ttft_slo_ms, args.seed + 2)
+    ttft_slo_targets_ms = [
+        request["ttft_slo_ms"] if request["ttft_slo_ms"] is not None
+        else default_ttft_targets[index]
+        for index, request in enumerate(workload_data.requests)
+    ]
+    tpot_slo_targets_ms = [
+        request["tpot_slo_ms"] if request["tpot_slo_ms"] is not None
+        else args.slo_tpot_ms
+        for request in workload_data.requests
+    ]
+    if args.slo_tpot_targets:
+        # Explicit CLI sweeps take precedence over per-request trace defaults.
+        tpot_slo_targets_ms = [args.slo_tpot_ms] * len(prompts)
     variants = variant_table()
     if args.no_decode_burst_yield:
         for options in variants.values():
@@ -636,15 +799,17 @@ def main():
         for raw in args.slo_tpot_targets.split(","):
             target = float(raw)
             name = f"tpot_{target:g}ms"
-            print(f"running {name} ({len(prompts)} requests, {args.arrival_mode}, "
-                  f"{args.arrival_rate:g} req/s, TPOT target {target:g} ms) ...",
+            print(f"running {name} ({len(prompts)} requests, "
+                  f"{arrival_description(args)}, TPOT target {target:g} ms) ...",
                   flush=True)
             saved = args.slo_tpot_ms
             args.slo_tpot_ms = target
             try:
                 result = run_arrival_trace(
                     args, prompts, sampling_params, arrivals, ttft_slo_targets_ms,
-                    base_options)
+                    base_options,
+                    tpot_slo_targets_ms=[target] * len(prompts),
+                    request_metadata=workload_data.requests)
             finally:
                 args.slo_tpot_ms = saved
             runs[name] = result
@@ -677,16 +842,22 @@ def main():
                   f"{summary['prefill_steps']:>14}")
         # 与"最宽松目标"对比，反映收紧目标带来的代价
         widest = max(runs.items(), key=lambda item: float(item[0].split("_")[1][:-2]))
-        _report_and_save(args, runs, variants, prompts, sampling_params, arrivals,
-                         ttft_slo_targets_ms, delta_baseline=widest[0])
+        _report_and_save(
+            args, runs, variants, prompts, sampling_params, arrivals,
+            ttft_slo_targets_ms, request_metadata=workload_data.requests,
+            delta_baseline=widest[0],
+            tpot_sweep_targets_ms=[
+                float(name.split("_")[1][:-2]) for name in runs])
         return
 
     for variant_name in args.variants:
-        print(f"running {variant_name} ({len(prompts)} requests, {args.arrival_mode}, "
-              f"{args.arrival_rate:g} req/s) ...", flush=True)
+        print(f"running {variant_name} ({len(prompts)} requests, "
+              f"{arrival_description(args)}) ...", flush=True)
         result = run_arrival_trace(
             args, prompts, sampling_params, arrivals, ttft_slo_targets_ms,
-            variants[variant_name])
+            variants[variant_name],
+            tpot_slo_targets_ms=tpot_slo_targets_ms,
+            request_metadata=workload_data.requests)
         runs[variant_name] = result
         summary = result["summary"]
         request_tpot = summary["request_tpot_slo_percent"]
@@ -706,12 +877,28 @@ def main():
               flush=True)
 
     _report_and_save(args, runs, variants, prompts, sampling_params, arrivals,
-                     ttft_slo_targets_ms)
+                     ttft_slo_targets_ms, tpot_slo_targets_ms,
+                     workload_data.requests)
 
 
 def _report_and_save(args, runs, variants, prompts, sampling_params, arrivals,
-                     ttft_slo_targets_ms, delta_baseline: str = "baseline") -> None:
+                     ttft_slo_targets_ms, tpot_slo_targets_ms=None,
+                     request_metadata=None,
+                     delta_baseline: str = "baseline",
+                     tpot_sweep_targets_ms: list[float] | None = None) -> None:
     """Write the JSON payload and print the comparison tables for a finished run set."""
+    if tpot_slo_targets_ms is None and tpot_sweep_targets_ms is None:
+        tpot_slo_targets_ms = [args.slo_tpot_ms] * len(prompts)
+    if request_metadata is None:
+        request_metadata = [{"request_id": f"request-{i:06d}",
+                             "prompt_token_hash": None,
+                             "prompt_tokens": len(prompt),
+                             "user_prompt_tokens": len(prompt),
+                             "prefix_tokens": 0,
+                             "prefix_group": None,
+                             "prefix_kind": None,
+                             "content_class": None}
+                            for i, prompt in enumerate(prompts)]
     baseline = runs.get(delta_baseline)
     if baseline:
         baseline_summary = baseline["summary"]
@@ -761,16 +948,36 @@ def _report_and_save(args, runs, variants, prompts, sampling_params, arrivals,
             "warmup_seqs": args.warmup_seqs,
         },
         "variants": {name: dict(options) for name, options in variants.items()},
+        "execution_order": list(runs),
         "workload": {
             "num_requests": len(prompts),
             "arrival_mode": args.arrival_mode,
-            "arrival_rate_requests_per_second": args.arrival_rate,
+            "arrival_rate_requests_per_second": args.reported_arrival_rate,
+            "trace_arrival_summary": args.trace_arrival_summary,
             "arrival_times_seconds": arrivals,
             "ttft_slo_targets_ms": ttft_slo_targets_ms,
-            "tpot_slo_targets_ms": [args.slo_tpot_ms] * len(prompts),
-            "fingerprint": workload_fingerprint(
+            "tpot_slo_targets_ms": tpot_slo_targets_ms,
+            "tpot_slo_targets_ms_by_run": (
+                {name: [float(name.split("_")[1][:-2])] * len(prompts)
+                 for name in runs} if tpot_sweep_targets_ms is not None else None),
+            "fingerprint": (workload_fingerprint(
                 prompts, sampling_params, arrivals, ttft_slo_targets_ms,
-                [args.slo_tpot_ms] * len(prompts), args.seed),
+                [tpot_sweep_targets_ms[0]] * len(prompts), args.seed,
+                request_metadata) if tpot_sweep_targets_ms else workload_fingerprint(
+                    prompts, sampling_params, arrivals, ttft_slo_targets_ms,
+                    tpot_slo_targets_ms, args.seed, request_metadata)),
+            "source": "request_trace" if args.prompts_file else "synthetic",
+            "request_ids": [request["request_id"] for request in request_metadata],
+            "prompt_token_hashes": [request["prompt_token_hash"]
+                                    for request in request_metadata],
+            "prompt_tokens": [request["prompt_tokens"]
+                              for request in request_metadata],
+            "user_prompt_tokens": [request["user_prompt_tokens"]
+                                   for request in request_metadata],
+            "prefix_groups": [request["prefix_group"]
+                              for request in request_metadata],
+            "content_classes": [request["content_class"]
+                                for request in request_metadata],
             "seed": args.seed,
             "shared_prefix_len": args.shared_prefix_len,
             "min_input_len": args.min_input_len,

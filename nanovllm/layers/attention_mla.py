@@ -426,11 +426,14 @@ class MLAAttention(nn.Module):
         v_out = torch.empty(total, h, dv, device=dev, dtype=v_dense.dtype)
         s_cum = torch.cat([torch.zeros(1, dtype=torch.long, device=dev),
                            torch.cumsum(s, 0)])
-        q_cum = q_off.long()
+        q_starts = q_off.long()
+        if q_starts.numel() != R or f.numel() != R:
+            raise ValueError("MLA cache assembly needs one query start and length per row")
         for r in range(R):
             dst = int(seg_start[r])
             cs, ce = int(s_cum[r]), int(s_cum[r + 1])
-            qs, qe = int(q_cum[r]), int(q_cum[r + 1])
+            qs = int(q_starts[r])
+            qe = qs + int(f[r])
             if ce - cs:
                 k_out[dst:dst + ce - cs] = gk_head[cs:ce]
                 v_out[dst:dst + ce - cs] = gv[cs:ce]
