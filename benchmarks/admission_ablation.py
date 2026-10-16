@@ -8,6 +8,7 @@ Run in the WSL inference environment::
 The report compares admission off, admission with cache-hit estimation disabled,
 and the default cache-aware admission policy. ``--variants`` can select a
 subset for parameter sweeps that reuse a separately measured control.
+``--speculative ngram`` enables n-gram decode for a matched online comparison.
 """
 from __future__ import annotations
 
@@ -59,6 +60,8 @@ def parse_args():
     parser.add_argument("--quantization", default="none")
     parser.add_argument("--int4-group-size", type=int, default=128,
                         help="INT4 K-group size; DeepSeek-V2-Lite requires 64")
+    parser.add_argument("--speculative", choices=("none", "ngram"), default="none",
+                        help="speculative decode mode for an online arrival-trace run")
     parser.add_argument("--kv-cache-dtype", choices=("auto", "fp8_e4m3"), default="auto")
     parser.add_argument("--no-swap-kv", action="store_true")
     parser.add_argument("--enforce-eager", action="store_true")
@@ -174,6 +177,7 @@ async def run_variant(args, prompts, sampling_params, arrival_times,
             int4_group_size=args.int4_group_size,
             kv_cache_dtype=args.kv_cache_dtype,
             kv_swap=not args.no_swap_kv,
+            speculative=args.speculative,
             enforce_eager=args.enforce_eager,
             mixed_cudagraph=args.mixed_cudagraph,
             default_ttft_slo_ms=args.slo_ttft_ms,
@@ -396,6 +400,7 @@ async def run_variant(args, prompts, sampling_params, arrival_times,
             "admission": admission,
             "execution_settings": {
                 "enforce_eager": args.enforce_eager,
+                "speculative": args.speculative,
                 "mixed_cudagraph": engine.config.mixed_cudagraph,
                 "kv_cache_dtype": engine.config.kv_cache_dtype,
                 "quantization": engine.config.quantization,
@@ -451,7 +456,8 @@ async def async_main(args, prompts, sampling_params, arrival_times,
     for name, dynamic, cache_aware in variants:
         print(f"running {name}: {len(prompts)} requests, "
               f"{arrival_description(args)} (dynamic={dynamic}, "
-              f"cache_aware={cache_aware}) ...", flush=True)
+              f"cache_aware={cache_aware}, speculative={args.speculative}) ...",
+              flush=True)
         runs[name] = await run_variant(
             args, prompts, sampling_params, arrival_times, dynamic, cache_aware,
             request_metadata=request_metadata,

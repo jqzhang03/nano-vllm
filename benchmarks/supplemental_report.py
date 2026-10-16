@@ -1,7 +1,7 @@
 """Aggregate the 2026-10-15 supplemental experiment outputs.
 
 Run from the repository root after the experiments have written JSON/CSV files.
-Aggregation itself needs no model weights or GPU::
+Aggregation itself needs no model weights or GPU:
 
     python -m benchmarks.supplemental_report
 
@@ -9,7 +9,9 @@ The script writes review tables under ``results/supplemental/report``, charts
 under ``benchmarks/_supplemental_figures``, and refreshes
 ``benchmarks/_supplemental_report.md``. It does not modify benchmark inputs or
 raw results. Charts use PNG when matplotlib is installed and dependency-free
-SVG otherwise.
+SVG otherwise. Tracked dated follow-ups matching
+_supplemental_report_20*.md are appended after the generated 2026-10-15 section
+so report regeneration preserves later experiment records.
 """
 
 from __future__ import annotations
@@ -2470,6 +2472,13 @@ def _write_markdown(path: Path, *, data_dir: Path,
     ))
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines), encoding="utf-8")
+    # Keep dated follow-ups after regenerating the 2026-10-15 aggregate.
+    for addendum in sorted(
+            Path(__file__).parent.glob("_supplemental_report_20*.md")):
+        addition = addendum.read_text(encoding="utf-8").strip()
+        if addition:
+            with path.open("a", encoding="utf-8", newline="\n") as report:
+                report.write(f"\n\n{addition}\n")
 
 
 def main() -> None:

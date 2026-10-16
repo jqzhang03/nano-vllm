@@ -1877,6 +1877,82 @@ free / repeat 的 batch 1/8/32、γ=2/4 扩展中，free 的 α / speedup median
 
 汇总脚本为 [`benchmarks/supplemental_report.py`](benchmarks/supplemental_report.py)，配对表和结论见 [`benchmarks/_supplemental_report.md`](benchmarks/_supplemental_report.md)，配图在 [`benchmarks/_supplemental_figures/`](benchmarks/_supplemental_figures/)。原始 JSON/CSV 留在本地被 Git 忽略的 `results/supplemental/` 下。仍需明确的边界：held-out admission 只有 100 条 prompt 且使用不同到达率，产品拒绝率预算缺失；swap 测量是禁用重算成本比较后的路径诊断；MoE 5×5 重复只覆盖一个在线条件；投机解码只测了 n-gram。
 
+### 10.3.20 2026-10-16 持续到达复测与投机 / FP8 补足
+
+本轮在 RTX 5060 Ti 16GB / WSL2 上测试 Qwen3-0.6B。运行记录的 HEAD 为
+a5a2e0e71d91753e2384285b079aaaf0535b84c6，manifest 均标记 dirty=true；数据对应未提交工作树，
+不能称为 clean-tree 复现。ShareGPT 来源为脱敏用户 prompt；Poisson 到达是合成流量，不是生产日志。
+环境为 Python 3.12.13、PyTorch 2.8.0+cu128、CUDA 12.8、Triton 3.4.0。
+
+#### 调度优化前后配对
+
+500 请求、8 req/s、TTFT≤2,000 ms / TPOT≤80 ms，5 个配对 seed。差值是按 seed 配对均值，
+括号为 bootstrap 95% CI，单位 token/s：
+
+| 配对 | 输出吞吐 | 联合 SLO 输出 goodput | 结论 |
+|---|---:|---:|---|
+| all_on − baseline | +158.8（+9.4～+308.1） | −59.6（−163.0～+37.9） | goodput 区间跨零 |
+| without_tpot_aware − all_on | +113.5（+61.8～+165.2） | +213.9（+47.8～+405.7） | 吞吐 5/5 seed 增加，goodput 4/5 增加 |
+| without_tpot_aware − baseline | +272.3（+111.8～+432.7） | +154.3（−40.2～+323.1） | goodput 区间跨零 |
+
+该负载下关闭 TPOT-aware 改善 all_on；相对 baseline 的 joint-SLO goodput 仍未形成稳定差异，
+因此不据此改变默认策略。2026-10-15 HEAD 143ce1b 的 all_on 负结果继续作为另一批历史数据保存。
+
+#### 准入、KV 容量与 FP8
+
+Admission 校准 / held-out 各使用 250 请求、96 req/s、TTFT≤2,000 ms / TPOT≤80 ms，分别为
+3/2 个 seed，每次对照共享 workload fingerprint。Admission-off 每次零拒绝且 goodput 高于
+cache-blind 与 cache-aware。校准配对 goodput 差为 −893 token/s（95% CI −1,173～−723）和
+−685（−817～−596）；动态策略拒绝率约 31%–34%。没有产品拒绝率预算，仍不推荐默认阈值。
+
+BF16 / FP8 E4M3 在线容量矩阵各 24 点、每点 3 次，无失败；池容量为 425 / 827 blocks，即
+108,800 / 211,712 token slots（1.946×）。4096-token prompt、并发 4 时，BF16 12/12 请求同时
+满足 TTFT/TPOT SLO，FP8 为 4/12；并发 32 时两者都没有请求同时满足联合 SLO。容量提升未转化为
+稳定 SLO 改善。
+
+FP8 teacher-forced 检查使用 250 calibration + 250 held-out prompts，并固定 BF16 continuation，
+比较 decode position 1/8/32/64/128。margin 1.0/1.1/1.25 没有全面胜者；margin 1.25 的 held-out
+饱和计数 K=0/V=1，margin 1.0 为 K=338/V=53。见
+kv_fp8_teacher_forced_20261016.json、context_kv_bf16_20261016.json 和
+context_kv_fp8m11_20261016.json。
+
+#### N-gram、Medusa 与 EAGLE
+
+固定长度 greedy none/ngram 正确性校验覆盖 repeat、JSON × batch1 × gamma2/4 × seed42，4/4 输出
+fingerprint 匹配；单 seed 不作为吞吐结论。随机采样、natural-stop、max output 128 的分层 screen
+完成 90/90 配对，覆盖 repeat、JSON、
+structured、ShareGPT、open-ended × batch 1/8/32 × gamma 2/4 × 3 seeds；所有运行都到达输出上限，
+EOS=0。初次 screen 在 78/90 后因 WSL 内存和 swap 用尽退出；中断 JSON/CSV 已保留，剩余配对从
+checkpoint resume。该数据不是有效的自然 EOS 测量。
+
+ShareGPT 使用 Qwen3 chat template、batch 8、512-token cap 后触发 EOS。离线 gamma2 吞吐中位差
++9.44%（2/3 胜，95% CI −8.57%～+15.41%）；gamma4 +5.21%（3/3 胜，+2.15%～+9.39%），每轮 8
+个请求，属于小样本筛查。N-gram 在线重复合成文本（100 请求、cap96）在 8/16 req/s 的中位吞吐差
+分别为 +2.57% / +3.14%，两侧每轮均 100/100 请求达联合 SLO。Chat-template ShareGPT 在线
+4 req/s、100 个 held-out prompt、cap512 的吞吐变化为 +0.19%、−5.03%、+2.47%，中位 +0.19%、
+均值 −0.79%，未见稳定服务收益。
+
+Gamma2 checkpoint smoke 中 EAGLE 可生成，Medusa 因 checkpoint/head 数量与 gamma2 实例不匹配而无法加载；
+gamma4 的 Medusa/EAGLE 均可加载。Gamma4 greedy、batch8、3 seeds 的 Medusa alpha 为 0.010–0.014，
+中位吞吐差 +9.27%（2/3 胜，
+95% CI −6.22%～+10.86%）；EAGLE alpha 为 0.047–0.051，吞吐差 −35.79%（0/3 胜，
+−36.62%～−34.00%）。两种模式与 baseline 输出 token fingerprint 均为 0/3 匹配。Medusa 正向
+中位数不视为等质量加速；EAGLE 在该条件下为负收益。
+
+#### 多模型与 MLA / MoE 诊断
+
+INT4 streaming-load smoke 中，Qwen2.5-7B、Mistral-7B-v0.1、Llama-3.1-8B 均完成 16/16 请求；
+三模型并发 / 上下文矩阵仍未执行。MLA query assembly 已改为逐行使用
+query_end = query_start + query_length。改后 seed42、8 req/s、16 请求的独立诊断中 5 对 token parity
+为 5/5，focus logits 相同为 5/5，固定 KV 行置换 replay 检查为 10/10。历史 seed42、32 req/s、
+24 请求的 divergence 条件没有重跑，最早不同 KV 写入仍未定位。诊断耗时不作为性能结果。
+
+复现实验脚本与详细表见 [supplemental follow-up report](benchmarks/_supplemental_report_20261016.md)；
+原始文件保存在被 Git 忽略的 results/supplemental/。主要记录包括
+scheduling_clean_a5a_paired_summary.json、admission_matched_*_20261016.json、
+spec_natural_screen_20261016.json、spec_medusa_eagle_greedy_sharegpt_chat_b8_g4_seed012_20261016.json
+及 moe_int4_arrival_diag_seed42_r8_n16_i64_o64_focus5_14_rep5_20261016.json。
+
 ### 10.4 Profiling
 
 **torch.profiler（CPU 侧；WSL 下 CUPTI 不可用，无 CUDA kernel 时间）**：

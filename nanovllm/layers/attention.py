@@ -373,8 +373,13 @@ class Attention(nn.Module):
         self.inv_k_scale = 1.0
         self.inv_v_scale = 1.0
         self.calibrating = False             # 校准阶段：记录本层K/V的max|·|
+        self.eval_collect_fp8_stats = False
         self.cal_max_k = 0.0
         self.cal_max_v = 0.0
+        self.cal_saturated_k = 0
+        self.cal_saturated_v = 0
+        self.cal_elements_k = 0
+        self.cal_elements_v = 0
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
         context = get_context()
@@ -388,8 +393,29 @@ class Attention(nn.Module):
                else context.prefill_block_tables)
         # 校准时记录K/V动态范围（在store之前）
         if self.calibrating:
-            self.cal_max_k = max(self.cal_max_k, k.abs().max().item())
-            self.cal_max_v = max(self.cal_max_v, v.abs().max().item())
+            if self.eval_collect_fp8_stats:
+                max_k = k.abs().max().detach()
+                max_v = v.abs().max().detach()
+                self.cal_max_k = (max_k if not isinstance(self.cal_max_k, torch.Tensor)
+                                  else torch.maximum(self.cal_max_k, max_k))
+                self.cal_max_v = (max_v if not isinstance(self.cal_max_v, torch.Tensor)
+                                  else torch.maximum(self.cal_max_v, max_v))
+            else:
+                self.cal_max_k = max(self.cal_max_k, k.abs().max().item())
+                self.cal_max_v = max(self.cal_max_v, v.abs().max().item())
+            if self.use_fp8 and self.eval_collect_fp8_stats:
+                scaled_k = k.float().abs() * self.inv_k_scale
+                scaled_v = v.float().abs() * self.inv_v_scale
+                saturated_k = (scaled_k > 448.0).sum(dtype=torch.int64)
+                saturated_v = (scaled_v > 448.0).sum(dtype=torch.int64)
+                if not isinstance(self.cal_saturated_k, torch.Tensor):
+                    self.cal_saturated_k = saturated_k
+                    self.cal_saturated_v = saturated_v
+                else:
+                    self.cal_saturated_k.add_(saturated_k)
+                    self.cal_saturated_v.add_(saturated_v)
+                self.cal_elements_k += k.numel()
+                self.cal_elements_v += v.numel()
         if k_cache.numel() and v_cache.numel():
             if self.use_fp8:
                 # 写路径：先用本层固定scale量化为fp8（E4M3）。

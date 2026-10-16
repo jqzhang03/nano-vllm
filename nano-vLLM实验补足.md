@@ -2,207 +2,175 @@
 
 
 
-# nano\-vLLM：RTX 5060 Ti 16GB 单卡补充实验方案
+# nano\-vLLM 下一阶段实验工作与详细步骤（截至 2026\-10\-16）
 
-目标：把项目中目前缺少真实请求负载、准入与 SLO 阈值未校准、KV 容量与并发边界不清、算子收益波动、投机解码效果随内容变化等问题，转成可复现的实验。所有数值都应由这轮实验实测后再写入简历；本文中的历史数据只作实验起点，不作为新实验结论。
+**目标：**把已经补做的实验收敛成可复现、能区分功能正确性与服务收益的下一轮计划。以下优先补齐现有结论的证据缺口，不把单次筛查或 kernel 微基准写成端到端加速。
 
-## 本轮执行结果与结论（2026-10-15）
+|方向|已有证据|目前缺口|
+|---|---|---|
+|多模型支持|RTX 5060 Ti 16GB、INT4 streaming-load 下，Qwen2.5-7B、Mistral-7B-v0.1、Llama-3.1-8B 均通过 16/16 请求生成 smoke。|尚未完成三模型的并发 × 上下文矩阵；smoke 不代表长时间稳定服务边界。|
+|调度优化|2026-10-16 当前工作树 5-seed 配对中，关闭 TPOT-aware 相对 all_on 的联合 SLO 输出 goodput 增加均值 213.9 token/s（95% CI +47.8 至 +405.7）；相对 baseline 的 CI 跨零。10-15 的历史负结果单独保留。|本轮只完成 baseline/all_on/without_tpot_aware；其它策略及更多到达率仍需消融。Poisson 到达是合成负载。|
+|准入|250-request calibration 与 held-out trace 各 3/2 个 seed、96 req/s；admission-off 每次零拒绝且 goodput 高于 cache-blind/cache-aware。|两种动态准入在 calibration 中拒绝约 31%–34%；没有产品拒绝预算，不能据此推荐默认阈值。|
+|算子优化|修正 MLA query range 为逐行 start + qlen 后，seed42、8 req/s、16 请求的 5 对诊断均 token parity，focus logits 5/5 相同，行置换 replay 10/10 通过。|历史 32 req/s、24 请求的分歧条件本轮未重跑；仍未定位首个不同 KV 状态。本轮是诊断而非性能测量。|
+|量化与投机解码|FP8 已补 250 calibration + 250 held-out 的 decode position 1/8/32/64/128 teacher-forced 精度评测；BF16/FP8 在线容量分别 108,800/211,712 token slots。N-gram 已有自然停止及在线 A/B；gamma4 Medusa/EAGLE checkpoint 均可加载。|FP8 margin 无全面胜者且未提高各点 SLO；N-gram 在线收益只在重复合成文本较稳定；gamma4 Medusa/EAGLE greedy 输出 parity 均为 0/3。|
 
-本轮已按方案补做调度、准入、KV、INT4 MoE 和 n-gram 投机解码实验。这里记录实际跑过的条件；真实 ShareGPT prompt 配合的是合成 Poisson 到达过程，不是生产请求日志。原始 JSON/CSV 留在本机被 Git 忽略的 `results/supplemental/`，汇总与图表见 [`benchmarks/_supplemental_report.md`](benchmarks/_supplemental_report.md) 和 [`benchmarks/_supplemental_figures/`](benchmarks/_supplemental_figures/)。
+## 0\. 统一实验口径与复现门槛（P0）
 
-- **真实 prompt 与调度**：清理后的 500 条 ShareGPT 用户 prompt，8 req/s、5 个配对 seed。trace 中的 `max_tokens` 由对应 assistant 回复 token 长度截断生成，参考回复文本不作为模型输入；到达时间由 Poisson 合成，没有线上到达日志。seed0 结果的 500 个 request ID、输出预算和到达时间均与生成 trace 匹配。`all_on` 相对 baseline 的输出吞吐均值下降 6.50%（配对 bootstrap 95% CI：-7.99%～-4.52%），联合 SLO 输出 goodput 均值下降 59.09%（-68.30%～-49.89%）；两项都在 5/5 个 seed 下降。当前结论不支持默认启用整组策略。
-- **准入**：完成 400 请求、96 req/s 的 12 点 target/work 网格（TPOT≤20 ms），以及 24 点 soft-pressure/max-wait 细化（TPOT≤80 ms）；两阶段 SLO 不同，结果不能合成一条 Pareto 曲线。候选 `500/5000/1.0/500` 在 3-seed、TPOT≤80 ms 校准中位拒绝率/goodput 为 58.2%/4458 token/s，admission-off 为 33.8%/5217 token/s；TPOT≤20 ms 时候选 goodput 为 1607 token/s、admission-off 为 0，TPOT≤40/80/120 ms 时候选均低于 admission-off。Held-out 只有 100 条 prompt、384 req/s、2 个 seed，与 calibration 负载不同；该候选中位 goodput 为 3774 对 4507 token/s，拒绝率 16.5% 对 0%。没有产品拒绝率预算，因此不推荐新的默认阈值。
-- **KV 容量与 swap**：当前 Qwen 配置的 synthetic pool 实测 BF16 为 425 blocks / 108,800 token slots，FP8 E4M3 为 835 / 213,760；这只是该配置的容量账本，没有测到 OOM 或物理容量极限。默认成本策略下观察到的 2 次抢占都选择重算。关闭重算成本比较后做的 3 次路径诊断中，swap-on 为 470.2 token/s（12 次 swap），no-swap 为 511.4 token/s（0 次 swap），不能据此宣称 swap 带来性能收益。FP8 held-out 比较仅覆盖 16 条 prompt 的首个 decode logits，不代表长文本质量。
-- **INT4 MoE**：DeepSeek-V2-Lite、TP=1、group64 的 split/fused 在 26 层 × 2 seed × 5 row count 中都对 loop bitwise 匹配（每种实现 260/260）；microbenchmark fused 为 11.90×～42.95×，仅代表 kernel 局部。36 组在线初筛每组一次，吞吐中位变化 +0.91%（-14.94%～+23.07%），只有 19/36 组输出完全一致。另一个 8 req/s、128 输出、100 ms TPOT 条件完成 5 seeds × 5 repeats：吞吐中位变化 +0.51%（-12.87%～+16.46%，均值 95% CI -0.35%～+5.11%），输出完全一致 14/25 组。该重复只覆盖一个 workload，仍不证明稳定服务收益，fusion 保持实验选项。MLA query range 修正后的复现仍有 1/16 请求输出不同。
-- **投机解码**：完成 n-gram 的内容分层与 batch/γ 扩展（报告共 102 次运行，固定 96-token 输出）。重复文本接受率高于 ShareGPT、开放问答和结构化内容；α 与样本中的 4-gram 重复率相关（Spearman ρ=0.929），不是对总体请求的因果结论。没有测试自然停止，也没有可用的 Medusa/EAGLE draft 权重。
+1. 复跑关键结论。2026-10-16 的调度、准入、量化与投机结果记录为 HEAD a5a2e0e71d91753e2384285b079aaaf0535b84c6，manifest 标记 git_worktree_dirty=true；这些是当前改动工作树上的复测，不能称为干净提交复现。提交最终选定改动后，仍需在 clean tree 上复跑代表性对照。结果 manifest 应保留 commit、dirty 状态、模型 revision、Python/PyTorch/CUDA/Triton/flash-attn 版本、GPU 时钟/温度和完整命令。
 
-因此，本轮交付的是按上述 workload 可复核的实测结果，而不是对全部计划维度的通用结论。后续若要推荐准入阈值，仍需业务拒绝率预算和匹配 calibration/held-out 负载；若要验证 serving 优化，仍需在更多 MoE workload 上重复配对，并取得真实到达日志及可用的 Medusa/EAGLE 权重。
+2. 固定请求 trace。沿用 benchmarks/sharegpt\_trace\.py 生成的脱敏 user prompt；assistant 回复只用于派生截断的 max\_tokens，不作为模型输入。保存 trace 文件 SHA256、逐请求 prompt token hash、max\_tokens、arrival\_time\_s、prefix\_group 和 SLO。把合成 Poisson 到达明确标作合成流量；若使用合成公共前缀，也单独标记为 synthetic。
 
-## 0\. 统一实验口径与环境
+3. 成对运行必须使用同一批 tokenized prompts、到达时间、采样配置和 workload fingerprint。每个变体使用新 engine，预热与计时分开；交替执行 A/B 顺序，运行前清空指标和 prefix KV。每个 seed 的记录数必须和去重后的 request\_id 数一致。
 
-- 硬件基线：单张 RTX 5060 Ti 16GB，TP=1；优先使用仓库已覆盖的 Qwen3\-0\.6B BF16 跑调度、准入、容量和投机实验。MoE 算子实验使用仓库现有的 DeepSeek\-V2\-Lite INT4 group64 配置。切换模型、量化或 KV dtype 后要重新测量，不能把一个模型的结论外推到另一个模型。
+4. 校准与 held\-out 分开。screen 使用 3 个 seed；候选结果至少 5 个配对 seed。held\-out 使用未参与选参数的 prompt 子集，但 request 数、到达率、prompt 长度分布、输出预算、前缀比例和 SLO 与 calibration 一致。配对比较按 seed 计算差值并给出 95% bootstrap CI。
 
-- 记录软件与硬件状态：仓库 commit、Python/PyTorch/CUDA/Triton/flash\-attn 版本、GPU 型号、显存、GPU 温度/核心时钟、模型路径和量化配置；确认运行的 nanovllm 源码来自当前 checkout。实验期间关闭其他 GPU 任务，不锁频、不改功耗参数。
+5. 统一口径：同时报告 TTFT/TPOT/E2E p50、p95、p99，输出 token/s、满足 TTFT 与 TPOT 两个 SLO 的输出 token goodput、请求达标率、接收/拒绝率、KV 抢占与 swap、峰值显存。goodput 分母使用测试墙钟时间；拒绝请求不能从到达请求统计中消失。
 
-- 成对对照：baseline 与优化版本使用完全相同的 prompt token IDs、输出上限、到达时间、采样配置和 seed；保存 workload fingerprint。两边交替运行顺序，避免温度和时钟漂移总偏向某一组。
+## 1\. 多模型支持：从“能加载”补到“能稳定服务”
 
-- 预热与重复：每个配置先预热；探索阶段至少 3 个 seed，候选结论至少 5 个配对重复。冷启动/CUDA Graph 首次 capture 和稳定态分开计时。每次开始前清空或重置指标与 prefix KV，避免前一轮缓存污染后一轮。
+**要回答的问题：**已测的 INT4 streaming\-load 显存值是否能在三个 checkpoint 上转化为端到端可用的上下文与并发范围。
 
-- 统一报告：请求数、输入/输出 token 分布、到达模式、TTFT/TPOT/E2E 的 p50/p95/p99、输出 token/s、接收率/拒绝率、KV 抢占与 swap、GPU 峰值显存。SLO goodput 定义为同时满足 TTFT 与 TPOT 目标的请求所生成 token 数除以测试墙钟时间；同时报告请求 goodput 和被接收请求比例，避免只看被服务请求的尾延迟。
+1. 固定 Qwen2\.5\-7B、Mistral\-7B、Llama\-3\.1\-8B 的 checkpoint revision、tokenizer、权重格式、量化方式和 group size。不同 checkpoint 若量化格式不同，分别记录配置，不把不同量化格式的结果当成同条件比较。
 
-- 原始数据保存在 JSON，汇总表另存 CSV；记录每次命令、配置、seed 和 fingerprint。对有波动的优化用配对差值和 bootstrap 95% 置信区间报告，不挑单次最好结果。
+2. 先做每模型 16 条 prompt 的 smoke：短/中/长 prompt 各覆盖，greedy 生成 32 tokens；检查模型加载、首 token、EOS、输出长度、异常退出、峰值显存。失败时保留完整错误和模型配置，不只记录成功模型。
 
-## 1\. 补真实请求负载：从合成 prompt 到 ShareGPT trace
+3. 通过 smoke 后，使用同一组 100 条脱敏用户文本，按各模型 tokenizer 重新分为 128–256、257–512、513–1024、1025–2048 token 桶；输出上限固定 64。分别测并发 1/2/4/8，每点 3 次独立进程重复。上下文总长度不得超过模型位置上限。
 
-### 已完成 trace loader 与剩余边界
+4. 每个模型记录 load time、权重与 KV 显存、TTFT/TPOT/E2E 分位数、输出 token/s、OOM/抢占数和完成率。若要评估量化质量，额外用相同 teacher\-forced token 前缀比较 BF16 与量化 logits；只测显存不能得出质量或吞吐结论。
 
-**bench\.py**、**scheduling\_ablation\.py** 和 **admission\_ablation\.py** 已支持 JSONL request trace，包括 `request_id`、`max_tokens`、`arrival_time_s`、prefix 元数据与请求级 SLO；prompt-only 格式仍兼容。**sharegpt\_trace.py** 生成脱敏 ShareGPT trace，使用参考 assistant 回复 token 长度派生输出预算但不保存回复文本，按 Poisson 或 constant 等模式合成到达；**derive\_trace\_variants.py** 派生 smoke、calibration、held-out 和共享前缀变体。当前配对调度/准入筛查使用 Poisson；共享前缀变体采用合成的 256-token 公共模板，没有使用真实 system prompt。当前没有生产到达日志，因此不能外推真实到达间隔分布。
+**通过标准：**三次重复均能加载并完成所有请求，报告每个模型的可服务边界。模型之间只报告各自结果；优化收益必须在同一模型、同一 checkpoint、同一负载下做成对比较。
 
-### 负载准备
+## 2\. 调度优化：定位 all\_on 回退，并在真实前缀上验证缓存价值
 
-1. 从 ShareGPT/LMSYS 公开数据中抽取 100 条作为冒烟集，再准备 300–500 条用于正式统计。每条只保留用户输入；去除个人信息、超长异常样本和空请求。将原始 assistant 回复长度仅作为输出预算的来源，不把参考回复直接喂给模型。
+**现有结论：**all\_on 在 500 请求、8 req/s 的 5 个配对 seed 上同时降低输出吞吐和联合 SLO goodput，不应继续作为整体优化结论。固定 512\-token 合成前缀的 128 请求测试曾把 prefill 工作量从 77,824 降至 25,393 tokens（约 67%）；下一步要验证实际重复 system prompt 的效果。
 
-2. 按 tokenizer 统计 prompt 长度，分桶为 1–256、257–512、513–1024、1025–2048 tokens；正式 workload 尽量覆盖真实比例，同时保留每个长度桶单独跑的结果，避免总体均值掩盖长 prompt。
+### 2\.1 调度策略逐项消融
 
-3. 已生成 request trace JSONL，包含 **request\_id**、**prompt**、**max\_tokens**、**arrival\_time\_s**、**prefix\_group**、**ttft\_slo\_ms**、**tpot\_slo\_ms** 和 tokenized prompt hash。workload loader 已支持这些字段，并保留老格式 **\{"prompt":"\.\.\."\}** 兼容。
+1. 使用固定 500 请求 ShareGPT trace，Qwen3\-0\.6B BF16、Poisson 8 req/s、TTFT≤2,000 ms、TPOT≤80 ms；同一轮运行 baseline、all\_on、without\_tpot\_aware、without\_multi\_step\_decode、without\_slo\_adaptive、without\_cache\_affinity、without\_aging。
 
-4. trace builder 和 benchmark 支持 burst、constant（2/4/8/16 req/s）及 Poisson。当前 ShareGPT 调度/准入配对报告使用 Poisson；没有在相同配对矩阵中覆盖 burst/constant，也没有线上到达日志，结论表述为“真实 prompt + 合成到达过程”。
+2. 先以 3 个 seed 筛查；只把有改善迹象的策略扩展到 5 个配对 seed。每个 seed 变体之间校验 prompt/arrival fingerprint 完全一致。筛查通过后，再在 4/8/16/24 req/s 的负载点复测；如要研究 TPOT 目标影响，20/40/80 ms 分开成组比较，不把不同 SLO 的数据拼成同一条曲线。
 
-5. 已完成 0%/20%/50% 共享前缀准入对照；20%/50% 条件使用合成的 256-token 公共模板，没有验证真实 system/template 前缀。合成前缀用于单独验证 prefix cache，不能与真实公共前缀结果混报。
-
-### 执行与对照
-
-已完成 prompt-only 输入和 request trace 两种路径。正式筛查使用保存的请求 ID、ShareGPT prompt 与参考回复派生的 `max_tokens` 预算；到达时间使用可复现的 Poisson 合成 trace。所有策略在同一 workload fingerprint 上配对，输入输出预算固定，到达过程不代表线上日志。
+3. 结果表至少包含吞吐、联合 SLO goodput、TTFT/TPOT p50/p95/p99、排队等待、抢占、prefix hit tokens 和各策略计数。若 all\_on 回退，结合单项消融和队列/配额计数说明主要回退来自哪条策略；若 CI 跨零，结论写“未观察到稳定收益”。
 
 ```bash
-mkdir -p results/supplemental
-MODEL_DIR=~/huggingface/Qwen3-0.6B
-python benchmarks/scheduling_ablation.py --model "$MODEL_DIR" --prompts-file datasets/sharegpt_100.jsonl --num-seqs 100 --arrival-mode poisson --arrival-rate 8 --variants baseline all_on --seed 0 --output results/supplemental/sharegpt_poisson_8rps_seed0.json
+MODEL_DIR=/path/to/Qwen3-0.6B
+TRACE=datasets/sharegpt_500.jsonl
+python benchmarks/scheduling_ablation.py --model "$MODEL_DIR" --prompts-file "$TRACE" --num-seqs 500 --arrival-mode poisson --arrival-rate 8 --variants baseline all_on without_tpot_aware without_multi_step_decode without_slo_adaptive without_cache_affinity without_aging --slo-ttft-ms 2000 --slo-tpot-ms 80 --seed 0 --output results/supplemental/schedule_seed0.json
 ```
 
-- 初始对照用 **baseline**、**all\_on**；之后针对差异最大的策略做单项消融，如 **without\_tpot\_aware**、**without\_slo\_adaptive**、**without\_multi\_step\_decode**。
+### 2\.2 Prefix Caching 与准入策略
 
-- 每种到达模式至少跑 3 个 seed；正式结果增加到 5 个 seed。固定同一 trace fingerprint，核对每个变体都完成或明确记录全部 100% 请求，避免重复 request 记录造成提前结束。
+1. 若目标服务有固定 system prompt，构造真实重复前缀 trace：0%、20%、50%请求共享相同 system prompt，前缀长度按实际 tokenizer 结果及 block 对齐；用户正文保持不同。没有可用线上 prompt 时继续用合成模板，但结论限定为 synthetic prefix。
 
-### 观察指标与判定
+2. 准入只保留已筛出的候选，不再重复大网格：dynamic\_off、dynamic\_on\_no\_cache、dynamic\_on\_cache\_aware；候选参数比较 500/5000/1\.0/500 与 2000/10000/1\.0/500（依次为 target TTFT ms / work budget ms / soft pressure / max wait ms）。在 24 req/s 的 0/20/50% prefix 条件及无共享前缀的 48/96 req/s 压力点分别测量。
 
-- 按长度桶报告 TTFT/TPOT/E2E 分位数、输出 token/s、抢占数、队列等待时间和 SLO goodput；对共享前缀场景额外报告 prefix hit tokens/requests。
+3. 先用 calibration 子集 3 个 seed，再用不重叠的 held\-out prompt 子集 2 个 seed。calibration 和 held\-out 都使用 400 个请求、相同 offered rate、到达分布、输出上限和 SLO；不要再用 400 请求/96 req/s calibration 对比 100 请求/384 req/s held\-out。
 
-- 对比 prompt\-only 合成输出长度与 trace replay 的差异，说明“真实 prompt”本身不足以代表真实 serving 负载，输出长度和到达过程也需要匹配。
+4. 按“拒绝率—全到达请求联合 SLO goodput—p99 TTFT”画 Pareto 图，同时报告接收请求达标率、defer/reject 数、拒绝原因和估算 cache hit 与真实复用 token 的误差。不同 TPOT SLO 分开画。
 
-- 交付物：脱敏 JSONL trace、trace builder、各变体 JSON/CSV、fingerprint 校验结果、分长度和分到达率图表。
+**决策规则：**目前没有业务拒绝率预算，所以不推荐新的默认拒绝阈值。只有某个候选在 held\-out 上提升联合 goodput、满足明确的拒绝率上限且置信区间不跨零时，才把它作为限定负载下的可选 operating point。
 
-## 2\. 校准准入策略与 TTFT/TPOT SLO
+## 3\. 算子优化：先定位在线分歧，再决定是否保留融合
 
-### 实验目标与起点
+**现有结论：**INT4 segment kernel 固定输入正确性和微基准结果较强，但在线收益仍在噪声范围内。2026-10-16 修正 MLA query range 后，在 seed42、8 req/s、16 请求的独立诊断中 5 对均无 token 分歧，行置换 replay 也通过；历史 seed42、32 req/s、24 请求的分歧条件没有重跑，根因仍未定位。性能筛查前仍需在原 workload 上追踪首个不同状态，避免误归因到 fused GEMM。
 
-目标是在给定拒绝率/延迟要求下找到合理的 admission 参数，而不是只让接收请求的 p99 变好。已有 24 req/s、128 请求过载结果显示：无准入吞吐约 1611 tok/s、TTFT 目标达标率 26\.6%；cache\-aware 准入接受率 15\.6%、接受请求 TTFT 达标率 95%、吞吐约 777 tok/s。这说明需要同时展示吞吐、达标率和拒绝代价，且 2 s 准入目标仍需按 workload 校准。
+1. 在 DeepSeek\-V2\-Lite、TP=1、INT4 group64、eager、固定 greedy 输入上复现 seed42、8 req/s、16 请求、64\-token 输入/输出的在线差异，至少重复 5 次 split/fused 配对。保存每个请求的 prompt/output fingerprint、model\-call shape histogram、request row order、block table、slot mapping 和逻辑 KV 行序。
 
-### 校准步骤
+2. 对首个不同请求与 token 做逐层对齐：比较输入 hidden、router top\-k 与 expert assignment、gate/up/down 输出、attention 输入/输出、KV 写入位置和 logits；沿 prefill 到该 decode position 回溯，报告最早不同的 tensor、层、token position 与误差。先判断是数值差、缓存索引/生命周期还是请求重排，再针对根因修改。
 
-1. 使用第 1 节的 ShareGPT trace，先关闭准入在 2/4/8/12/16/24 req/s 上做容量扫描；找到联合 SLO 开始明显失守的 offered rate。低于饱和点且 admission 从不触发的结果只作为正确性对照，不用于选阈值。
+3. 根因修复后重新跑固定 shape parity。之后才执行在线性能筛查：8/16/24 req/s、64/128 输出 token、TPOT 100/125/150 ms；筛查 3 seeds × 2 repeats，选中的负载扩大为 5 seeds × 5 repeats。split/fused 交替运行，固定输入 trace 和采样配置。
 
-2. 选“刚开始失守”和“明显过载”两档压力，固定同一请求 trace，对比 **dynamic\_off**、**dynamic\_on\_prefix\_cache\_unaware**、**dynamic\_on**。测试 0%/20%/50% 共享前缀，区分准入估算本身和 prefix\-cache 感知的影响。
-
-3. 分两阶段扫参数以控制成本：先扫 **admission\_target\_ttft\_ms** 500/1000/2000/3000 ms 与 **admission\_work\_budget\_ms** 2000/5000/10000 ms；再围绕表现最好的两组扫 **admission\_soft\_pressure** 0\.5/0\.7/0\.85/1\.0 和 **max\_admission\_wait\_ms** 500/2000/5000 ms。TPOT SLO 用 20/40/80/120 ms 形成可行性曲线，不能只挑容易达到的目标。
-
-4. 用 seed 0–2 做调参，seed 3–4 和未见过的 prompt 子集做 held\-out 验证。准入参数在 validation 集上不再继续调。
-
-### 运行示例
+4. 同时报告 kernel latency、端到端输出 token/s、joint\-SLO goodput、TTFT/TPOT、token parity、形状直方图和配对置信区间。若端到端收益区间跨零，融合保留为实验选项；不能用 11\.90×–42\.95× 的 kernel\-local speedup 替代服务收益。
 
 ```bash
-MODEL_DIR=~/huggingface/Qwen3-0.6B
-python benchmarks/admission_ablation.py --model "$MODEL_DIR" --prompts-file datasets/sharegpt_100.jsonl --num-seqs 100 --arrival-mode poisson --arrival-rate 16 --shared-prefix-len 256 --slo-ttft-ms 2000 --slo-tpot-ms 80 --admission-target-ttft-ms 2000 --admission-work-budget-ms 5000 --admission-soft-pressure 0.85 --max-admission-wait-ms 2000 --seed 0 --output results/supplemental/admission_16rps_seed0.json
+python benchmarks/moe_int4_fuse_sweep.py --model /path/to/DeepSeek-V2-Lite --seeds 7,17,42 --arrival-rates 8,16,24 --output-lengths 64,128 --num-seqs 24 --input-length 64 --int4-group-size 64 --slo-tpot-targets 100,125,150 --repeats 2 --sampling-mode greedy --output results/supplemental/moe_fuse_screen.json
 ```
 
-示例只表示命令入口；正式矩阵需分别改变到达率、SLO 和 admission 参数，并在不同 seed 上复跑。
+## 4\. 量化与投机解码：补多步精度、在线容量和自然停止
 
-### 指标与选点
+### 4\.1 FP8 KV 与 swap
 
-- 报告 arrived/accepted/deferred/rejected 数、接受率、拒绝原因、准入等待 p50/p95、预测 TTFT、实际 TTFT/TPOT/E2E、接受请求 SLO 达成率、全到达请求 SLO goodput、输出 token/s、prefix 估算误差和 KV 压力。
+1. 校准集与 held\-out 完全分离。held\-out 扩到至少 200 条 prompt，覆盖短/长文本、代码、数字和不同上下文长度；保持现有 scale margin 1\.0/1\.1/1\.25 对照。
 
-- 先画“请求拒绝率—联合 SLO goodput—p99 TTFT”的 Pareto 曲线。若没有业务给定的最大拒绝率，不宣称某一组参数是最优默认值；展示可选 operating points，并把 held\-out 结果作为校准有效性的证据。
+2. 当前 kv\_fp8\_calibrate\.py 只比较首个 pure decode logits。新增 teacher\-forced 多位置评测：先用 BF16 生成并固定一段目标 continuation，再把同一 token 前缀输入 BF16 与 FP8 KV，比较 decode position 1/8/32/64/128 的 top\-1、top\-5 overlap、KL、logit error 和 E4M3 饱和计数。这样避免两个生成路径在首 token 分歧后比较到不同上下文。
 
-- 交付物：参数 sweep 表、Pareto 图、held\-out 验证结果、推荐参数及其适用负载范围。
+3. 在 Qwen3\-0\.6B 上做 BF16 KV 与 FP8 E4M3 KV 在线矩阵：prompt 512/1024/2048/4096、并发 1/2/4/8/16/32、输出 64；确保输入加输出不超过模型长度上限。两种 dtype 都关闭 swap，逐级增加并发，记录实际 blocks/token slots、峰值显存、preemption、完成率、TTFT/TPOT 与 joint\-SLO goodput。需要时为压测脚本增加逐点捕获 CUDA OOM 并写出部分 JSON 的逻辑，避免一次 OOM 丢掉整批结果。
 
-## 3\. 测 KV 容量与并发边界
+4. 只在确实出现 KV 抢占的点比较 swap\-on、swap\-off 和 recompute\-aware 默认策略，记录交换字节数、传输耗时、重算耗时与完成请求数。此前 swap\-on 低 8\.1%，因此目标是确定何种压力下它能避免失败或改善 SLO，而不是预设其能提高吞吐。
 
-### 实验矩阵
+**判定：**分别报告容量账本与在线可服务并发。只有在同一请求 trace、相同 SLO 下 FP8 增加了达标并发且多位置精度达到预先约定阈值，才能写容量收益；约 1\.96× pool slots 不等于 1\.96× 在线并发。
 
-**context\_concurrency\.py** 已能在每个并发/上下文点读取实际 KV tensor、block pool 容量、GPU 峰值显存、请求延迟与抢占；它当前使用确定性 synthetic token IDs，适合先测容量，再用第 1 节的真实 prompt 验证性能边界。历史 Qwen3\-0\.6B BF16 配置记录约 421 个 KV blocks，约 108K token slots；重新以当前模型、版本和配置实测为准。
+### 4\.2 N\-gram / Medusa / EAGLE 投机解码
 
-- 上下文长度：512、1024、2048、4096 tokens；模型位置编码与显存允许时再加 8192。每条请求保留 32 或 64 个输出 token。
+1. 沿用已有分层 prompt，补成每类至少 50 条互不相同的 held\-out prompt：重复文本正对照、JSON、代码/结构化输出、ShareGPT 对话、开放式问答。baseline 与 speculative 模式必须复用相同 tokenized prompts、采样参数和输入 fingerprint。
 
-- 并发：1、2、4、8、16、32，容量尚有余量时再加 48、64。每点 3 次 burst；接近边界的点做 5 次。
+2. 先用 greedy、固定输出长度检查 none 与 ngram 的输出正确性；再用 temperature=0\.6 分别跑 ignore\_eos 固定长度与 natural\-stop 两种模式。屏幕矩阵为 batch 1/8/32、γ=2/4；先 3 seeds 筛查，再对代表性高/低接受率类别做 5 个配对 seed。
 
-- 配置：先测 BF16 weights \+ auto KV，关闭 KV swap 得到 GPU KV pool 的物理边界；再测 FP8 KV。FP8 先用真实文本校准 scale，并以 held\-out prompt 做首个 decode logits/KL/top\-1 检查。最后单独开启 swap，报告 host offload 的服务边界，不把 swap 容量记作 GPU KV 容量。
+3. 记录 proposed/accepted token 数、α、TTFT/TPOT p50/p95、E2E、输出 token/s、输出长度、EOS 比例、4\-gram 重复率和 distinct\-4。分内容类别画 α 与 speedup；自然停止的结果和固定 token 成本结果分开汇总。
 
-### 运行命令
+4. 若 n\-gram 在某些类别通过离线筛查，再将该类别放入同一连续到达 trace 做 speculative on/off 服务配对，报告 joint\-SLO goodput。离线 decode speedup 不能直接当作 serving speedup。
+
+5. 本机已有可用于 Qwen3 的 Medusa/EAGLE gamma4 权重；已完成加载 smoke 和 gamma4 greedy 配对筛查。gamma2 Medusa 因 checkpoint/head 数量不匹配未通过加载，EAGLE gamma2 smoke 可生成。gamma4 token 输出 fingerprint 与 baseline 均未匹配（0/3），Medusa alpha 约 0.010–0.014、EAGLE 约 0.047–0.051。需先核对数值/verify 路径并提高接受率，再讨论模型投机收益；checkpoint 能加载不等于质量或性能已验证。
 
 ```bash
-MODEL_DIR=~/huggingface/Qwen3-0.6B
-python benchmarks/context_concurrency.py --model "$MODEL_DIR" --context-lengths 512,1024,2048,4096 --concurrency 1,2,4,8,16,32 --repeats 3 --max-output-tokens 64 --no-swap-kv --output results/supplemental/kv_auto_no_swap.json
+python benchmarks/spec_bench.py --model /path/to/Qwen3-0.6B --prompts-file datasets/spec_heldout.jsonl --speculative none,ngram --batch-sizes 1,8,32 --max-draft-lens 2,4 --max-output-len 256 --seeds 7,17,42 --repeats 3 --sampling-mode random --temperature 0.6 --natural-stop --output results/supplemental/spec_natural_screen.json
 ```
 
-达到最大上下文后，另跑 **\-\-kv\-cache\-dtype fp8\_e4m3** 并提供校准文件；再去掉 **\-\-no\-swap\-kv** 单独测试 swap。不要把三种配置混在同一张“最大容量”数字里。
+## 5\. 执行顺序与交付物
 
-### 边界定义
+1. **第一步：**在当前干净提交复跑代表性结果，并生成 manifest；完成三模型端到端 smoke，确认权重加载数字可以对应到真实生成。
 
-- 物理容量边界：实际 KV blocks/token slots、CUDA peak memory、首次 OOM 或无法分配的点。
+2. **第二步：**完成调度逐项消融和准入 held\-out 配对；优先解释现有负收益，并用真实 system prompt 或明确标注的 synthetic prefix 验证缓存。
 
-- 无抢占容量边界：首次出现 KV preemption/recompute 的并发点。
+3. **第三步：**扩展 FP8 多位置精度与在线 KV 压力；只有在实际出现抢占的点测 swap。
 
-- 服务容量边界：首次出现联合 SLO goodput 明显下降、TPOT p95 失守或请求无法完成的点。物理上能装入显存，不代表在目标延迟下可服务。
+4. **第四步：**追踪 MoE 在线首个分歧，修复并复测 parity 后再扩大融合性能矩阵。
 
-- 输出“最大并发 vs prompt 长度”曲线，并分开报告 BF16/FP8 KV、swap on/off、冷/热 prefix。burst 矩阵之后再用 Poisson 到达 trace 验证在线服务边界。
+5. **第五步：**为 n\-gram 加入 natural\-stop 和在线 serving 对照；有匹配权重时再加入 Medusa/EAGLE。
 
-- 交付物：容量矩阵 CSV/JSON、显存与 KV block 账本、抢占/SLO 失守点、FP8 held\-out 精度报告。
+- 每项实验保留原始 JSON/CSV、prompt/arrival fingerprint、命令与配置、绘图脚本和一段结论；结果区分“稳定收益、负收益、未确认”。
 
-## 4\. 让算子收益在目标 workload 上稳定可复现
+- 简历只采用当前干净版本复跑后有同负载配对证据的指标；限定模型、GPU、请求数、到达率、SLO 和配置。固定形状微基准、容量折算与单次 screening 分别标注，不能混作端到端性能结论。
 
-### 优先选择可控消融
+本计划依据仓库 benchmarks/_supplemental_report.md 与 INTERVIEW.md §10.3.19 整理。下列 2026-10-16 进展仅代表标明的模型、GPU、工作负载和 dirty 工作树；“仍未完成”部分保持为计划，不代表已实测。
 
-先选仓库已有明确开关的 INT4 MoE segmented GEMM gate/up 融合作为案例：DeepSeek\-V2\-Lite、纯 INT4 group64、TP=1，比较 loop、segment\-split、segment\-fused。现有固定输入正确性覆盖很强，但端到端融合收益会随输出长度、到达率与 TPOT 目标变化，配对波动区间仍跨过零。因此本实验需要分别证明内核正确、固定形状收益、在线收益。
+## 6. 2026-10-16 实测进度与优化消融
 
-### 阶段 A：微基准与数值正确性
+### 环境与复现口径
 
-1. 在真实模型权重上测 token batch 1/4/16/64/128；每种配置预热，使用 CUDA events 计时，增加重复样本数量。固定输入逐位比对 loop、segment split、segment fused 输出。
+Qwen3-0.6B 结果使用 RTX 5060 Ti 16GB、Python 3.12.13、PyTorch 2.8.0+cu128、CUDA 12.8、Triton 3.4.0；模型路径为本机 checkpoint。运行记录的 HEAD 为 a5a2e0e71d91753e2384285b079aaaf0535b84c6，且 git_worktree_dirty=true。ShareGPT trace 使用脱敏用户 prompt；到达过程为合成 Poisson，不能称为生产流量。原始 JSON/CSV 位于 Git 忽略的 results/supplemental/。
 
-2. 交替 split/fused 运行顺序；每个形状做至少 10 组配对重复。保存输入 fingerprint、kernel latency 分布、GPU clock/温度和显存。
+### 调度优化前后对照
 
-```bash
-MOE_MODEL=~/huggingface/DeepSeek-V2-Lite
-python benchmarks/moe_int4_ablation.py "$MOE_MODEL" --int4-group-size 64 --token-batches 1,4,16,64,128 --profile-token-batches 1,16,64 --warmup 5 --iterations 10 --repeats 10 --output results/supplemental/moe_int4_micro.json
-```
+在 500 请求、8 req/s、TTFT≤2000 ms、TPOT≤80 ms 的 5-seed 配对 trace 上，报告的是按 seed 配对差值的均值与 bootstrap 95% CI：
 
-### 阶段 B：在线服务配对
+| 配对 | 输出吞吐差 (token/s) | 联合 SLO 输出 goodput 差 (token/s) | 解释 |
+|---|---:|---:|---|
+| all_on − baseline | +158.8（+9.4 至 +308.1） | −59.6（−163.0 至 +37.9） | goodput 区间跨零，未显示稳定改善。|
+| without_tpot_aware − all_on | +113.5（+61.8 至 +165.2） | +213.9（+47.8 至 +405.7） | 本负载下关闭 TPOT-aware 相对 all_on 有配对收益，吞吐 5/5 seed 增加，goodput 4/5 增加。|
+| without_tpot_aware − baseline | +272.3（+111.8 至 +432.7） | +154.3（−40.2 至 +323.1） | 输出吞吐改善，但 joint-SLO goodput CI 跨零，不足以改默认策略。|
 
-- 固定 TP=1、INT4 group64、eager、KV swap off；输入先用 64 tokens 的固定形状隔离算子，再增加真实 ShareGPT prompt 验证外部有效性。输出长度 16/64/128，arrival rate 4/8/16/24 req/s，TPOT 目标 100/125/150 ms；先用较小矩阵找差异，再细化候选区间。
+这组数据与 2026-10-15 HEAD 143ce1b 的 all_on 负结果属于不同代码状态/实验批次，分别保留；不能合并成同一组统计。其它 scheduler 单项和负载点尚未在本轮完成。
 
-- 对 split/fused 使用相同到达 trace 和采样 seed，交替后端顺序；保存完整 model\-call shape histogram、SM clock、首个分歧 token 和输入 fingerprint。固定输入重放用于性能配对；端到端 token 差异不能直接判定 kernel 不正确。
+### 准入、FP8 与 KV 容量
 
-- 每个候选格至少 5 个 seed × 5 次配对；若 95% 配对区间跨零，结论写成“未观察到稳定收益”或限定到具体负载条件。不要用 microbenchmark 的大倍数替代全模型 serving speedup。
+- 准入在 calibration / held-out 各用 250 个请求、96 req/s、TTFT≤2000 ms、TPOT≤80 ms；每个 split 分别使用 3 个和 2 个 seed。每一 seed 的三个变体共享 workload fingerprint。admission-off 每次零拒绝且 goodput 高于两个动态准入变体；calibration 中 cache-blind −893 token/s（95% CI −1173 至 −723），cache-aware −685（−817 至 −596）。动态策略 calibration reject rate 约 31%–34%。没有业务拒绝预算，仍不推荐默认阈值。
+- FP8 teacher-forced 评估用 250 calibration 和 250 held-out prompts，固定 BF16 continuation，并检查 decode position 1/8/32/64/128。margin 1.0/1.1/1.25 没有单一全面胜者；margin 1.25 的 held-out E4M3 饱和计数为 K=0、V=1，margin 1.0 为 K=338、V=53。饱和减少不等同于 logits 或生成质量全面更优。
+- KV 容量矩阵 BF16、FP8 各 24 个点、每点 3 次，无失败。BF16 池为 425 blocks / 108,800 slots；FP8 为 827 / 211,712 slots（1.946×）。4096-token prompt、并发4时 BF16 12/12 请求同时满足 TTFT/TPOT SLO，FP8 为 4/12；并发32时两者都没有请求同时满足联合 SLO。容量增加没有转化成稳定的 SLO 收益。
 
-### 指标与判定
+### N-gram 与 Medusa/EAGLE 消融
 
-- 内核：median/p95 latency、配对 speedup、max absolute/relative error、寄存器/显存信息（可取得时）。
+- 固定长度 greedy none/ngram 校验在 repeat、JSON × batch1 × gamma2/4 × seed42 上 4/4 输出 token fingerprint 匹配；单 seed 只作正确性检查。自然停止 screen 完成 90/90 配对（5 类内容 × batch 1/8/32 × gamma 2/4 × 3 seeds），但 128-token 输出上限下 EOS 计数为 0；初次进程在 78/90 后因 WSL 内存和 swap 用尽中断，保留中断 JSON/CSV 并从 checkpoint resume 完成。不能把这 90 对称为有效 EOS 停止测试。
+- Qwen3 chat template 的 ShareGPT、batch=8、512-token cap 触发真实 EOS。离线 gamma2 吞吐中位差 +9.44%（2/3 胜，95% CI −8.57% 至 +15.41%）；gamma4 +5.21%（3/3 胜，CI +2.15% 至 +9.39%）。这是 3-seed 小样本筛查。
+- N-gram 在线重复合成 prompt、100 请求、cap96、合成 Poisson 到达：8 req/s 的三个 seed 为 +2.57%、+2.64%、+2.47%；16 req/s 为 +3.14%、+5.74%、+2.99%。两侧每次都是 100/100 请求满足联合 SLO。该结果只支持高度重复合成内容上的小幅收益。chat-template ShareGPT、4 req/s、cap512 的三组变化为 +0.19%、−5.03%、+2.47%，中位 +0.19%、均值 −0.79%，没有稳定在线吞吐提升。
+- Medusa/EAGLE gamma4 greedy screen 使用同一 chat-template prompt fingerprint、batch8、固定 128-token 输出、3 seeds。Medusa 吞吐中位差 +9.27%（2/3 胜，95% CI −6.22% 至 +10.86%），EAGLE −35.79%（0/3 胜，CI −36.62% 至 −34.00%）；两者的输出 token fingerprint 都是 0/3 与 baseline 一致。因此 Medusa 的正向吞吐筛查不作为等质量加速证据，EAGLE 在此条件下为负收益。
 
-- 端到端：output tok/s、joint\-SLO output goodput、请求达标数、TTFT/TPOT p50/p95、GPU clock、batch shape 和每次 trace 的方差。
+### 多模型与 MoE 诊断
 
-- 只有固定输入正确性通过，且关键目标负载下配对改善稳定、置信区间不跨零时，才把该算子写成已验证优化；否则描述为条件性收益并保留可选开关。
+- 多模型 INT4 smoke：Qwen2.5-7B、Mistral-7B-v0.1、Llama-3.1-8B 均完成 16/16 请求；并发 × 上下文矩阵尚未执行。
+- MLA query assembly 已调整为逐行 query_end = query_start + query_length。更新后 DeepSeek-V2-Lite INT4 在 seed42、8 req/s、16 请求条件下做 5 对：token parity 5/5，focus logits 5/5 相同，固定 KV 的行置换回放检查 10/10 通过。历史 seed42、32 req/s、24 请求的差异条件没有重跑，首次不同 KV 写入位置仍未定位；诊断耗时不是性能结果。
 
-## 5\. 补投机解码的内容依赖实验
+### 尚未完成
 
-### 先修正基准公平性
-
-当前 **spec\_bench\.py** 的 free 输入在每次 run\_case 内重新抽随机 token，因此 baseline 与 spec 可能不是同一批输入；json/repeat 则把一个完全相同的 prompt 复制给整个 batch。正式扩展前应一次性生成 tokenized prompts，并在所有模式中复用；每个请求使用不同但同类的 prompt，避免相同 prompt/prefix cache 混入 decode 收益。脚本的 **\-\-seed** 目前主要控制 prompt 构造，GPU sampler 仍是随机采样；记录每次 seed 并重复多轮，不能依赖单个随机输出。
-
-### 内容分层与运行顺序
-
-1. 建立四类各 50–100 条不同请求：重复/echo 正对照；JSON、SQL 或代码等结构化输出；ShareGPT 真实对话/总结；开放式问答或推理等低重复生成。训练 Medusa/EAGLE draft 权重的 prompt 与 held\-out 评估 prompt 按来源隔离。
-
-2. 第一阶段只比较 baseline 与 n\-gram，batch=8，统一 96 或 128 输出 token、prompt 长度分桶、同一组输入；每类至少 3 个 seed。先用 **ignore\_eos=True** 做固定输出成本对比，再增加 **ignore\_eos=False** 的自然停止实验。
-
-3. 第二阶段对高接受率和低接受率两类扩大到 batch 1/8/32，扫描 **max\_draft\_len** γ=2/4。EAGLE/Medusa 只在对应模型的 draft/head 权重已训练且验证通过时加入；n\-gram 作为无额外模型的主对照。
-
-4. 按内容类别分别跑，不把不同类别混成一个 batch 后只报告总 α。若希望做请求级相关性，给每条 sequence 增加 accepted/proposed 计数，再与生成文本的 4\-gram 重复率、distinct\-4、token entropy 关联。
-
-### 采集指标与解释
-
-- 记录 proposal 数、accepted draft 数、α、每个 verify step 的实际接受 token 数、spec verify/decode steps、decode tokens/s、全请求吞吐、TTFT/TPOT p50/p95、E2E、GPU peak memory。
-
-- 输出内容统计：4\-gram 重复率、distinct\-4、输出长度和类别；用“内容特征—接受率 α—加速比”散点图判断哪些工作负载处于 break\-even 以上。加速比不能只由 α 推断，草稿成本、verify 成本、batch 和 γ 都要同时记录。
-
-- 至少 5 组配对重复后报告 median 与 95% 区间。精度/分布保持检查单独做；temperature\>0 时不同路径可能消费不同随机数，不能要求普通跑分输出逐 token 完全相同。
-
-- 已有 EAGLE γ=2 重复文本加速、自由文本退化的数据只能作为高/低接受率示例，不代表真实请求总体。新简历数字必须写清模型、类别、batch、γ 和硬件。
-
-## 6\. 本轮实验执行顺序与交付状态
-1. 已完成 ShareGPT trace builder/loader 与 fingerprint 配对；生成 500 请求 trace。seed0 结果的 500 个 request ID、max_tokens 预算和到达时间均与该 trace 匹配；100 请求 smoke 结果已留档。
-2. 已完成 BF16/FP8 KV 容量矩阵、真实 prompt 点和 swap 路径诊断。未触发 OOM 或测到物理 KV 容量极限；swap 结果只用于确认路径。
-3. 已完成准入 target/work、soft-pressure/max-wait 筛查，3-seed calibration 和 2-seed held-out 检查。两阶段 target/work SLO 不同，held-out workload 较短且到达率不同；没有业务拒绝率预算，不推荐默认阈值。
-4. 已完成 n-gram 内容分层与 batch/γ 扩展，以及 INT4 MoE 固定输入正确性和在线配对。自然停止、Medusa/EAGLE 权重评估未完成；MoE 5×5 重复仅覆盖一个条件。
-5. 已保留 trace builder、benchmark/report 脚本、运行配置、原始 JSON/CSV 和图表。汇总结论见 [`benchmarks/_supplemental_report.md`](benchmarks/_supplemental_report.md)；原始实验数据保存在本机被 Git 忽略的 `results/supplemental/`。
-
-建议简历只写实验最终支持的结论，例如“基于真实 prompt 与到达 trace 对调度/准入策略做配对评测，按 TTFT/TPOT 联合 SLO goodput 校准准入阈值”；具体加速率、接受率和容量数字等测完后再填写。
+三模型并发/上下文矩阵、全量调度策略与到达率筛查、MoE 历史差异首因定位，以及提交最终代码后的 clean-tree 复跑仍待完成。所有服务吞吐结论继续限定于上面列出的合成/held-out workload 和 GPU。
 

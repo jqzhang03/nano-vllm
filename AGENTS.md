@@ -28,6 +28,17 @@ smoke, calibration, held-out, and prefix variants. The benchmark loaders retain
 prompt-only JSONL support and can replay recorded `arrival_time_s` with
 `--arrival-mode trace`; synthetic arrivals must not be described as production traffic.
 
+benchmarks/spec_bench.py pairs none/ngram/medusa/eagle decoding on identical tokenized inputs,
+checkpoints completed pairs for --resume, supports Qwen chat-template rendering, and records
+EOS and output fingerprints. derive_spec_arrival_trace.py and derive_chat_template_trace.py
+prepare speculative arrival and prompt traces; spec_weight_smoke.py checks draft checkpoint
+loading. admission_ablation.py --speculative none|ngram adds the same decoding toggle to
+continuous-arrival admission comparisons. kv_fp8_calibrate.py supports teacher-forced
+multi-position precision checks; context_concurrency.py records per-point capacity and
+continues after captured CUDA OOMs.
+derive_matched_sharegpt_split.py creates disjoint calibration/held-out prompt splits, and
+multimodel_smoke.py checks short generation on a selected set of model checkpoints.
+
 `benchmarks/moe_int4_ablation.py` profiles real packed-INT4 MoE layers by input-token count
 and reports independent routing, dispatch, gate/up, activation, down, and scatter timings.
 `benchmarks/moe_int4_fuse_sweep.py` compares split/fused serving on paired seeded arrival
@@ -124,6 +135,35 @@ The 20%/50% shared-prefix variants used a synthetic 256-token common template, n
 INT4 MoE segment split/fused matched the loop bitwise for 26 layers × 2 seeds × 5 row counts (260 cases per variant). The fused microbenchmark was 11.90×–42.95× faster across 1/4/16/64/128 rows, but this is kernel-local. In 36 online ShareGPT pairs, fused throughput had +0.91% median delta (-14.94% to +23.07%; 20 wins/16 losses), and every-request output parity held in 19/36 pairs. A repeated 8 req/s, 128-output, 100 ms TPOT condition (5 seeds × 5 repeats) measured +0.51% median throughput delta (-12.87% to +16.46%; 14 wins/11 losses) and full output parity in 14/25 pairs; keep fusion experimental. `MLAAttention._assemble` now derives each query end from its per-row start plus query length. The post-change seed-42 replay still had one mismatching request out of 16, so this does not close the online divergence. Speculative screening covered n-gram only; trained EAGLE/Medusa weights were unavailable.
 
 See [`benchmarks/_supplemental_report.md`](benchmarks/_supplemental_report.md), [`benchmarks/_supplemental_figures/`](benchmarks/_supplemental_figures/), and `python -m benchmarks.supplemental_report` for generated tables and charts. The raw results are ignored under `results/supplemental/` and are local experiment artifacts.
+
+### 2026-10-16 supplemental follow-up
+
+The current-tree scheduling rerun used 500 Qwen3-0.6B requests at synthetic Poisson 8 req/s,
+five paired seeds, TTFT 2 s / TPOT 80 ms. without_tpot_aware versus all_on improved output
+throughput by +113.5 token/s (95% CI +61.8 to +165.2) and joint-SLO output goodput by
++213.9 token/s (+47.8 to +405.7); against baseline, the goodput CI crossed zero. Keep the
+2026-10-15 negative result as a separate historical run. Matched admission used 250-request
+calibration and held-out traces at 96 req/s, with 3/2 seeds; admission-off rejected none and
+had higher goodput in every pair. No product rejection budget is defined.
+
+The 2026-10-16 FP8 teacher-forced evaluation covers 250 calibration and 250 held-out prompts at
+decode positions 1/8/32/64/128. The BF16/FP8 capacity matrix has 24 points per dtype and no
+failures; pools hold 108,800 and 211,712 token slots, but the larger FP8 pool did not improve
+joint-SLO attainment at the tested long-context points. N-gram online A/B gained 2.5–3.1%
+median throughput on repeated synthetic prompts but showed no stable gain on chat-template
+ShareGPT. Gamma2 Medusa smoke failed on a checkpoint/head-count mismatch while EAGLE loaded.
+The gamma4 Medusa/EAGLE screen had output parity in 0/3 seeds for both modes; EAGLE was slower
+in all three. Do not treat the Medusa positive median as quality-preserving speedup.
+
+INT4 multi-model smoke completed 16/16 requests on Qwen2.5-7B, Mistral-7B-v0.1, and
+Llama-3.1-8B; concurrency/context sweeps remain outstanding. After the MLA query-range change,
+five paired MoE diagnostics at seed42 / 8 req/s / 16 requests showed 5/5 token parity and 10/10
+row-permutation replay checks. The historical seed42 / 32 req/s / 24-request divergence condition
+was not rerun; its first differing KV position remains unknown. All 2026-10-16 results are from HEAD a5a2e0e71d91753e2384285b079aaaf0535b84c6 with
+git_worktree_dirty=true; raw JSON/CSV are local ignored artifacts under results/supplemental/.
+See INTERVIEW.md §10.3.20 and benchmarks/_supplemental_report_20261016.md.
+supplemental_report.py appends tracked 2026 dated follow-up Markdown files after the generated
+2026-10-15 body, so regeneration retains this historical update.
 
 ## Documentation maintenance
 

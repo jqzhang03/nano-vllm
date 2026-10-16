@@ -168,8 +168,10 @@ def run_case(style: str, speculative: str, prompts_tok: list[list[int]],
         if len({row["seq_id"] for row in per_request}) != len(per_request):
             raise RuntimeError("speculative benchmark returned duplicate request metrics")
         rows = []
+        eos_token_id = getattr(tokenizer, "eos_token_id", None)
         for index, (request, output) in enumerate(zip(per_request, outputs)):
             token_stats = _output_stats(output["token_ids"])
+            token_ids = output["token_ids"]
             rows.append({
                 "request_index": index,
                 "request_id": (request_metadata[index].get("request_id")
@@ -188,6 +190,9 @@ def run_case(style: str, speculative: str, prompts_tok: list[list[int]],
                 "spec_proposed_tokens": request.get("spec_proposed_tokens", 0),
                 "spec_accepted_tokens": request.get("spec_accepted_tokens", 0),
                 "spec_verify_steps": request.get("spec_verify_steps", 0),
+                "model_eos_terminated": bool(
+                    eos_token_id is not None and token_ids
+                    and token_ids[-1] == eos_token_id),
                 "alpha": (request.get("spec_accepted_tokens", 0)
                           / request["spec_proposed_tokens"]
                           if request.get("spec_proposed_tokens", 0) else None),
@@ -203,6 +208,12 @@ def run_case(style: str, speculative: str, prompts_tok: list[list[int]],
             "seed": seed,
             "wall_seconds": wall,
             "output_tokens": output_tokens,
+            "mean_output_tokens_per_request": output_tokens / max(1, len(rows)),
+            "model_eos_terminated_requests": sum(
+                row["model_eos_terminated"] for row in rows),
+            "model_eos_terminated_percent": (
+                100.0 * sum(row["model_eos_terminated"] for row in rows)
+                / max(1, len(rows))),
             "throughput_tok_per_s": output_tokens / max(wall, 1e-9),
             "ttft_ms": _summary([row["ttft_ms"] for row in rows]),
             "tpot_ms": _summary([row["tpot_ms"] for row in rows]),
@@ -290,6 +301,26 @@ def _prompt_fingerprint(prompts: list[list[int]], output_len: int,
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _save_results(output_path: Path, payload: dict,
+                  flat_rows: list[dict]) -> tuple[Path, Path]:
+    """Atomically checkpoint completed pairs so a later failure keeps prior data."""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    csv_path = output_path.with_suffix(".csv")
+    temp_json = output_path.with_name(output_path.name + ".tmp")
+    temp_csv = csv_path.with_name(csv_path.name + ".tmp")
+    with temp_json.open("w", encoding="utf-8") as result_file:
+        json.dump(payload, result_file, indent=2, default=str)
+    rows = list(flat_rows)
+    fields = list(dict.fromkeys(key for row in rows for key in row))
+    with temp_csv.open("w", encoding="utf-8", newline="") as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+    os.replace(temp_json, output_path)
+    os.replace(temp_csv, csv_path)
+    return output_path, csv_path
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -298,6 +329,8 @@ def main() -> None:
                         help="free,json,repeat,sharegpt,structured,sharegpt_summary,open_ended")
     parser.add_argument("--prompts-file", default=None,
                         help="optional request JSONL built by sharegpt_trace.py")
+    parser.add_argument("--chat-template", action="store_true",
+                        help="wrap prompt-file user text with the tokenizer chat template")
     parser.add_argument("--speculative", default="none,ngram",
                         help="comma-separated modes: none,ngram,medusa,eagle")
     parser.add_argument("--medusa-path", default="results/medusa_heads.pt")
@@ -326,6 +359,8 @@ def main() -> None:
     eos_group.add_argument("--natural-stop", dest="ignore_eos", action="store_false")
     parser.set_defaults(ignore_eos=True)
     parser.add_argument("--output", default="results/spec_bench_supplemental.json")
+    parser.add_argument("--resume", action="store_true",
+                        help="resume an incomplete run from its checkpointed output")
     args = parser.parse_args()
     args.model = os.path.expanduser(args.model)
     if args.repeats < 1 or args.num_seqs < 1:
@@ -348,6 +383,8 @@ def main() -> None:
         raise FileNotFoundError(f"Medusa weights do not exist: {args.medusa_path}")
     if "eagle" in spec_modes and not os.path.isfile(args.eagle_path):
         raise FileNotFoundError(f"EAGLE weights do not exist: {args.eagle_path}")
+    if args.chat_template and not args.prompts_file:
+        raise ValueError("--chat-template requires --prompts-file")
 
     tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=True,
                                               local_files_only=True)
@@ -366,11 +403,92 @@ def main() -> None:
         )
         workload = build_workload_data(loader_args, tokenizer)
         trace_prompts, trace_metadata = workload.prompts, workload.requests
+        if args.chat_template:
+            with open(args.prompts_file, "r", encoding="utf-8") as trace_file:
+                request_rows = [json.loads(line) for line in trace_file if line.strip()]
+            if len(request_rows) != len(trace_prompts):
+                raise ValueError("chat-template input rows do not match loaded trace rows")
+            if any(row.get("prompt_prefix_token_ids") for row in request_rows):
+                raise ValueError("--chat-template cannot be combined with token-ID prefixes")
+            chat_prompts = [tokenizer.apply_chat_template(
+                [{"role": "user", "content": row["prompt"]}],
+                tokenize=False, add_generation_prompt=True)
+                for row in request_rows]
+            trace_prompts = [tokenizer.encode(prompt) for prompt in chat_prompts]
 
     pair_results = []
     flat_rows = []
     condition_index = 0
     styles = [item.strip() for item in args.styles.split(",") if item.strip()]
+    output_path = Path(args.output).expanduser()
+    planned_pairs = (len(styles) * len(batch_sizes) * len(draft_lengths)
+                     * len(seeds) * args.repeats)
+    expected_config = {
+        "styles": styles,
+        "speculative_modes": spec_modes,
+        "batch_sizes": batch_sizes,
+        "seeds": seeds,
+        "repeats": args.repeats,
+        "max_draft_lens": draft_lengths,
+        "max_output_len": args.max_output_len,
+        "ignore_eos": args.ignore_eos,
+        "sampling_mode": args.sampling_mode,
+        "temperature": args.temperature,
+        "fp8_kv": args.fp8,
+        "prompts_file": args.prompts_file,
+        "chat_template": args.chat_template,
+        "max_model_len": args.max_model_len,
+    }
+    completed_pair_keys = set()
+    if args.resume:
+        if not output_path.is_file():
+            raise FileNotFoundError(f"cannot resume; checkpoint does not exist: {output_path}")
+        previous = json.loads(output_path.read_text(encoding="utf-8"))
+        if previous.get("status") != "running":
+            raise ValueError("--resume requires a checkpoint with status='running'")
+        if previous.get("meta", {}).get("model") != args.model:
+            raise ValueError("--resume model does not match checkpoint")
+        if previous.get("config") != expected_config:
+            raise ValueError("--resume options do not match checkpoint config")
+        pair_results = previous.get("pairs", [])
+        completed_pair_keys = {
+            (pair["style"], pair["batch_size"], pair["max_draft_len"],
+             pair["seed"], pair["repeat_index"])
+            for pair in pair_results
+        }
+        csv_path = output_path.with_suffix(".csv")
+        if not csv_path.is_file():
+            raise FileNotFoundError(f"cannot resume; CSV checkpoint does not exist: {csv_path}")
+        with csv_path.open("r", encoding="utf-8", newline="") as csv_file:
+            saved_rows = list(csv.DictReader(csv_file))
+        complete_mode_count = sum(len(pair.get("runs", {})) for pair in pair_results)
+        if len(saved_rows) < complete_mode_count:
+            raise ValueError("checkpoint CSV contains fewer rows than completed pairs")
+        flat_rows = saved_rows[:complete_mode_count]
+        print(f"resuming from {len(pair_results)}/{planned_pairs} completed pairs",
+              flush=True)
+
+    def checkpoint(status: str, aggregate: dict | None = None) -> None:
+        payload = {
+            "meta": {
+                "model": args.model,
+                "created_utc": datetime.now(timezone.utc).isoformat(),
+                "spec_bench_source": os.path.abspath(__file__),
+                **env_info(),
+            },
+            "config": expected_config,
+            "status": status,
+            "progress": {
+                "completed_pairs": len(pair_results),
+                "completed_mode_runs": len(flat_rows),
+                "planned_pairs": planned_pairs,
+            },
+            "aggregate": aggregate or {},
+            "pairs": pair_results,
+        }
+        _save_results(output_path, payload, flat_rows)
+
+    checkpoint("running")
     for style in styles:
         if style not in {"free", "json", "repeat", "sharegpt", "structured",
                          "sharegpt_summary", "open_ended"}:
@@ -399,6 +517,10 @@ def main() -> None:
                         prompts, args.max_output_len, args.ignore_eos)
                     condition_index += 1
                     for repeat_index in range(args.repeats):
+                        pair_key = (style, batch_size, draft_len, seed,
+                                    repeat_index + 1)
+                        if pair_key in completed_pair_keys:
+                            continue
                         order = (list(spec_modes) if (condition_index + repeat_index) % 2 == 0
                                  else list(reversed(spec_modes)))
                         runs = {}
@@ -408,7 +530,7 @@ def main() -> None:
                             f"order={' -> '.join(order)} fingerprint={fingerprint[:16]}",
                             flush=True,
                         )
-                        for speculative in order:
+                        for mode_index, speculative in enumerate(order):
                             run = run_case(style, speculative, prompts, tokenizer,
                                            args, seed=seed + repeat_index * 1009,
                                            request_metadata=metadata)
@@ -431,6 +553,10 @@ def main() -> None:
                                     for row in metadata})),
                                 "wall_seconds": run["wall_seconds"],
                                 "output_tokens": run["output_tokens"],
+                                "mean_output_tokens_per_request": run[
+                                    "mean_output_tokens_per_request"],
+                                "model_eos_terminated_percent": run[
+                                    "model_eos_terminated_percent"],
                                 "throughput_tok_per_s": run["throughput_tok_per_s"],
                                 "ttft_p50_ms": run["ttft_ms"]["p50"],
                                 "ttft_p95_ms": run["ttft_ms"]["p95"],
@@ -452,6 +578,8 @@ def main() -> None:
                                 f"{_format_ms(run['tpot_ms']['p95'])} ms | alpha={run['alpha']}",
                                 flush=True,
                             )
+                            if mode_index == 0:
+                                checkpoint("running")
                         if len({run["input_fingerprint"] for run in runs.values()}) != 1:
                             raise AssertionError("paired modes received different prompt inputs")
                         baseline = runs["none"]
@@ -489,6 +617,7 @@ def main() -> None:
                             "comparisons": comparisons,
                             "runs": runs,
                         })
+                        checkpoint("running")
 
     grouped = {}
     for pair in pair_results:
@@ -508,40 +637,8 @@ def main() -> None:
         }
         for (style, batch, gamma, speculative), values in grouped.items()
     }
-    output_path = Path(args.output).expanduser()
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint("complete", aggregate)
     csv_path = output_path.with_suffix(".csv")
-    with csv_path.open("w", encoding="utf-8", newline="") as csv_file:
-        fieldnames = list(dict.fromkeys(key for row in flat_rows for key in row))
-        writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(flat_rows)
-    payload = {
-        "meta": {
-            "model": args.model,
-            "created_utc": datetime.now(timezone.utc).isoformat(),
-            "spec_bench_source": os.path.abspath(__file__),
-            **env_info(),
-        },
-        "config": {
-            "styles": styles,
-            "speculative_modes": spec_modes,
-            "batch_sizes": batch_sizes,
-            "seeds": seeds,
-            "repeats": args.repeats,
-            "max_draft_lens": draft_lengths,
-            "max_output_len": args.max_output_len,
-            "ignore_eos": args.ignore_eos,
-            "sampling_mode": args.sampling_mode,
-            "temperature": args.temperature,
-            "fp8_kv": args.fp8,
-            "prompts_file": args.prompts_file,
-        },
-        "aggregate": aggregate,
-        "pairs": pair_results,
-    }
-    with output_path.open("w", encoding="utf-8") as result_file:
-        json.dump(payload, result_file, indent=2)
     print(f"\nJSON -> {output_path}, CSV -> {csv_path}")
 
 

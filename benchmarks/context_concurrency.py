@@ -21,12 +21,14 @@ import argparse
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+import hashlib
 import json
 import math
 import os
 import random
 import statistics
 import time
+import traceback
 from types import SimpleNamespace
 
 import torch
@@ -323,6 +325,7 @@ async def run_scenario(engine: LLM, executor: ThreadPoolExecutor,
     manager.start()
     all_rows = []
     burst_walls = []
+    prompt_fingerprints = []
     start_allocated = torch.cuda.memory_allocated(engine.model_runner.device)
     torch.cuda.reset_peak_memory_stats(engine.model_runner.device)
     try:
@@ -346,6 +349,9 @@ async def run_scenario(engine: LLM, executor: ThreadPoolExecutor,
                     real_prompts, real_requests, context_len, concurrency,
                     sample_seed)
                 _clear_idle_prefix_cache(engine)
+            prompt_fingerprints.append(hashlib.sha256(
+                json.dumps(prompts, separators=(",", ":")).encode("ascii")
+            ).hexdigest())
             sampling = SamplingParams(temperature=0.6, ignore_eos=True,
                                       max_tokens=args.max_output_tokens)
             burst_start = time.perf_counter()
@@ -412,6 +418,12 @@ async def run_scenario(engine: LLM, executor: ThreadPoolExecutor,
 
     accepted = [row for row in all_rows if row["status"] == "accepted"]
     output_tokens = sum(row["completion_tokens"] for row in accepted)
+    joint_slo = [row for row in accepted
+                 if row["ttft_ms"] is not None
+                 and row["ttft_ms"] <= args.ttft_slo_ms
+                 and row["average_tpot_ms"] is not None
+                 and row["average_tpot_ms"] <= args.tpot_slo_ms]
+    joint_slo_output_tokens = sum(row["completion_tokens"] for row in joint_slo)
     input_tokens = sum(row["prompt_tokens"] for row in accepted)
     metrics = engine.collect_metrics()
     admission = manager.admission_snapshot()
@@ -436,6 +448,7 @@ async def run_scenario(engine: LLM, executor: ThreadPoolExecutor,
             else "synthetic_exact_length"),
         "actual_prompt_tokens": _percentiles(
             row["prompt_tokens"] for row in accepted),
+        "prompt_fingerprints": prompt_fingerprints,
         "concurrency": concurrency,
         "repeats": args.repeats,
         "requests": len(all_rows),
@@ -452,6 +465,11 @@ async def run_scenario(engine: LLM, executor: ThreadPoolExecutor,
         "input_tokens": input_tokens,
         "prefill_tokens_processed": prefill_tokens_processed,
         "output_tokens": output_tokens,
+        "joint_slo_requests": len(joint_slo),
+        "joint_slo_output_tokens": joint_slo_output_tokens,
+        "joint_slo_request_goodput": len(joint_slo) / max(total_wall, 1e-12),
+        "joint_slo_output_tokens_per_second": (
+            joint_slo_output_tokens / max(total_wall, 1e-12)),
         "input_tokens_per_second": input_tokens / max(total_wall, 1e-12),
         "prefill_tokens_per_second": prefill_tokens_processed / max(total_wall, 1e-12),
         "output_tokens_per_second": output_tokens / max(total_wall, 1e-12),
@@ -589,6 +607,38 @@ def _csv_rows(results: list[dict]) -> list[dict]:
     return rows
 
 
+def _write_checkpoint(output: str, payload: dict) -> tuple[str, str]:
+    """Atomically persist completed points, including a terminal OOM point."""
+    output = os.path.expanduser(output)
+    os.makedirs(os.path.dirname(output) or ".", exist_ok=True)
+    csv_path = os.path.splitext(output)[0] + ".csv"
+    temp_output = output + ".tmp"
+    with open(temp_output, "w", encoding="utf-8") as result_file:
+        json.dump(payload, result_file, indent=2, default=str)
+    os.replace(temp_output, output)
+
+    rows = _csv_rows(payload["results"])
+    for failure in payload.get("failures", []):
+        rows.append({
+            "context_length": failure.get("context_length"),
+            "concurrency": failure.get("concurrency"),
+            "status": failure.get("status"),
+            "failure_phase": failure.get("phase"),
+            "error": failure.get("error"),
+        })
+    fields = list(dict.fromkeys(key for row in rows for key in row))
+    if not fields:
+        fields = ["context_length", "concurrency", "status", "failure_phase", "error"]
+    temp_csv = csv_path + ".tmp"
+    with open(temp_csv, "w", encoding="utf-8", newline="") as csv_file:
+        import csv
+        writer = csv.DictWriter(csv_file, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+    os.replace(temp_csv, csv_path)
+    return output, csv_path
+
+
 def main() -> None:
     args = parse_args()
     args.model = os.path.expanduser(args.model)
@@ -598,6 +648,10 @@ def main() -> None:
         raise SystemExit("CUDA is required to run the inference benchmark")
     if max(args.concurrency) > 512:
         raise SystemExit("maximum concurrency is 512 (the current CUDA graph batch limit)")
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    output = args.output or os.path.join(
+        "results", f"context_concurrency_{timestamp}.json")
+    output = os.path.expanduser(output)
     real_prompts = None
     real_requests = None
     if args.prompts_file:
@@ -635,60 +689,11 @@ def main() -> None:
 
     # Keep the active sequence capacity close to the test's largest concurrency,
     # rounded to a captured family for values above eight.
-    initialization_started = time.perf_counter()
-    engine = LLM(
-        args.model,
-        execution_mode="mixed",
-        tensor_parallel_size=1,
-        max_model_len=max_model_len,
-        max_num_seqs=cudagraph_capacity(max(args.concurrency)),
-        max_num_batched_tokens=args.max_num_batched_tokens,
-        gpu_memory_utilization=args.gpu_memory_utilization,
-        enforce_eager=args.enforce_eager,
-        kv_cache_dtype=args.kv_cache_dtype,
-        kv_calibration_path=args.kv_calibration_path,
-        kv_fp8_scale_margin=args.kv_fp8_scale_margin,
-        quantization=args.quantization,
-        int4_group_size=args.int4_group_size,
-        rolling_cache=args.rolling_cache,
-        kv_swap=not args.no_swap_kv,
-        kv_swap_space_gb=args.kv_swap_space_gb,
-        recompute_aware_preemption=not args.no_recompute_aware_preemption,
-        mixed_cudagraph=not args.no_mixed_cudagraph,
-    )
-    engine_initialization_seconds = time.perf_counter() - initialization_started
-    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="context-bench")
     results = []
     warmup_records = []
-    try:
-        matrix = [(context, concurrency) for context in args.context_lengths
-                  for concurrency in args.concurrency]
-        print(f"Warming {len(matrix)} context/concurrency shapes before measurement",
-              flush=True)
-        warmup_records = _warmup_matrix(
-            engine, args, matrix, real_prompts, real_requests)
-        for index, (context, concurrency) in enumerate(matrix, 1):
-            print(f"[{index}/{len(matrix)}] prompt={context} tokens, "
-                  f"concurrency={concurrency}, repeats={args.repeats}", flush=True)
-            result = asyncio.run(run_scenario(
-                engine, executor, args, context, concurrency,
-                real_prompts, real_requests))
-            results.append(result)
-            print(f"  accepted {result['accepted']}/{result['requests']} | "
-                  f"output {result['output_tokens_per_second']:.1f} tok/s | "
-                  f"TTFT p50/p99 {result['ttft_ms']['p50'] or 0:.1f}/"
-                  f"{result['ttft_ms']['p99'] or 0:.1f} ms | "
-                  f"E2E p99 {result['e2e_ms']['p99'] or 0:.1f} ms", flush=True)
-    finally:
-        executor.shutdown(wait=True)
-        engine.exit()
-        torch.cuda.empty_cache()
-
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    output = args.output or os.path.join(
-        "results", f"context_concurrency_{timestamp}.json")
-    output = os.path.expanduser(output)
-    os.makedirs(os.path.dirname(output) or ".", exist_ok=True)
+    failures = []
+    matrix = [(context, concurrency) for context in args.context_lengths
+              for concurrency in args.concurrency]
     payload = {
         "schema_version": 1,
         "meta": {"model": args.model, "date": timestamp, **env_info()},
@@ -701,7 +706,7 @@ def main() -> None:
             "real_prompt_count": len(real_prompts) if real_prompts is not None else 0,
             "warmup_output_tokens": min(8, args.max_output_tokens),
             "warmup_per_matrix_point": True,
-            "engine_initialization_seconds": engine_initialization_seconds,
+            "engine_initialization_seconds": None,
             "concurrency": args.concurrency,
             "repeats": args.repeats,
             "max_output_tokens": args.max_output_tokens,
@@ -723,23 +728,108 @@ def main() -> None:
             "enforce_eager": args.enforce_eager,
             "seed": args.seed,
         },
-        "warmup": {
-            "points": warmup_records,
-            "total_seconds": sum(row["wall_seconds"] for row in warmup_records),
-        },
+        "warmup": {"points": warmup_records, "total_seconds": 0.0},
         "results": results,
+        "failures": failures,
+        "status": "initializing",
+        "matrix_points_total": len(matrix),
     }
-    with open(output, "w", encoding="utf-8") as result_file:
-        json.dump(payload, result_file, indent=2, default=str)
-    csv_path = os.path.splitext(output)[0] + ".csv"
-    rows = _csv_rows(results)
-    with open(csv_path, "w", encoding="utf-8", newline="") as csv_file:
-        import csv
-        writer = csv.DictWriter(csv_file, fieldnames=list(rows[0]) if rows else [])
-        writer.writeheader()
-        writer.writerows(rows)
-    print(f"JSON results: {output}")
-    print(f"CSV summary:  {csv_path}")
+
+    def checkpoint(status: str) -> None:
+        payload["status"] = status
+        payload["warmup"] = {
+            "points": warmup_records,
+            "total_seconds": sum(row.get("wall_seconds", 0.0)
+                                  for row in warmup_records),
+        }
+        payload["results"] = results
+        payload["failures"] = failures
+        paths = _write_checkpoint(output, payload)
+        print(f"Checkpoint JSON: {paths[0]}", flush=True)
+
+    checkpoint("initializing")
+    initialization_started = time.perf_counter()
+    try:
+        engine = LLM(
+            args.model,
+            execution_mode="mixed",
+            tensor_parallel_size=1,
+            max_model_len=max_model_len,
+            max_num_seqs=cudagraph_capacity(max(args.concurrency)),
+            max_num_batched_tokens=args.max_num_batched_tokens,
+            gpu_memory_utilization=args.gpu_memory_utilization,
+            enforce_eager=args.enforce_eager,
+            kv_cache_dtype=args.kv_cache_dtype,
+            kv_calibration_path=args.kv_calibration_path,
+            kv_fp8_scale_margin=args.kv_fp8_scale_margin,
+            quantization=args.quantization,
+            int4_group_size=args.int4_group_size,
+            rolling_cache=args.rolling_cache,
+            kv_swap=not args.no_swap_kv,
+            kv_swap_space_gb=args.kv_swap_space_gb,
+            recompute_aware_preemption=not args.no_recompute_aware_preemption,
+            mixed_cudagraph=not args.no_mixed_cudagraph,
+        )
+    except torch.cuda.OutOfMemoryError as exc:
+        failures.append({"phase": "engine_initialization", "status": "cuda_oom",
+                         "error": str(exc), "traceback": traceback.format_exc()})
+        checkpoint("stopped_on_cuda_oom")
+        return
+    except Exception as exc:
+        failures.append({"phase": "engine_initialization", "status": "error",
+                         "error": str(exc), "traceback": traceback.format_exc()})
+        checkpoint("error")
+        raise
+
+    engine_initialization_seconds = time.perf_counter() - initialization_started
+    payload["config"]["engine_initialization_seconds"] = engine_initialization_seconds
+    executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="context-bench")
+    terminal_status = "complete"
+    try:
+        for index, (context, concurrency) in enumerate(matrix, 1):
+            print(f"[{index}/{len(matrix)}] prompt={context} tokens, "
+                  f"concurrency={concurrency}, repeats={args.repeats}", flush=True)
+            try:
+                warmed = _warmup_matrix(
+                    engine, args, [(context, concurrency)], real_prompts,
+                    real_requests)
+                warmup_records.extend(warmed)
+                checkpoint("running")
+                result = asyncio.run(run_scenario(
+                    engine, executor, args, context, concurrency,
+                    real_prompts, real_requests))
+            except torch.cuda.OutOfMemoryError as exc:
+                torch.cuda.empty_cache()
+                failures.append({
+                    "context_length": context,
+                    "concurrency": concurrency,
+                    "phase": "warmup_or_measurement",
+                    "status": "cuda_oom",
+                    "error": str(exc),
+                    "traceback": traceback.format_exc(),
+                })
+                terminal_status = "stopped_on_cuda_oom"
+                checkpoint(terminal_status)
+                break
+            results.append(result)
+            checkpoint("running")
+            print(f"  accepted {result['accepted']}/{result['requests']} | "
+                  f"output {result['output_tokens_per_second']:.1f} tok/s | "
+                  f"TTFT p50/p99 {result['ttft_ms']['p50'] or 0:.1f}/"
+                  f"{result['ttft_ms']['p99'] or 0:.1f} ms | "
+                  f"E2E p99 {result['e2e_ms']['p99'] or 0:.1f} ms", flush=True)
+    except Exception as exc:
+        failures.append({"phase": "matrix", "status": "error",
+                         "error": str(exc), "traceback": traceback.format_exc()})
+        terminal_status = "error"
+        checkpoint(terminal_status)
+        raise
+    finally:
+        executor.shutdown(wait=True)
+        engine.exit()
+        torch.cuda.empty_cache()
+    checkpoint(terminal_status)
+    print(f"CSV summary: {_write_checkpoint(output, payload)[1]}")
 
 
 if __name__ == "__main__":

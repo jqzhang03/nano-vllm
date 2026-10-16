@@ -317,8 +317,13 @@ class MLAAttention(nn.Module):
         self.inv_c_scale = 1.0
         self.inv_r_scale = 1.0
         self.calibrating = False      # 校准阶段：分别记录两段 max|·|
+        self.eval_collect_fp8_stats = False
         self.cal_c_max = 0.0
         self.cal_r_max = 0.0
+        self.cal_saturated_c = 0
+        self.cal_saturated_r = 0
+        self.cal_elements_c = 0
+        self.cal_elements_r = 0
         self._wuk_t = None            # [h, qk_nope, kv_lora] 逐头 W_UK（惰性）
         self._wuv_t = None            # [h, v_head, kv_lora] 逐头 W_UV
 
@@ -483,8 +488,29 @@ class MLAAttention(nn.Module):
         # ---- 写路径：全批次 token 的 [c_kv | k̃]（写后才读，见各路径注释）----
         # fp8 KV 校准：无缓存（cache_ready=False）时仍记录两段 max|·|（同 MHA）
         if self.calibrating:
-            self.cal_c_max = max(self.cal_c_max, c_kv.abs().max().item())
-            self.cal_r_max = max(self.cal_r_max, k_pe_r.abs().max().item())
+            if self.eval_collect_fp8_stats:
+                max_c = c_kv.abs().max().detach()
+                max_r = k_pe_r.abs().max().detach()
+                self.cal_c_max = (max_c if not isinstance(self.cal_c_max, torch.Tensor)
+                                  else torch.maximum(self.cal_c_max, max_c))
+                self.cal_r_max = (max_r if not isinstance(self.cal_r_max, torch.Tensor)
+                                  else torch.maximum(self.cal_r_max, max_r))
+            else:
+                self.cal_c_max = max(self.cal_c_max, c_kv.abs().max().item())
+                self.cal_r_max = max(self.cal_r_max, k_pe_r.abs().max().item())
+            if self.mla_fp8 and self.eval_collect_fp8_stats:
+                scaled_c = c_kv.float().abs() * self.inv_c_scale
+                scaled_r = k_pe_r.float().abs() * self.inv_r_scale
+                saturated_c = (scaled_c > 448.0).sum(dtype=torch.int64)
+                saturated_r = (scaled_r > 448.0).sum(dtype=torch.int64)
+                if not isinstance(self.cal_saturated_c, torch.Tensor):
+                    self.cal_saturated_c = saturated_c
+                    self.cal_saturated_r = saturated_r
+                else:
+                    self.cal_saturated_c.add_(saturated_c)
+                    self.cal_saturated_r.add_(saturated_r)
+                self.cal_elements_c += c_kv.numel()
+                self.cal_elements_r += k_pe_r.numel()
         if cache_ready and ctx.slot_mapping is not None:
             if self.mla_fp8:
                 # fused 行两段各自量化（E4M3；fp32→fp8 溢出产生 NaN 位模式，

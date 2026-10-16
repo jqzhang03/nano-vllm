@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 from datetime import datetime, timezone
 import gc
+import hashlib
 import json
 import math
 import os
@@ -69,6 +70,20 @@ def _positive_int(value: str) -> int:
     return result
 
 
+def _positive_int_list(value: str) -> list[int]:
+    try:
+        values = [int(item.strip()) for item in value.split(",") if item.strip()]
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "positions must be comma-separated positive integers") from exc
+    if not values or any(item <= 0 for item in values):
+        raise argparse.ArgumentTypeError(
+            "positions must be comma-separated positive integers")
+    if len(values) != len(set(values)):
+        raise argparse.ArgumentTypeError("positions must not contain duplicates")
+    return sorted(values)
+
+
 def _float_list(value: str) -> list[float]:
     try:
         values = [float(item.strip()) for item in value.split(",") if item.strip()]
@@ -99,6 +114,10 @@ def parse_args() -> argparse.Namespace:
                         help="repeat short prompts to this length; 0 preserves corpus lengths")
     parser.add_argument("--max-output-tokens", type=_positive_int, default=2,
                         help="2 is sufficient to capture the first pure decode logits")
+    parser.add_argument("--teacher-forced-positions", type=_positive_int_list,
+                        default=None,
+                        help="optional decode positions, e.g. 1,8,32,64,128; runs a BF16 "
+                             "reference continuation and forces the same tokens in FP8")
     parser.add_argument("--max-num-batched-tokens", type=_positive_int, default=16384)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
     parser.add_argument("--enforce-eager", action="store_true")
@@ -186,6 +205,12 @@ def _percentile_summary(values: list[float]) -> dict[str, float | int | None]:
             "median": statistics.median(vals), "max": vals[-1]}
 
 
+def _scalar_value(value, cast):
+    if isinstance(value, torch.Tensor):
+        value = value.item()
+    return cast(value)
+
+
 def extract_fp8_scales(engine: LLM, *, observed: bool = False) -> list[dict[str, Any]]:
     rows = []
     range_prefix = "evaluation" if observed else "calibration"
@@ -194,16 +219,34 @@ def extract_fp8_scales(engine: LLM, *, observed: bool = False) -> list[dict[str,
             continue
         row: dict[str, Any] = {"module": name}
         if hasattr(module, "cal_max_k"):
-            row.update({f"{range_prefix}_max_k": module.cal_max_k,
-                        f"{range_prefix}_max_v": module.cal_max_v})
+            row.update({f"{range_prefix}_max_k": _scalar_value(module.cal_max_k, float),
+                        f"{range_prefix}_max_v": _scalar_value(module.cal_max_v, float)})
             if not observed:
                 row.update({"k_scale": module.k_scale, "v_scale": module.v_scale})
+            else:
+                row.update({
+                    "evaluation_saturated_k_values": _scalar_value(
+                        module.cal_saturated_k, int),
+                    "evaluation_k_values": _scalar_value(module.cal_elements_k, int),
+                    "evaluation_saturated_v_values": _scalar_value(
+                        module.cal_saturated_v, int),
+                    "evaluation_v_values": _scalar_value(module.cal_elements_v, int),
+                })
         if hasattr(module, "cal_c_max"):
-            row.update({f"{range_prefix}_max_c": module.cal_c_max,
-                        f"{range_prefix}_max_rope": module.cal_r_max})
+            row.update({f"{range_prefix}_max_c": _scalar_value(module.cal_c_max, float),
+                        f"{range_prefix}_max_rope": _scalar_value(module.cal_r_max, float)})
             if not observed:
                 row.update({"c_scale": module.mla_c_scale,
                             "rope_scale": module.mla_r_scale})
+            else:
+                row.update({
+                    "evaluation_saturated_c_values": _scalar_value(
+                        module.cal_saturated_c, int),
+                    "evaluation_c_values": _scalar_value(module.cal_elements_c, int),
+                    "evaluation_saturated_rope_values": _scalar_value(
+                        module.cal_saturated_r, int),
+                    "evaluation_rope_values": _scalar_value(module.cal_elements_r, int),
+                })
         if len(row) > 1:
             rows.append(row)
     return rows
@@ -218,6 +261,15 @@ def observe_fp8_ranges(engine: LLM, enabled: bool) -> None:
             for name in ("cal_max_k", "cal_max_v", "cal_c_max", "cal_r_max"):
                 if hasattr(module, name):
                     setattr(module, name, 0.0)
+            for name in ("cal_saturated_k", "cal_saturated_v", "cal_saturated_c",
+                         "cal_saturated_r", "cal_elements_k", "cal_elements_v",
+                         "cal_elements_c", "cal_elements_r"):
+                if hasattr(module, name):
+                    setattr(module, name, 0)
+            if hasattr(module, "eval_collect_fp8_stats"):
+                module.eval_collect_fp8_stats = True
+        elif hasattr(module, "eval_collect_fp8_stats"):
+            module.eval_collect_fp8_stats = False
         module.calibrating = enabled
 
 
@@ -374,6 +426,233 @@ def compare_logits(reference: dict[str, Any], candidate: dict[str, Any]) -> dict
     }
 
 
+def _decode_position_logits(engine: LLM, positions: list[int]) -> dict[int, torch.Tensor]:
+    """Return decode logits after the requested number of continuation tokens."""
+    decode_rows = [logits.detach().float().cpu()
+                   for kind, logits in engine.collected_logits
+                   if kind == "decode" and logits is not None]
+    if len(decode_rows) < max(positions):
+        raise RuntimeError(
+            f"captured {len(decode_rows)} decode rows, need position {max(positions)}")
+    return {position: decode_rows[position - 1] for position in positions}
+
+
+def _greedy_reference(engine: LLM, prompt: list[int], token_count: int,
+                      positions: list[int]) -> tuple[list[int], dict[int, torch.Tensor]]:
+    original_forward = engine.model_runner.sampler.forward
+    engine.model_runner.sampler.forward = (
+        lambda logits, temperatures: logits.argmax(dim=-1))
+    try:
+        output = engine.generate(
+            [prompt],
+            SamplingParams(temperature=1.0, ignore_eos=True, max_tokens=token_count),
+            use_tqdm=False,
+            collect_logits=True,
+            collect_decode_logits_only=True,
+        )[0]
+    finally:
+        engine.model_runner.sampler.forward = original_forward
+    tokens = list(output["token_ids"])
+    if len(tokens) != token_count:
+        raise RuntimeError(f"greedy reference returned {len(tokens)} tokens, expected {token_count}")
+    return tokens, _decode_position_logits(engine, positions)
+
+
+def _teacher_forced_replay(engine: LLM, prompt: list[int], tokens: list[int],
+                           positions: list[int]) -> tuple[list[int], dict[int, torch.Tensor]]:
+    original_forward = engine.model_runner.sampler.forward
+    cursor = 0
+
+    def force_tokens(logits: torch.Tensor, temperatures: torch.Tensor) -> torch.Tensor:
+        nonlocal cursor
+        batch = logits.shape[0]
+        if cursor + batch > len(tokens):
+            raise RuntimeError("teacher-forced sampler requested more tokens than provided")
+        selected = tokens[cursor:cursor + batch]
+        cursor += batch
+        return torch.tensor(selected, dtype=torch.int64, device=logits.device)
+
+    engine.model_runner.sampler.forward = force_tokens
+    try:
+        output = engine.generate(
+            [prompt],
+            SamplingParams(temperature=1.0, ignore_eos=True, max_tokens=len(tokens)),
+            use_tqdm=False,
+            collect_logits=True,
+            collect_decode_logits_only=True,
+        )[0]
+    finally:
+        engine.model_runner.sampler.forward = original_forward
+    output_tokens = list(output["token_ids"])
+    if cursor != len(tokens) or output_tokens != tokens:
+        raise RuntimeError(
+            "teacher-forced token replay did not preserve the full reference continuation")
+    return output_tokens, _decode_position_logits(engine, positions)
+
+
+def _teacher_forced_engine(args: argparse.Namespace, kv_dtype: str,
+                           calibration_path: str, margin: float | None,
+                           max_model_len: int) -> LLM:
+    kwargs: dict[str, Any] = {
+        "max_model_len": max_model_len,
+        "max_num_batched_tokens": args.max_num_batched_tokens,
+        "max_num_seqs": 1,
+        "gpu_memory_utilization": args.gpu_memory_utilization,
+        "enforce_eager": args.enforce_eager,
+        "kv_cache_dtype": kv_dtype,
+        "kv_swap": False,
+    }
+    if kv_dtype == "fp8_e4m3":
+        kwargs["kv_calibration_path"] = calibration_path
+        kwargs["kv_fp8_scale_margin"] = margin
+    return LLM(args.model, **kwargs)
+
+
+def _teacher_forced_evaluation(args: argparse.Namespace, calibration_path: str,
+                               eval_prompts: list[list[int]],
+                               positions: list[int], max_model_len: int,
+                               progress_callback=None) -> dict[str, Any]:
+    token_count = max(positions) + 1
+    references = []
+    if progress_callback is not None:
+        progress_callback("reference", {"completed_prompts": 0,
+                                        "total_prompts": len(eval_prompts)})
+    baseline = _teacher_forced_engine(
+        args, "auto", calibration_path, None, max_model_len)
+    try:
+        for index, prompt in enumerate(eval_prompts):
+            print(f"  BF16 teacher reference {index + 1}/{len(eval_prompts)}",
+                  flush=True)
+            torch.manual_seed(args.seed + index)
+            torch.cuda.manual_seed_all(args.seed + index)
+            tokens, logits = _greedy_reference(
+                baseline, prompt, token_count, positions)
+            continuation_hash = hashlib.sha256(
+                json.dumps(tokens, separators=(",", ":")).encode("ascii")).hexdigest()
+            references.append({
+                "prompt_tokens": len(prompt),
+                "continuation_tokens": tokens,
+                "continuation_sha256": continuation_hash,
+                "position_logits": logits,
+            })
+            if (progress_callback is not None
+                    and ((index + 1) % 10 == 0 or index + 1 == len(eval_prompts))):
+                progress_callback("reference", {
+                    "completed_prompts": index + 1,
+                    "total_prompts": len(eval_prompts),
+                })
+    finally:
+        baseline.exit()
+        del baseline
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    variants = {}
+    metric_keys = tuple(_score_logits(
+        torch.zeros(1, 5), torch.zeros(1, 5)).keys())
+    for margin in args.margins:
+        name = f"fp8_e4m3_margin_{margin:g}"
+        print(f"  FP8 teacher-forced replay margin={margin:g}", flush=True)
+        engine = _teacher_forced_engine(
+            args, "fp8_e4m3", calibration_path, margin, max_model_len)
+        per_position = {position: [] for position in positions}
+        forced_match_count = 0
+        observe_fp8_ranges(engine, True)
+        try:
+            for index, (prompt, reference) in enumerate(zip(eval_prompts, references)):
+                print(f"    prompt {index + 1}/{len(eval_prompts)}", flush=True)
+                output_tokens, candidate_logits = _teacher_forced_replay(
+                    engine, prompt, reference["continuation_tokens"], positions)
+                forced_match_count += int(output_tokens == reference["continuation_tokens"])
+                for position in positions:
+                    score = _score_logits(
+                        reference["position_logits"][position],
+                        candidate_logits[position])
+                    per_position[position].append({"prompt_index": index, **score})
+                if (progress_callback is not None
+                        and ((index + 1) % 10 == 0
+                             or index + 1 == len(eval_prompts))):
+                    progress_callback("fp8_replay", {
+                        "margin": margin,
+                        "completed_prompts": index + 1,
+                        "total_prompts": len(eval_prompts),
+                        "partial_position_metrics": {
+                            str(position): rows
+                            for position, rows in per_position.items()
+                        },
+                    })
+        finally:
+            observe_fp8_ranges(engine, False)
+        observed_ranges = extract_fp8_scales(engine, observed=True)
+        calibration_scales = extract_fp8_scales(engine)
+        utilization = range_utilization(calibration_scales, observed_ranges)
+        saturation_fields = (
+            ("k", "evaluation_saturated_k_values", "evaluation_k_values"),
+            ("v", "evaluation_saturated_v_values", "evaluation_v_values"),
+            ("c", "evaluation_saturated_c_values", "evaluation_c_values"),
+            ("rope", "evaluation_saturated_rope_values", "evaluation_rope_values"),
+        )
+        saturation = {}
+        for component, saturated_key, count_key in saturation_fields:
+            saturated = sum(row.get(saturated_key, 0) for row in observed_ranges)
+            count = sum(row.get(count_key, 0) for row in observed_ranges)
+            if count:
+                saturation[component] = {
+                    "saturated_values": saturated,
+                    "total_values": count,
+                    "saturation_rate": saturated / count,
+                }
+        position_summary = {}
+        for position, rows in per_position.items():
+            position_summary[str(position)] = {
+                "compared_prompts": len(rows),
+                "metrics": {
+                    key: _percentile_summary([row[key] for row in rows])
+                    for key in metric_keys
+                },
+                "per_prompt": rows,
+            }
+        utilization_values = [value for row in utilization for key, value in row.items()
+                              if key.endswith("_limit_utilization")]
+        variants[name] = {
+            "kv_cache_dtype": "fp8_e4m3",
+            "scale_margin": margin,
+            "continuation_tokens": token_count,
+            "forced_continuations_matching": forced_match_count,
+            "evaluation_prompts": len(eval_prompts),
+            "positions": position_summary,
+            "evaluation_saturation": saturation,
+            "evaluation_max_range_utilization": max(utilization_values, default=None),
+            "evaluation_mean_range_utilization": (
+                statistics.fmean(utilization_values) if utilization_values else None),
+            "evaluation_activation_ranges": observed_ranges,
+        }
+        if progress_callback is not None:
+            progress_callback("fp8_variant_complete", {
+                "variant": name,
+                "summary": {
+                    position: value["metrics"]
+                    for position, value in position_summary.items()
+                },
+            })
+        engine.exit()
+        del engine
+        gc.collect()
+        torch.cuda.empty_cache()
+    return {
+        "method": (
+            "BF16 greedy continuation; FP8 replays force the identical token IDs. "
+            "Position p is the decode logit after p reference continuation tokens "
+            "have been fed through the KV cache."),
+        "reference_kv_cache_dtype": "auto/BF16",
+        "teacher_continuation_tokens": token_count,
+        "positions": positions,
+        "evaluation_prompts": len(eval_prompts),
+        "continuation_fingerprints": [row["continuation_sha256"] for row in references],
+        "variants": variants,
+    }
+
+
 def _scale_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
     fields = sorted({key for row in rows for key in row if key != "module"})
     summary = {}
@@ -385,6 +664,10 @@ def _scale_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
 
 def main() -> None:
     args = parse_args()
+    if args.teacher_forced_positions and not args.enforce_eager:
+        print("Teacher-forced FP8 statistics require eager forwards; disabling CUDA Graph capture.",
+              flush=True)
+        args.enforce_eager = True
     args.model = os.path.expanduser(args.model)
     if not os.path.isdir(args.model):
         raise SystemExit(f"model directory does not exist: {args.model}")
@@ -423,7 +706,11 @@ def main() -> None:
     max_position = int(getattr(hf, "max_position_embeddings", 4096))
     longest_eval = max(len(prompt) for prompt in eval_prompts)
     longest_calibration = max(len(prompt) for prompt in calibration_prompts)
-    max_model_len = max(longest_calibration, longest_eval + args.max_output_tokens)
+    teacher_output_tokens = (
+        max(args.teacher_forced_positions) + 1
+        if args.teacher_forced_positions else 0)
+    effective_output_tokens = max(args.max_output_tokens, teacher_output_tokens)
+    max_model_len = max(longest_calibration, longest_eval + effective_output_tokens)
     if max_model_len > max_position:
         raise SystemExit(
             f"calibration/evaluation needs max_model_len={max_model_len}, but model limit "
@@ -460,6 +747,8 @@ def main() -> None:
         "config": {
             "margins": args.margins,
             "max_output_tokens": args.max_output_tokens,
+            "teacher_forced_positions": args.teacher_forced_positions,
+            "teacher_forced_output_tokens": teacher_output_tokens or None,
             "max_model_len": max_model_len,
             "max_num_batched_tokens": args.max_num_batched_tokens,
             "max_calibration_prompt_tokens_effective": calibration_token_limit,
@@ -470,53 +759,75 @@ def main() -> None:
         },
         "runs": {},
         "warnings": [
-            "FP8 scores compare first decode logits only when the first generated token matches; unaligned prompts are excluded from cache-logit metrics.",
             "A calibration maximum is data-dependent. Include representative production prompts and verify on a separate held-out corpus.",
-            "Range utilization compares held-out activation maxima with the calibrated E4M3 limit; values above 1 indicate an observed value will be clamped, but do not give the elementwise saturation rate.",
+            "Range utilization compares held-out activation maxima with the calibrated E4M3 limit. Elementwise saturation counts are instrumented only for teacher-forced FP8 runs.",
         ],
     }
+    if not args.teacher_forced_positions:
+        result["warnings"].append(
+            "Without --teacher-forced-positions, FP8 scores compare first decode logits only when the first generated token matches; unaligned prompts are excluded from cache-logit metrics.")
     if not args.calibrate_only:
         if not torch.cuda.is_available():
             raise SystemExit("CUDA is required for FP8 KV accuracy calibration")
         result["meta"].update(env_info())
-        baseline = run_variant(args, "auto", None, calibration_path,
-                               eval_prompts, max_model_len)
-        result["runs"]["auto_baseline"] = baseline
-        for margin in args.margins:
-            key = f"fp8_e4m3_margin_{margin:g}"
-            print(f"calibrating FP8 KV with margin={margin:g} ...", flush=True)
-            candidate = run_variant(args, "fp8_e4m3", margin, calibration_path,
-                                    eval_prompts, max_model_len)
-            comparison = compare_logits(baseline, candidate)
-            for prompt in candidate["prompts"]:
-                prompt.pop("first_decode_logits", None)
-            candidate["comparison_to_auto"] = comparison
-            candidate["scale_summary"] = _scale_summary(candidate["fp8_layer_scales"])
-            utilization_values = [value for row in candidate["evaluation_range_utilization"]
-                                  for key, value in row.items()
-                                  if key.endswith("_limit_utilization")]
-            candidate["evaluation_range_summary"] = {
-                "max_limit_utilization": max(utilization_values, default=None),
-                "mean_limit_utilization": (statistics.fmean(utilization_values)
-                                           if utilization_values else None),
-                "components_over_limit": sum(value > 1.0 for value in utilization_values),
-                "measured_layer_components": len(utilization_values),
+        if args.teacher_forced_positions:
+            result["teacher_forced"] = {
+                "positions": args.teacher_forced_positions,
+                "variants": {},
             }
-            result["runs"][key] = candidate
-            metrics = comparison["metrics"]
-            kl = metrics["kl_ref_to_fp8"]
-            top1 = metrics["top1_agreement_percent"]
-            mean_error = metrics["logits_mean_abs_error"]
-            max_utilization = candidate["evaluation_range_summary"][
-                "max_limit_utilization"]
-            print(f"  aligned {comparison['aligned_first_token_prompts']}/"
-                  f"{comparison['evaluation_prompts']} | "
-                  f"KL {kl if kl is not None else float('nan'):.6g} | "
-                  f"top-1 {top1 if top1 is not None else float('nan'):.1f}% | "
-                  f"max range {max_utilization if max_utilization is not None else float('nan'):.3f}x | "
-                  f"mean |delta logit| "
-                  f"{mean_error if mean_error is not None else float('nan'):.6g}",
-                  flush=True)
+
+            def save_teacher_progress(stage: str, details: dict[str, Any]) -> None:
+                result["teacher_forced_progress"] = {"stage": stage, **details}
+                temp_path = output + ".tmp"
+                with open(temp_path, "w", encoding="utf-8") as result_file:
+                    json.dump(result, result_file, indent=2, default=str)
+                os.replace(temp_path, output)
+
+            result["teacher_forced"] = _teacher_forced_evaluation(
+                args, calibration_path, eval_prompts,
+                args.teacher_forced_positions, max_model_len,
+                progress_callback=save_teacher_progress)
+            result.pop("teacher_forced_progress", None)
+        else:
+            baseline = run_variant(args, "auto", None, calibration_path,
+                                   eval_prompts, max_model_len)
+            result["runs"]["auto_baseline"] = baseline
+            for margin in args.margins:
+                key = f"fp8_e4m3_margin_{margin:g}"
+                print(f"calibrating FP8 KV with margin={margin:g} ...", flush=True)
+                candidate = run_variant(args, "fp8_e4m3", margin, calibration_path,
+                                        eval_prompts, max_model_len)
+                comparison = compare_logits(baseline, candidate)
+                for prompt in candidate["prompts"]:
+                    prompt.pop("first_decode_logits", None)
+                candidate["comparison_to_auto"] = comparison
+                candidate["scale_summary"] = _scale_summary(candidate["fp8_layer_scales"])
+                utilization_values = [value for row in candidate[
+                    "evaluation_range_utilization"] for key, value in row.items()
+                                      if key.endswith("_limit_utilization")]
+                candidate["evaluation_range_summary"] = {
+                    "max_limit_utilization": max(utilization_values, default=None),
+                    "mean_limit_utilization": (statistics.fmean(utilization_values)
+                                               if utilization_values else None),
+                    "components_over_limit": sum(value > 1.0
+                                                  for value in utilization_values),
+                    "measured_layer_components": len(utilization_values),
+                }
+                result["runs"][key] = candidate
+                metrics = comparison["metrics"]
+                kl = metrics["kl_ref_to_fp8"]
+                top1 = metrics["top1_agreement_percent"]
+                mean_error = metrics["logits_mean_abs_error"]
+                max_utilization = candidate["evaluation_range_summary"][
+                    "max_limit_utilization"]
+                print(f"  aligned {comparison['aligned_first_token_prompts']}/"
+                      f"{comparison['evaluation_prompts']} | "
+                      f"KL {kl if kl is not None else float('nan'):.6g} | "
+                      f"top-1 {top1 if top1 is not None else float('nan'):.1f}% | "
+                      f"max range {max_utilization if max_utilization is not None else float('nan'):.3f}x | "
+                      f"mean |delta logit| "
+                      f"{mean_error if mean_error is not None else float('nan'):.6g}",
+                      flush=True)
 
     # Logits are retained in-memory only for pairwise comparison. The JSON keeps
     # aggregate and per-prompt error metrics rather than huge vocabulary vectors.
@@ -541,6 +852,28 @@ def main() -> None:
             "mean_limit_utilization")
         row["components_over_e4m3_limit"] = range_summary.get("components_over_limit")
         csv_rows.append(row)
+    for name, variant in result.get("teacher_forced", {}).get("variants", {}).items():
+        for position, position_result in variant["positions"].items():
+            row = {
+                "variant": name,
+                "evaluation_mode": "teacher_forced",
+                "kv_cache_dtype": variant["kv_cache_dtype"],
+                "scale_margin": variant["scale_margin"],
+                "decode_position": int(position),
+                "compared_prompts": position_result["compared_prompts"],
+                "forced_continuations_matching": (
+                    variant["forced_continuations_matching"]),
+            }
+            for metric, summary in position_result["metrics"].items():
+                for stat, value in summary.items():
+                    row[f"{metric}_{stat}"] = value
+            for component, summary in variant["evaluation_saturation"].items():
+                row[f"{component}_saturated_values"] = summary["saturated_values"]
+                row[f"{component}_total_values"] = summary["total_values"]
+                row[f"{component}_saturation_rate"] = summary["saturation_rate"]
+            row["evaluation_max_range_utilization"] = variant[
+                "evaluation_max_range_utilization"]
+            csv_rows.append(row)
     if csv_rows:
         import csv
         with open(summary_csv, "w", encoding="utf-8", newline="") as csv_file:

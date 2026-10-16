@@ -160,3 +160,9 @@ free / repeat 的 batch×γ 扩展：
 - INT4 MoE 在线初筛每条件一次，16 请求、8/16 req/s、16/64/128 输出上限、100/150 ms TPOT、3 seeds；另对 8 req/s、128 输出、100 ms TPOT 做 5 seeds × 5 repeats。仍不足以确认所有负载上的稳定 goodput 提升。
 - 投机解码使用固定 96-token 输出、temperature 0.6、3 seeds 和 n-gram；没有自然停止、Medusa/EAGLE 权重或大规模 held-out workload。
 - 性能实验运行于带未提交代码的工作区；以上数据只对应所列 GPU、模型、负载和配置。
+
+## 后续实验记录
+
+2026-10-16 的调度、准入、FP8、KV 容量、投机解码、多模型 smoke 与 MoE 诊断结果见
+[_supplemental_report_20261016.md](_supplemental_report_20261016.md)。该 dated follow-up 由
+supplemental_report.py 在重生成报告时追加。
